@@ -46,7 +46,7 @@ class EnvStatusTool(
         val tier = router.resolveTier(cwd)
         val tierText = when (tier) {
             ExecutionTier.PRIVILEGED ->
-                "Shizuku ADB-shell privileges (${if (shizuku.isTmpPrefixDeployed()) "with the full Linux toolchain deployed to /data/local/tmp" else "system /system/bin/sh, Linux toolchain not deployed"}) in $cwd"
+                "Shizuku ADB-shell privileges (${if (shizuku.isTmpPrefixDeployed(linuxEnv.deployedTag())) "with the full Linux toolchain deployed to /data/local/tmp" else "system /system/bin/sh, Linux toolchain not deployed"}) in $cwd"
             ExecutionTier.APP_LINUX ->
                 "app-uid Linux bash (full toolchain: node, python, git, …) in $cwd"
             ExecutionTier.TOYBOX ->

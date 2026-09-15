@@ -899,7 +899,7 @@ class LinuxEnvironmentManager(
      * after every successful deploy.
      */
     private suspend fun syncShellTierAuth(shizuku: ShizukuManager) {
-        if (!shizuku.isTmpPrefixDeployed()) return
+        if (!shizuku.isTmpPrefixDeployed(deployedTag())) return
         val token = githubToken()
         val gitconfig = GitHubProvision.gitConfigBody(token)
         val hosts = GitHubProvision.ghHostsYaml(token)
@@ -1027,7 +1027,15 @@ class LinuxEnvironmentManager(
         put("HOME", "$TMP_PREFIX/home")
         put("TMPDIR", "$TMP_PREFIX/tmp")
         put("PREFIX", TMP_PREFIX)
-        put("LD_PRELOAD", "$TMP_PREFIX/lib/libtermux-exec.so")
+        // Same derivation rule as the entries below, and the same trap: the
+        // deployed copy carries the preload iff the app prefix does. Pointing
+        // LD_PRELOAD at a file that is not there is worse than not setting it,
+        // because the linker then refuses EVERY dynamically linked binary
+        // (setsid, sh, bash) with `CANNOT LINK EXECUTABLE ... not found`, so
+        // the whole tier looks broken instead of degraded.
+        if (File(prefix, "lib/libtermux-exec.so").exists()) {
+            put("LD_PRELOAD", "$TMP_PREFIX/lib/libtermux-exec.so")
+        }
         put("TERMUX__PREFIX", TMP_PREFIX)
         put("TERM", "xterm-256color")
         put("LANG", "C.UTF-8")
@@ -1101,6 +1109,29 @@ class LinuxEnvironmentManager(
     fun invalidateExternalToolDeploy() {
         runCatching { stagingMarker.delete() }
         runCatching { deployStateListener?.invoke() }
+    }
+
+    /**
+     * Tag the deployed copy must carry to be usable: the package-set hash plus
+     * the content hash of the exact tarball it was extracted from.
+     *
+     * The package set alone is not enough. When staging fails (or is skipped)
+     * the deploy would still untar whatever tarball is on disk and stamp it
+     * with the current package hash, and from then on the copy looks current
+     * forever while its files are older than the environment built for them:
+     * binaries started there die in the linker on libraries that moved or
+     * appeared since. Including the staged content means a copy is only ever
+     * trusted when it came from the same bytes the app is staging now.
+     *
+     * Null means "nothing can match": staging is behind the installed package
+     * set, so the copy has to be re-staged and re-deployed.
+     */
+    fun deployedTag(): String? {
+        val hash = packageSetHash()
+        val lines = runCatching { stagingMarker.readText().lines() }.getOrDefault(emptyList())
+        if (lines.getOrNull(0) != hash) return null
+        val content = lines.getOrNull(1)?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        return "$hash $content"
     }
 
     private fun fileSha256(file: File): String {
@@ -1238,7 +1269,17 @@ class LinuxEnvironmentManager(
             withContext(Dispatchers.IO) {
                 stageForShell()
                 if (!stagingTar.exists()) return@withContext false
-                val ok = shizuku.ensureTmpPrefix(stagingTar.absolutePath, packageSetHash())
+                // Deploy the tag computed AFTER staging, and skip the deploy
+                // entirely when staging is behind the installed package set:
+                // untarring a stale tarball and stamping it current is how a
+                // broken copy becomes permanent (the marker then matches
+                // forever, so nothing ever repairs it).
+                val tag = deployedTag()
+                if (tag == null) {
+                    Log.e(TAG, "staging is behind the installed package set; skipping the shell-tier deploy")
+                    return@withContext false
+                }
+                val ok = shizuku.ensureTmpPrefix(stagingTar.absolutePath, tag)
                 if (ok) {
                     // The tarball carries no auth (excluded at stage time), so a
                     // freshly deployed prefix has no gitconfig/token/hosts until

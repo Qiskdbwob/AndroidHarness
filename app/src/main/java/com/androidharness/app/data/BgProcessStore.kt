@@ -107,11 +107,14 @@ class BgProcessStore(
         }.let { if (it.exists() || it.canWrite()) it else File(detachedLogDir, logName).apply { createNewFile() } }
 
         if (shizuku.isGranted()) {
-            // Make sure the shell-user toolchain copy exists before spawning.
-            if (linuxEnv.isReady && !shizuku.isTmpPrefixDeployed()) {
+            // Make sure the shell-user toolchain copy matches the package set
+            // tmpProcessEnv() is built for: a copy from an older set is missing
+            // the libraries that env names.
+            val expected = linuxEnv.deployedTag()
+            if (linuxEnv.isReady && !shizuku.isTmpPrefixDeployed(expected)) {
                 linuxEnv.ensureShellDeploy(shizuku)
             }
-            val toolchainDeployed = shizuku.isTmpPrefixDeployed()
+            val toolchainDeployed = shizuku.isTmpPrefixDeployed(expected)
             val cmd = if (toolchainDeployed) {
                 arrayOf("${LinuxEnvironmentManager.TMP_PREFIX_BASE}/linux/bin/bash", "-c", command)
             } else {

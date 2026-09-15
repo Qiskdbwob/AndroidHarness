@@ -67,6 +67,18 @@ class ShizukuManager(
     @Volatile private var tmpPrefixDeployed = false
 
     /**
+     * Package-set hash plus staged-tarball content hash the deployed copy was
+     * extracted from. Readiness is keyed to it: the tier's environment is built
+     * from the APP prefix (PATH, the termux-exec preload, the CA bundle, the
+     * OpenSSL config), so a copy that came from other bytes is missing exactly
+     * the files that env points at, and binaries started in it die in the
+     * linker. Installing a package, or any staging that lagged behind for a
+     * moment, makes the copy stale on the spot instead of five minutes later
+     * when the periodic verify comes round.
+     */
+    @Volatile private var deployedTag: String? = null
+
+    /**
      * True while the deploy script is gutting and re-extracting
      * /data/local/tmp/androidharness: during that window the deployed prefix
      * is partially absent even though [isTmpPrefixDeployed] stays true (the
@@ -87,6 +99,7 @@ class ShizukuManager(
     fun invalidateDeployState() {
         deployCheckForced = true
         tmpPrefixDeployed = false
+        deployedTag = null
     }
 
     private val isDebuggable: Boolean =
@@ -268,9 +281,10 @@ class ShizukuManager(
      * Deploys (or refreshes) the shell-user toolchain at
      * /data/local/tmp/androidharness/linux by untarring the staging tarball
      * (shared storage, shell-readable) there. No-op when the deployed copy
-     * already matches [hash].
+     * already matches [tag], which is the package set plus the content hash of
+     * the tarball it must have come from.
      */
-    suspend fun ensureTmpPrefix(stagingTarPath: String, hash: String): Boolean {
+    suspend fun ensureTmpPrefix(stagingTarPath: String, tag: String): Boolean {
         val base = LinuxEnvironmentManager.TMP_PREFIX_BASE
         // Bug 1 fix: locate the staged CA bundle (next to the tarball) so the
         // deployed toolchain gets trust anchors; fall back gracefully.
@@ -284,8 +298,9 @@ class ShizukuManager(
             arrayOf("/system/bin/sh", "-c", "test -x \"$base/linux/bin/bash\" && cat \"$base/.harness-hash\""),
             env = null, dir = null, timeoutMs = 15_000, maxBytes = 2_000,
         ) ?: return false
-        if (check.exitCode == 0 && check.output.trim() == hash) {
+        if (check.exitCode == 0 && check.output.trim() == tag) {
             tmpPrefixDeployed = true
+            deployedTag = tag
             deployCheckForced = false
             return true
         }
@@ -307,7 +322,7 @@ class ShizukuManager(
                 append("chmod 600 \"$base/linux/home/.gh-token\" " +
                     "\"$base/linux/home/.config/gh/hosts.yml\" " +
                     "\"$base/linux/etc/gitconfig\" 2>/dev/null; ")
-                append("echo '$hash' > \"$base/.harness-hash\" && ")
+                append("echo '$tag' > \"$base/.harness-hash\" && ")
                 append("test -x \"$base/linux/bin/bash\" && ")
                 append("echo DEPLOY_OK")
             }
@@ -319,7 +334,10 @@ class ShizukuManager(
                 maxBytes = 20_000,
             )
             val ok = r != null && r.exitCode == 0 && r.output.contains("DEPLOY_OK")
-            if (ok) tmpPrefixDeployed = true
+            if (ok) {
+                tmpPrefixDeployed = true
+                deployedTag = tag
+            }
             deployCheckForced = false
             return ok
         } finally {
@@ -327,21 +345,47 @@ class ShizukuManager(
         }
     }
 
-    /** Whether the shell-user toolchain currently exists at /data/local/tmp. */
-    suspend fun isTmpPrefixDeployed(): Boolean {
-        if (tmpPrefixDeployed && !deployCheckForced) return true
+    /**
+     * Whether the shell-user toolchain can be executed from /data/local/tmp.
+     *
+     * Pass [expectedTag] (the tag the caller's environment was built for, from
+     * `LinuxEnvironmentManager.deployedTag()`) to also require the deployed copy
+     * to have come from those exact bytes. Anything that runs the deployed
+     * binaries with the app-side environment must ask the strict question: a
+     * copy that only answers "bin/bash exists" can be missing the very
+     * libraries that environment names, and the linker then refuses every
+     * binary with `CANNOT LINK EXECUTABLE ... library "..." not found`.
+     */
+    suspend fun isTmpPrefixDeployed(expectedTag: String? = null): Boolean {
+        // A cached success only counts for the tag it was deployed from;
+        // anything else has to be re-checked (and re-deployed by
+        // ensureTmpPrefix) before the tier may exec from the copy.
+        if (tmpPrefixDeployed && !deployCheckForced &&
+            (expectedTag == null || deployedTag == expectedTag)
+        ) return true
         val base = LinuxEnvironmentManager.TMP_PREFIX_BASE
+        val script = if (expectedTag != null) {
+            "test -x \"$base/linux/bin/bash\" && cat \"$base/.harness-hash\""
+        } else {
+            "test -x \"$base/linux/bin/bash\" && echo OK"
+        }
         val r = runPrivileged(
-            arrayOf("/system/bin/sh", "-c", "test -x \"$base/linux/bin/bash\" && echo OK"),
+            arrayOf("/system/bin/sh", "-c", script),
             env = null,
             dir = null,
             timeoutMs = 10_000,
             maxBytes = 2_000,
         )
-        if (r != null && r.exitCode == 0 && r.output.contains("OK") && !deployCheckForced) {
+        val matched = r != null && r.exitCode == 0 &&
+            if (expectedTag != null) r.output.trim() == expectedTag else r.output.contains("OK")
+        if (matched && !deployCheckForced) {
             // A forced check stays un-cached: callers must go through
-            // ensureTmpPrefix so the hash comparison actually happens.
+            // ensureTmpPrefix so the redeploy actually happens.
             tmpPrefixDeployed = true
+            if (expectedTag != null) deployedTag = expectedTag
+        } else {
+            tmpPrefixDeployed = false
+            deployedTag = null
         }
         return tmpPrefixDeployed
     }

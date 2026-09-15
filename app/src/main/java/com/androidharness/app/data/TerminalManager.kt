@@ -235,8 +235,11 @@ class TerminalManager(
 
     private fun sendPrivileged(cmd: String) {
         scope.launch {
-            // Make sure the shell-user toolchain copy exists before running.
-            if (linuxEnv.isReady && !shizuku.isTmpPrefixDeployed()) {
+            // Make sure the shell-user toolchain copy matches the package set
+            // tmpProcessEnv() is built for before running from it: a copy from
+            // an older set is missing the libraries that env names.
+            val expected = linuxEnv.deployedTag()
+            if (linuxEnv.isReady && !shizuku.isTmpPrefixDeployed(expected)) {
                 linuxEnv.ensureShellDeploy(shizuku)
             }
             val script = "cd \"\$HC_DIR\" && eval \"\$HC_CMD\"; ec=\$?; echo \"$marker:\$ec:\$PWD\""
@@ -245,7 +248,7 @@ class TerminalManager(
                 .plus("HC_CMD" to cmd)
                 .map { "${it.key}=${it.value}" }.toTypedArray()
             val bash = "${LinuxEnvironmentManager.TMP_PREFIX_BASE}/linux/bin/bash"
-            val useTmpBash = shizuku.isTmpPrefixDeployed()
+            val useTmpBash = shizuku.isTmpPrefixDeployed(expected)
             val argv = if (useTmpBash) arrayOf(bash, "-c", script) else arrayOf("/system/bin/sh", "-c", script)
             val res = shizuku.runPrivileged(argv, env, cwd.absolutePath, timeoutMs = 120_000, maxBytes = 60_000)
             if (res == null) {

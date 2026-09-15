@@ -143,11 +143,17 @@ class ShellTierRouter(
         // Self-heal: catch a stale or vanished deployed copy even when nothing
         // in-process changed the staging state (throttled internally).
         linuxEnv.verifyDeployedCopyThrottled(shizuku)
-        var toolchain = linuxEnv.isReady && shizuku.isTmpPrefixDeployed()
+        // The deployed copy has to come from the same package set this tier's
+        // environment (tmpProcessEnv) is built for. Asking only whether it
+        // exists accepts a copy that is missing the libraries the environment
+        // names, and every binary started in it then dies in the linker with
+        // `CANNOT LINK EXECUTABLE ... library "..." not found`.
+        val expectedTag = linuxEnv.deployedTag()
+        var toolchain = linuxEnv.isReady && shizuku.isTmpPrefixDeployed(expectedTag)
         if (linuxEnv.isReady && !toolchain) {
             // One-time deploy of the toolchain to an exec-allowed location.
             linuxEnv.ensureShellDeploy(shizuku)
-            toolchain = shizuku.isTmpPrefixDeployed()
+            toolchain = shizuku.isTmpPrefixDeployed(expectedTag)
         }
         // Bug 2 fix: make sure the designated exec-capable scratch dir exists
         // and is writable by both the shell uid and the app uid.
