@@ -97,7 +97,7 @@ internal object CodeGraphCommands {
         |  # so anything that re-runs Node through that path is malformed. CodeGraph's
         |  # liveness watchdog does exactly that ("node -e") and prints
         |  # 'expected absolute path: "-e"' while its daemon safety net fails to
-        |  # start. Harness only runs one-shot commands, so turn it off.
+        |  # start. Harness owns the child process lifetime, so turn it off.
         |  CODEGRAPH_NO_WATCHDOG=1
         |  export CODEGRAPH_NO_WATCHDOG
         |  exec "${'$'}LINKER" "${'$'}NODE" --liftoff-only --disable-warning=ExperimentalWarning "${'$'}CLI" "${'$'}@"
@@ -298,6 +298,11 @@ class CodeGraphManager(
     private val linuxEnv: LinuxEnvironmentManager,
     private val shellRouter: ShellTierRouter,
 ) {
+    private val mcp = CodeGraphMcp(linuxEnv)
+
+    suspend fun agentTools(workspace: WorkspaceFs): List<com.androidharness.app.tools.Tool> =
+        mcp.tools(workspace) { isAvailable(workspace) }
+
     // Release archives run to ~130 MB, so the read timeout is generous: the
     // call timeout is what bounds a genuinely stalled connection.
     private val client = OkHttpClient.Builder()
@@ -766,9 +771,11 @@ class CodeGraphManager(
         val ready = requireIndexed(workspace)
         if (ready != null) return ready
         val root = workspace.shellRoot!!
-        val synced = run(CodeGraphCommands.sync, root, 180_000, 12_000)
-        if (!synced.ok) return CodeGraphCommandResult(false, "CodeGraph sync failed before the query:\n${synced.output}")
-        return run(command, root, 180_000, 80_000)
+        return mcp.paused {
+            val synced = run(CodeGraphCommands.sync, root, 180_000, 12_000)
+            if (!synced.ok) CodeGraphCommandResult(false, "CodeGraph sync failed before the query:\n${synced.output}")
+            else run(command, root, 180_000, 80_000)
+        }
     }
 
     private suspend fun workspaceCommand(
@@ -784,7 +791,7 @@ class CodeGraphManager(
             return refused("Install CodeGraph in Settings → Code intelligence first.")
         }
         _workspaceState.value = CodeGraphRunState(busy = true, action = label)
-        val result = run(command, root, timeoutMs, 40_000)
+        val result = mcp.paused { run(command, root, timeoutMs, 40_000) }
         _workspaceState.value = CodeGraphRunState(
             message = result.output.ifBlank { if (result.ok) "$label complete." else "$label failed." },
             failed = !result.ok,
@@ -813,7 +820,7 @@ class CodeGraphManager(
 
     private suspend fun busy(label: String, block: suspend () -> CodeGraphCommandResult): CodeGraphState {
         _state.value = _state.value.copy(busy = true, action = label, message = null, failed = false)
-        val result = runCatching { block() }.getOrElse {
+        val result = runCatching { mcp.paused { block() } }.getOrElse {
             CodeGraphCommandResult(false, it.message ?: "$label failed.")
         }
         val refreshedVersion = if (result.ok) {

@@ -37,6 +37,7 @@ class McpManager(
     private val context: Context,
     private val linuxEnv: LinuxEnvironmentManager,
     private val keys: KeyStoreManager,
+    private val codeGraph: com.androidharness.app.data.env.CodeGraphManager? = null,
 ) {
 
     private val json = Json { ignoreUnknownKeys = true; prettyPrint = true }
@@ -293,10 +294,17 @@ class McpManager(
             }
         }
         val configs = global + if (approved) ws else emptyList()
-        if (configs.isEmpty()) return emptyList()
+        val tools = mutableListOf<Tool>()
+        try {
+            codeGraph?.agentTools(workspace)?.let { tools.addAll(it) }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            android.util.Log.w("CodeGraph", "MCP startup failed; keeping CLI tools available", e)
+        }
+        if (configs.isEmpty()) return tools
 
         val cwd = workspace.shellRoot ?: context.filesDir
-        val tools = mutableListOf<Tool>()
         for (config in configs) {
             val conn = connectionFor(config, cwd) ?: continue
             tools += conn.tools.map { info ->

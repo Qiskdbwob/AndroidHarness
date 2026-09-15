@@ -125,7 +125,7 @@ class AppContainer(val appContext: Context) {
         browserController = browser,
         searchApi = { searchApiConfig },
     )
-    val mcp = com.androidharness.app.tools.mcp.McpManager(appContext, linuxEnv, keys)
+    val mcp = com.androidharness.app.tools.mcp.McpManager(appContext, linuxEnv, keys, codeGraph)
     val engine = AgentEngine(
         providerFactory = { config -> ProviderFactory.create(config) },
         registry = registry,
