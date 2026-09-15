@@ -45,10 +45,10 @@ data class AppSettings(
     /** web_search backend: "keyless" (default) | "brave" | "tavily". */
     val webSearchProvider: String = "keyless",
     /**
-     * Screenshots are allowed outside credential screens. Off (default) blocks
+     * Screenshots are allowed by default outside credential screens. Off blocks
      * them app wide; screens that show keys and tokens always block.
      */
-    val allowScreenshots: Boolean = false,
+    val allowScreenshots: Boolean = true,
     /**
      * Separate models per agent mode: plan-mode runs use the planning
      * provider/model, everything else uses the execution one. Off (default)
@@ -152,7 +152,7 @@ class SettingsRepository(private val context: Context) {
             webSearchProvider = prefs[Keys.WEB_SEARCH_PROVIDER]
                 ?.takeIf { it in WEB_SEARCH_PROVIDERS }
                 ?: "keyless",
-            allowScreenshots = prefs[Keys.ALLOW_SCREENSHOTS] ?: false,
+            allowScreenshots = prefs[Keys.ALLOW_SCREENSHOTS] ?: true,
             planningModelsEnabled = prefs[Keys.PLANNING_MODELS_ENABLED] ?: false,
             planningProviderId = prefs[Keys.PLANNING_PROVIDER],
             planningModel = prefs[Keys.PLANNING_MODEL],

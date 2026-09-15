@@ -8,6 +8,14 @@ import org.junit.Test
 class ScreenshotPolicyTest {
 
     @Test
+    fun `screenshots are allowed by default outside credential screens`() {
+        assertTrue(AppSettings().allowScreenshots)
+        assertFalse(ScreenshotPolicy.blocked(AppSettings().allowScreenshots, false))
+        assertTrue(ScreenshotPolicy.blocked(AppSettings().allowScreenshots, true))
+    }
+
+
+    @Test
     fun `blocked is the not-allow or credential truth table`() {
         assertTrue(ScreenshotPolicy.blocked(allowScreenshots = false, credentialScreenVisible = false))
         assertTrue(ScreenshotPolicy.blocked(allowScreenshots = false, credentialScreenVisible = true))
