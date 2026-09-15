@@ -22,7 +22,7 @@ import java.io.File
 internal object CodeGraphBundlePatches {
 
     /** Bumped whenever [patches] changes, so an install can tell old from new. */
-    const val VERSION = 2
+    const val VERSION = 3
 
     internal data class Patch(
         val relativePath: String,
@@ -84,7 +84,7 @@ internal object CodeGraphBundlePatches {
     // B4: Framework language gate rejecting cross-language instantiations/extends
     private val frameworkAnchor = lines(
         "    gateFrameworkLanguage(result, ref) {",
-        "        if (!result) ",
+        "        if (!result)",
         "            return result;",
         "        if (ref.referenceKind !== 'references' && ref.referenceKind !== 'imports')",
         "            return result;",
@@ -93,7 +93,7 @@ internal object CodeGraphBundlePatches {
         "            return null;",
         "        return result;",
         "    }",
-    ).replace("if (!result) \n", "if (!result)\n")
+    )
 
     private val frameworkReplacement = lines(
         "    gateFrameworkLanguage(result, ref) {",
@@ -114,6 +114,32 @@ internal object CodeGraphBundlePatches {
         "        }",
         "        return result;",
         "    }",
+    )
+
+    // B6: Python single-level module import (import b)
+    private val pythonModuleImportAnchor = lines(
+        "function resolvePythonAbsoluteModule(ref, context) {",
+        "    if (ref.referenceKind !== 'imports')",
+        "        return null;",
+        "    // Only a DOTTED `import a.b.c` ref carries its full module path. A bare leaf",
+        "    // (`from app.api.routes import authentication`) is ambiguous on its own — three",
+        "    // `authentication.py` files may exist — so leave it to resolveModuleImportToFile,",
+        "    // which uses the import's source (`app.api.routes`) to build the full path.",
+        "    if (!ref.referenceName.includes('.'))",
+        "        return null;",
+        "    const hit = findPythonModuleFile(ref.referenceName, context, ref.filePath);",
+        "    return hit ? { original: ref, targetNodeId: hit.id, confidence: 0.9, resolvedBy: 'import' } : null;",
+        "}",
+    )
+
+    private val pythonModuleImportReplacement = lines(
+        "function resolvePythonAbsoluteModule(ref, context) {",
+        "    if (ref.referenceKind !== 'imports')",
+        "        return null;",
+        "    // Harness patch: allow bare single module imports (import b) as well as dotted paths",
+        "    const hit = findPythonModuleFile(ref.referenceName, context, ref.filePath);",
+        "    return hit ? { original: ref, targetNodeId: hit.id, confidence: 0.9, resolvedBy: 'import' } : null;",
+        "}",
     )
 
     // B9: Tree-sitter createNode rejects non-symbol junk
@@ -154,6 +180,25 @@ internal object CodeGraphBundlePatches {
         "            : `Found \${subgraph.nodes.size} symbol\${subgraph.nodes.size === 1 ? '' : 's'} across \${fileGroups.size} file\${fileGroups.size === 1 ? '' : 's'}.`;",
     )
 
+    // Minor 11: Raise searchLimit with maxFiles in explore
+    private val exploreSearchLimitAnchor = lines(
+        "        const subgraph = await cg.findRelevantContext(matchQuery, {",
+        "            searchLimit: 8,",
+        "            traversalDepth: 3,",
+        "            maxNodes: 200,",
+        "            minScore: 0.2,",
+        "        });",
+    )
+
+    private val exploreSearchLimitReplacement = lines(
+        "        const subgraph = await cg.findRelevantContext(matchQuery, {",
+        "            searchLimit: Math.max(24, maxFiles * 2),",
+        "            traversalDepth: 3,",
+        "            maxNodes: 200,",
+        "            minScore: 0.2,",
+        "        });",
+    )
+
     // B5: CLI impact multi-definition note
     private val impactAnchor = lines(
         "            else {",
@@ -167,7 +212,7 @@ internal object CodeGraphBundlePatches {
         "                console.log(chalk.bold(`\\nImpact of changing \"\${symbol}\"\${multiNote} — \${mergedNodes.size} affected symbols:\\n`));",
     )
 
-    // B8: Database maintenance includes ANALYZE
+    // B8 & Minor 12: Database maintenance analyzes real tables only, excluding virtual FTS tables
     private val maintenanceAnchor = lines(
         "        await this.runPragmasOffThread(['PRAGMA analysis_limit=1000', 'PRAGMA optimize', 'PRAGMA wal_checkpoint(PASSIVE)'], ",
         "        // Worker threads unavailable — bounded in-line fallback, no checkpoint.",
@@ -175,9 +220,94 @@ internal object CodeGraphBundlePatches {
     )
 
     private val maintenanceReplacement = lines(
-        "        await this.runPragmasOffThread(['PRAGMA analysis_limit=1000', 'PRAGMA optimize', 'ANALYZE', 'PRAGMA wal_checkpoint(PASSIVE)'], ",
+        "        await this.runPragmasOffThread(['PRAGMA analysis_limit=1000', 'PRAGMA optimize', 'ANALYZE nodes', 'ANALYZE edges', 'ANALYZE files', 'ANALYZE unresolved_refs', 'PRAGMA wal_checkpoint(PASSIVE)'], ",
         "        // Worker threads unavailable — bounded in-line fallback, no checkpoint.",
-        "        ['PRAGMA analysis_limit=1000', 'PRAGMA optimize', 'ANALYZE']);",
+        "        ['PRAGMA analysis_limit=1000', 'PRAGMA optimize', 'ANALYZE nodes', 'ANALYZE edges', 'ANALYZE files', 'ANALYZE unresolved_refs']);",
+    )
+
+    // B3, B7, B9: Migration 10 - clean existing bad edges, unique unresolved_refs, prune vocab orphans
+    private val migrationVersionAnchor = "exports.CURRENT_SCHEMA_VERSION = 9;"
+    private val migrationVersionReplacement = "exports.CURRENT_SCHEMA_VERSION = 10;"
+
+    private val migrationListAnchor = lines(
+        "            db.exec('CREATE INDEX IF NOT EXISTS idx_files_generated ON files(path) WHERE generated = 1');",
+        "        },",
+        "    },",
+        "];",
+    )
+
+    private val migrationListReplacement = lines(
+        "            db.exec('CREATE INDEX IF NOT EXISTS idx_files_generated ON files(path) WHERE generated = 1');",
+        "        },",
+        "    },",
+        "    {",
+        "        version: 10,",
+        "        description: 'Prune cross-language edges, unique unresolved refs index, and prune vocab orphans',",
+        "        up: (db) => {",
+        "            db.exec(`",
+        "        DELETE FROM edges WHERE id IN (",
+        "          SELECT e.id FROM edges e",
+        "          JOIN nodes s ON e.source = s.id",
+        "          JOIN nodes t ON e.target = t.id",
+        "          WHERE e.kind IN ('imports', 'calls', 'extends', 'instantiates')",
+        "          AND s.language != t.language",
+        "          AND NOT (",
+        "            (s.language IN ('kotlin','java','scala','clojure','groovy') AND t.language IN ('kotlin','java','scala','clojure','groovy')) OR",
+        "            (s.language IN ('swift','objc','objcpp') AND t.language IN ('swift','objc','objcpp')) OR",
+        "            (s.language IN ('typescript','tsx','javascript','jsx','arkts','vue','svelte','astro') AND t.language IN ('typescript','tsx','javascript','jsx','arkts','vue','svelte','astro')) OR",
+        "            (s.language IN ('c','cpp') AND t.language IN ('c','cpp')) OR",
+        "            (s.language IN ('csharp','razor') AND t.language IN ('csharp','razor'))",
+        "          )",
+        "        );",
+        "        DELETE FROM unresolved_refs WHERE id NOT IN (",
+        "          SELECT MIN(id) FROM unresolved_refs",
+        "          GROUP BY from_node_id, reference_name, reference_kind, line, col",
+        "        );",
+        "        CREATE UNIQUE INDEX IF NOT EXISTS idx_unresolved_identity",
+        "          ON unresolved_refs(from_node_id, reference_name, reference_kind, line, col);",
+        "        DELETE FROM name_segment_vocab WHERE name NOT IN (SELECT name FROM nodes);",
+        "      `);",
+        "        },",
+        "    },",
+        "];",
+    )
+
+    // B7: insertUnresolvedRefsBatch uses INSERT OR IGNORE
+    private val insertUnresolvedAnchor = "this.runBatched('insertUnresolvedRefs', 'INSERT INTO unresolved_refs (from_node_id, reference_name, reference_kind, line, col, candidates, file_path, language) VALUES ', '(?,?,?,?,?,?,?,?)', rows);"
+    private val insertUnresolvedReplacement = "this.runBatched('insertUnresolvedRefs', 'INSERT OR IGNORE INTO unresolved_refs (from_node_id, reference_name, reference_kind, line, col, candidates, file_path, language) VALUES ', '(?,?,?,?,?,?,?,?)', rows);"
+
+    // B9: deleteNodesByFile prunes name_segment_vocab orphans
+    private val deleteNodesAnchor = lines(
+        "    deleteNodesByFile(filePath) {",
+        "        if (!this.stmts.deleteNodesByFile) {",
+        "            this.stmts.deleteNodesByFile = this.db.prepare('DELETE FROM nodes WHERE file_path = ?');",
+        "        }",
+        "        // Invalidate cache for nodes in this file",
+        "        for (const [id, node] of this.nodeCache) {",
+        "            if (node.filePath === filePath) {",
+        "                this.nodeCache.delete(id);",
+        "            }",
+        "        }",
+        "        this.stmts.deleteNodesByFile.run(filePath);",
+        "    }",
+    )
+
+    private val deleteNodesReplacement = lines(
+        "    deleteNodesByFile(filePath) {",
+        "        if (!this.stmts.deleteNodesByFile) {",
+        "            this.stmts.deleteNodesByFile = this.db.prepare('DELETE FROM nodes WHERE file_path = ?');",
+        "        }",
+        "        // Invalidate cache for nodes in this file",
+        "        for (const [id, node] of this.nodeCache) {",
+        "            if (node.filePath === filePath) {",
+        "                this.nodeCache.delete(id);",
+        "            }",
+        "        }",
+        "        this.stmts.deleteNodesByFile.run(filePath);",
+        "        try {",
+        "            this.db.exec('DELETE FROM name_segment_vocab WHERE name NOT IN (SELECT name FROM nodes)');",
+        "        } catch { /* ignore */ }",
+        "    }",
     )
 
     private val patches = listOf(
@@ -185,10 +315,16 @@ internal object CodeGraphBundlePatches {
         Patch("resolution/name-matcher.js", matcherAnchor, matcherReplacement),
         Patch("resolution/index.js", resolverAnchor, resolverReplacement),
         Patch("resolution/index.js", frameworkAnchor, frameworkReplacement),
+        Patch("resolution/import-resolver.js", pythonModuleImportAnchor, pythonModuleImportReplacement),
         Patch("extraction/tree-sitter.js", treeSitterAnchor, treeSitterReplacement),
         Patch("mcp/tools.js", exploreAnchor, exploreReplacement),
+        Patch("mcp/tools.js", exploreSearchLimitAnchor, exploreSearchLimitReplacement),
         Patch("bin/codegraph.js", impactAnchor, impactReplacement),
         Patch("db/index.js", maintenanceAnchor, maintenanceReplacement),
+        Patch("db/migrations.js", migrationVersionAnchor, migrationVersionReplacement),
+        Patch("db/migrations.js", migrationListAnchor, migrationListReplacement),
+        Patch("db/queries.js", insertUnresolvedAnchor, insertUnresolvedReplacement),
+        Patch("db/queries.js", deleteNodesAnchor, deleteNodesReplacement),
     )
 
     /**

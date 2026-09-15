@@ -55,6 +55,21 @@ class CodeGraphPatchesTest {
         "    }",
     )
 
+    private val importResolverSource = lines(
+        "function resolvePythonAbsoluteModule(ref, context) {",
+        "    if (ref.referenceKind !== 'imports')",
+        "        return null;",
+        "    // Only a DOTTED `import a.b.c` ref carries its full module path. A bare leaf",
+        "    // (`from app.api.routes import authentication`) is ambiguous on its own — three",
+        "    // `authentication.py` files may exist — so leave it to resolveModuleImportToFile,",
+        "    // which uses the import's source (`app.api.routes`) to build the full path.",
+        "    if (!ref.referenceName.includes('.'))",
+        "        return null;",
+        "    const hit = findPythonModuleFile(ref.referenceName, context, ref.filePath);",
+        "    return hit ? { original: ref, targetNodeId: hit.id, confidence: 0.9, resolvedBy: 'import' } : null;",
+        "}",
+    )
+
     private val treeSitterSource = lines(
         "    createNode(kind, name, node, extra) {",
         "        // Skip nodes with empty/missing names — they are not meaningful symbols",
@@ -68,6 +83,12 @@ class CodeGraphPatchesTest {
     )
 
     private val toolsSource = lines(
+        "        const subgraph = await cg.findRelevantContext(matchQuery, {",
+        "            searchLimit: 8,",
+        "            traversalDepth: 3,",
+        "            maxNodes: 200,",
+        "            minScore: 0.2,",
+        "        });",
         "        let summaryLine = survivors.length > 0",
         "            ? `Found \${shownSymbols} symbol\${shownSymbols === 1 ? '' : 's'} across \${survivors.length} file\${survivors.length === 1 ? '' : 's'}.`",
         "            : `Found \${subgraph.nodes.size} symbol\${subgraph.nodes.size === 1 ? '' : 's'} across \${fileGroups.size} file\${fileGroups.size === 1 ? '' : 's'}.`;",
@@ -83,6 +104,35 @@ class CodeGraphPatchesTest {
         "        await this.runPragmasOffThread(['PRAGMA analysis_limit=1000', 'PRAGMA optimize', 'PRAGMA wal_checkpoint(PASSIVE)'], ",
         "        // Worker threads unavailable — bounded in-line fallback, no checkpoint.",
         "        ['PRAGMA analysis_limit=1000', 'PRAGMA optimize']);",
+    )
+
+    private val migrationsSource = lines(
+        "exports.CURRENT_SCHEMA_VERSION = 9;",
+        "const migrations = [",
+        "    {",
+        "        version: 9,",
+        "        description: 'test',",
+        "        up: (db) => {",
+        "            db.exec('CREATE INDEX IF NOT EXISTS idx_files_generated ON files(path) WHERE generated = 1');",
+        "        },",
+        "    },",
+        "];",
+    )
+
+    private val queriesSource = lines(
+        "this.runBatched('insertUnresolvedRefs', 'INSERT INTO unresolved_refs (from_node_id, reference_name, reference_kind, line, col, candidates, file_path, language) VALUES ', '(?,?,?,?,?,?,?,?)', rows);",
+        "    deleteNodesByFile(filePath) {",
+        "        if (!this.stmts.deleteNodesByFile) {",
+        "            this.stmts.deleteNodesByFile = this.db.prepare('DELETE FROM nodes WHERE file_path = ?');",
+        "        }",
+        "        // Invalidate cache for nodes in this file",
+        "        for (const [id, node] of this.nodeCache) {",
+        "            if (node.filePath === filePath) {",
+        "                this.nodeCache.delete(id);",
+        "            }",
+        "        }",
+        "        this.stmts.deleteNodesByFile.run(filePath);",
+        "    }",
     )
 
     private fun tempDir(): File {
@@ -102,37 +152,49 @@ class CodeGraphPatchesTest {
         File(dist, "db").mkdirs()
         File(dist, "resolution/name-matcher.js").writeText(matcherSource)
         File(dist, "resolution/index.js").writeText(resolverSource)
+        File(dist, "resolution/import-resolver.js").writeText(importResolverSource)
         File(dist, "extraction/tree-sitter.js").writeText(treeSitterSource)
         File(dist, "mcp/tools.js").writeText(toolsSource)
         File(dist, "bin/codegraph.js").writeText(binSource)
         File(dist, "db/index.js").writeText(dbSource)
+        File(dist, "db/migrations.js").writeText(migrationsSource)
+        File(dist, "db/queries.js").writeText(queriesSource)
         return dist
     }
 
     @Test
-    fun `applies all 8 bundle patches cleanly`() {
+    fun `applies all bundle patches cleanly`() {
         val dist = bundle()
 
         val result = CodeGraphBundlePatches.apply(dist)
 
         assertTrue("anchors must match the shipped shape", result.unresolved.isEmpty())
-        assertEquals("all files should have applied patches", 6, result.applied.toSet().size)
+        assertEquals("all files should have applied patches", 9, result.applied.toSet().size)
 
         val matcher = File(dist, "resolution/name-matcher.js").readText()
         val resolver = File(dist, "resolution/index.js").readText()
+        val importResolver = File(dist, "resolution/import-resolver.js").readText()
         val treeSitter = File(dist, "extraction/tree-sitter.js").readText()
         val tools = File(dist, "mcp/tools.js").readText()
         val bin = File(dist, "bin/codegraph.js").readText()
         val db = File(dist, "db/index.js").readText()
+        val migrations = File(dist, "db/migrations.js").readText()
+        val queries = File(dist, "db/queries.js").readText()
 
         assertTrue("name-matcher includes web SFCs", matcher.contains("vue: 'web', svelte: 'web', astro: 'web'"))
         assertTrue("name-matcher gates calls/extends", matcher.contains("sameLanguageFamily(c.language, ref.language)"))
         assertTrue("resolver gates calls/extends", resolver.contains("sameLanguageFamily)(tgt, ref.language)"))
         assertTrue("framework gate rejects cross-language", resolver.contains("gateFrameworkLanguage"))
+        assertTrue("import resolver supports bare python module import", importResolver.contains("bare single module imports"))
         assertTrue("tree-sitter rejects junk AST names", treeSitter.contains("name.startsWith('from ')"))
         assertTrue("mcp explore shows truncation note", tools.contains("showing \${shownSymbols} of \${totalFound}"))
+        assertTrue("mcp explore raises searchLimit", tools.contains("Math.max(24, maxFiles * 2)"))
         assertTrue("bin impact shows multi-def note", bin.contains("definitions named"))
-        assertTrue("db maintenance includes ANALYZE", db.contains("ANALYZE"))
+        assertTrue("db maintenance excludes virtual FTS table", db.contains("ANALYZE nodes"))
+        assertTrue("migrations bumps version to 10", migrations.contains("CURRENT_SCHEMA_VERSION = 10;"))
+        assertTrue("migrations includes version 10", migrations.contains("version: 10,"))
+        assertTrue("queries uses INSERT OR IGNORE", queries.contains("INSERT OR IGNORE INTO unresolved_refs"))
+        assertTrue("queries prunes vocab on file deletion", queries.contains("DELETE FROM name_segment_vocab WHERE name NOT IN"))
     }
 
     @Test
