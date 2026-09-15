@@ -349,6 +349,9 @@ class CodeGraphManager(
     private val nodeBinary get() = File(root, "node/bin/node")
     private val bundleLib get() = File(root, "bundle/lib")
 
+    /** The bundle's JavaScript, which is what the Harness patches edit. */
+    private val bundleDist get() = File(bundleLib, "dist")
+
     private val _state = MutableStateFlow(CodeGraphState(version = markerVersion()))
     val state: StateFlow<CodeGraphState> = _state
 
@@ -358,6 +361,7 @@ class CodeGraphManager(
     /** Set once the on-disk launcher has been compared with this build's. */
     @Volatile
     private var launcherChecked = false
+    private var bundlePatchChecked = false
 
     fun isIndexed(workspace: WorkspaceFs?): Boolean =
         workspace?.shellRoot?.resolve(".codegraph")?.isDirectory == true
@@ -476,6 +480,9 @@ class CodeGraphManager(
             return CodeGraphCommandResult(false, "Could not install the Node runtime CodeGraph needs.")
         }
         writeLauncher()
+        // A fresh download is the unpatched release, so the fixes go on before
+        // anything can run it.
+        CodeGraphBundlePatches.apply(bundleDist)
         ensureTelemetryOff()
         removeLegacyNpmInstall()
         linuxEnv.ensureShims(force = true)
@@ -733,6 +740,7 @@ class CodeGraphManager(
      * compare is small but not free, and the launcher cannot change under us.
      */
     private fun ensureLauncherCurrent() {
+        ensureBundlePatched()
         if (launcherChecked || !binary.exists()) return
         launcherChecked = true
         var changed = false
@@ -745,6 +753,22 @@ class CodeGraphManager(
         // made here would otherwise sit in the app prefix and never reach the
         // deployed copy that the privileged tier runs.
         if (changed) linuxEnv.invalidateExternalToolDeploy()
+    }
+
+    /**
+     * Applies the fixes Harness carries for the vendored CodeGraph release.
+     * Runs once per process, on the same path that keeps the launcher and the
+     * telemetry config current, so an install that already exists picks them up
+     * instead of waiting for a reinstall.
+     */
+    private fun ensureBundlePatched() {
+        if (bundlePatchChecked) return
+        bundlePatchChecked = true
+        val result = runCatching { CodeGraphBundlePatches.apply(bundleDist) }.getOrNull() ?: return
+        // The staged tarball is only rewritten when it looks stale, so a change
+        // to the bundle has to invalidate it or the privileged tier keeps
+        // running the copy it deployed before the fix.
+        if (result.changed) linuxEnv.invalidateExternalToolDeploy()
     }
 
     /**
