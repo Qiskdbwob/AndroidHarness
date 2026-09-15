@@ -47,7 +47,7 @@ class CodeGraphCommandsTest {
         assertTrue(script.contains("""CLI="${'$'}PREFIX/codegraph/bundle/lib/dist/bin/codegraph.js""""))
     }
 
-    @Test
+@Test
     fun `launcher pins the openssl config and disables the linker-hostile watchdog`() {
         val script = CodeGraphCommands.launcher()
         // Node's built-in config path is /data/data/com.termux/..., which is
@@ -56,6 +56,33 @@ class CodeGraphCommandsTest {
         // CodeGraph's watchdog re-runs node through process.execPath, which is
         // the linker on this launch path, so its child dies on "-e".
         assertTrue(script.contains("CODEGRAPH_NO_WATCHDOG=1"))
+    }
+
+    @Test
+    fun `launcher turns codegraph telemetry off`() {
+        val script = CodeGraphCommands.launcher()
+        // Telemetry is on by default upstream, and the env vars outrank any
+        // stored consent, so both are exported before every invocation.
+        assertTrue(script.contains("DO_NOT_TRACK=1"))
+        assertTrue(script.contains("CODEGRAPH_TELEMETRY=0"))
+        assertTrue(script.contains("export DO_NOT_TRACK CODEGRAPH_TELEMETRY"))
+    }
+
+    @Test
+    fun `the stored telemetry consent says off and keeps the machine id`() {
+        val fresh = CodeGraphProvision.telemetryOffConfig(null, "11111111-2222-3333-4444-555555555555")
+        assertTrue(CodeGraphProvision.telemetryIsOff(fresh))
+        assertTrue(fresh.contains("11111111-2222-3333-4444-555555555555"))
+        assertTrue(fresh.contains("\"androidharness\""))
+
+        // An existing id is preserved: a fresh one would read as a new machine.
+        val existing = """{"enabled": true, "machine_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}"""
+        val rewritten = CodeGraphProvision.telemetryOffConfig(existing, "unused")
+        assertTrue(rewritten.contains("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"))
+        assertFalse(rewritten.contains("unused"))
+
+        assertFalse(CodeGraphProvision.telemetryIsOff("""{"enabled": true}"""))
+        assertFalse(CodeGraphProvision.telemetryIsOff(null))
     }
 
     @Test

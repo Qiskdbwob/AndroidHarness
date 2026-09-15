@@ -72,6 +72,14 @@ internal object CodeGraphCommands {
         |  echo "codegraph: the Harness-installed runtime is incomplete. Reinstall it from Settings, Code intelligence." >&2
         |  exit 127
         |fi
+        |# CodeGraph ships anonymous usage telemetry that is ON by default, and its
+        |# resolution order is DO_NOT_TRACK > CODEGRAPH_TELEMETRY > stored config,
+        |# so both are set here: nothing is recorded, nothing is sent, no socket is
+        |# opened, and a config an earlier run left behind cannot turn it back on.
+        |# Harness ships a telemetry-free install and does not re-enable it.
+        |DO_NOT_TRACK=1
+        |CODEGRAPH_TELEMETRY=0
+        |export DO_NOT_TRACK CODEGRAPH_TELEMETRY
         |# Node opens the openssl.cnf it was built with, which for these Termux
         |# builds is /data/data/com.termux/...: unreadable from this app, and when
         |# the Termux app is installed that is EACCES rather than a missing file,
@@ -197,6 +205,30 @@ internal object CodeGraphProvision {
         val match = Regex("^([0-9a-fA-F]{64})\\s+\\*?(.+)$").find(line.trim()) ?: return@mapNotNull null
         if (match.groupValues[2].trim().substringAfterLast('/') == asset) match.groupValues[1].lowercase() else null
     }.firstOrNull()
+
+    /**
+     * Body for CodeGraph's stored telemetry consent, with telemetry off. The
+     * file is `$HOME/.codegraph/telemetry.json` and it is what
+     * `codegraph telemetry off` writes, so an install that was never given our
+     * launcher cannot report either. Any machine_id already on disk is kept:
+     * rewriting it would look like a new machine to the (disabled) collector.
+     */
+    fun telemetryOffConfig(existing: String?, machineId: String): String {
+        val kept = Regex("\"machine_id\"\\s*:\\s*\"([^\"]+)\"").find(existing.orEmpty())?.groupValues?.get(1)
+        return """
+            {
+              "enabled": false,
+              "machine_id": "${kept ?: machineId}",
+              "consent_source": "androidharness",
+              "first_run_notice_shown": true,
+              "updated_at": "${java.time.Instant.now()}"
+            }
+        """.trimIndent()
+    }
+
+    /** True when [existing] already records telemetry as off. */
+    fun telemetryIsOff(existing: String?): Boolean =
+        Regex("\"enabled\"\\s*:\\s*false").containsMatchIn(existing.orEmpty())
 
     /** True when [candidate] is a later release than [installed], ignoring any pre-release suffix. */
     fun isNewer(candidate: String, installed: String): Boolean {
@@ -419,6 +451,7 @@ class CodeGraphManager(
             return CodeGraphCommandResult(false, "Could not install the Node runtime CodeGraph needs.")
         }
         writeLauncher()
+        ensureTelemetryOff()
         removeLegacyNpmInstall()
         linuxEnv.ensureShims(force = true)
         return null
@@ -677,7 +710,37 @@ class CodeGraphManager(
     private fun ensureLauncherCurrent() {
         if (launcherChecked || !binary.exists()) return
         launcherChecked = true
-        if (runCatching { binary.readText() }.getOrNull() != CodeGraphCommands.launcher()) writeLauncher()
+        var changed = false
+        if (runCatching { binary.readText() }.getOrNull() != CodeGraphCommands.launcher()) {
+            writeLauncher()
+            changed = true
+        }
+        if (ensureTelemetryOff()) changed = true
+        // The staged tarball is only rewritten when it looks stale, so a change
+        // made here would otherwise sit in the app prefix and never reach the
+        // deployed copy that the privileged tier runs.
+        if (changed) linuxEnv.invalidateExternalToolDeploy()
+    }
+
+    /**
+     * Turns CodeGraph's anonymous usage telemetry off on disk, so a launch that
+     * bypasses the launcher (someone running the bundle's JS directly) cannot
+     * report either. The launcher sets the env vars that outrank this file; both
+     * exist because the env only covers processes it starts.
+     */
+    private fun ensureTelemetryOff(): Boolean {
+        val config = File(home, ".codegraph/telemetry.json")
+        val existing = runCatching { config.readText() }.getOrNull()
+        if (CodeGraphProvision.telemetryIsOff(existing)) return false
+        return runCatching {
+            config.parentFile?.mkdirs()
+            config.writeText(
+                CodeGraphProvision.telemetryOffConfig(existing, java.util.UUID.randomUUID().toString()),
+            )
+            // "Off is off": drop whatever was buffered but not yet sent.
+            File(config.parentFile, "telemetry-queue.jsonl").delete()
+            true
+        }.getOrDefault(false)
     }
 
     /**
