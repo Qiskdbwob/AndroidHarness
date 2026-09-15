@@ -244,6 +244,7 @@ fun SettingsScreen(
                             ChatBehaviorSection(container, settings, scope)
                             SlashCommandsSection(container)
                         }
+                        SettingsPage.CODE_INTELLIGENCE -> CodeIntelligenceSection(container, workspace, currentProject)
                         SettingsPage.VOICE -> VoiceSpeechSection(container, settings, scope)
                         SettingsPage.APPEARANCE -> AppearanceSection(container, settings, scope)
                         SettingsPage.PRIVACY -> PrivacySection(container, settings, scope)
@@ -461,6 +462,188 @@ private fun TerminalSection(
         onGrant = { container.shizuku.requestPermission() },
     )
     BatteryCard(container = container)
+}
+
+// ---------------------------------------------------------------------------
+// Code intelligence
+// ---------------------------------------------------------------------------
+
+@Composable
+private fun CodeIntelligenceSection(
+    container: AppContainer,
+    workspace: com.androidharness.app.workspace.WorkspaceFs?,
+    currentProject: ProjectEntity?,
+) {
+    val codeGraphState by container.codeGraph.state.collectAsStateWithLifecycle()
+    val scope = rememberCoroutineScope()
+    val rootPath = workspace?.shellRoot?.absolutePath
+    var indexRevision by remember(rootPath) { mutableStateOf(0) }
+    val indexed = remember(rootPath, indexRevision) { container.codeGraph.isIndexed(workspace) }
+
+    LaunchedEffect(rootPath) {
+        container.codeGraph.refresh()
+    }
+
+    SettingsHeader("CodeGraph")
+    SettingsPanel(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    Icons.Outlined.Code,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(20.dp),
+                )
+                Spacer(Modifier.width(10.dp))
+                Column(Modifier.weight(1f)) {
+                    Text("CodeGraph", style = MaterialTheme.typography.titleSmall)
+                    Text(
+                        "Local semantic code graph for symbols, callers, impact and affected tests",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                StatusText(
+                    codeGraphState.version?.let { "v$it" } ?: "Not installed",
+                    ok = codeGraphState.version != null,
+                )
+            }
+
+            if (codeGraphState.busy) {
+                ThinLinearProgress(modifier = Modifier.fillMaxWidth())
+                Text(
+                    codeGraphState.action ?: "Working…",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
+            codeGraphState.message?.takeLast(1_200)?.let { message ->
+                Text(
+                    message,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (codeGraphState.failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                if (codeGraphState.version == null) {
+                    Button(
+                        enabled = !codeGraphState.busy,
+                        onClick = { scope.launch { container.codeGraph.installOrUpdate() } },
+                    ) { Text("Install CodeGraph") }
+                } else {
+                    Button(
+                        enabled = !codeGraphState.busy,
+                        onClick = { scope.launch { container.codeGraph.installOrUpdate() } },
+                    ) { Text("Update") }
+                    OutlinedButton(
+                        enabled = !codeGraphState.busy,
+                        onClick = { scope.launch { container.codeGraph.uninstall() } },
+                    ) { Text("Uninstall") }
+                }
+            }
+
+            Text(
+                "Harness installs CodeGraph into its private Linux environment. No Termux app or separate CodeGraph agent setup is required.",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+
+    SettingsHeader("Active workspace")
+    SettingsPanel(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Outlined.Folder, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(Modifier.width(10.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(currentProject?.name ?: "No workspace", style = MaterialTheme.typography.titleSmall)
+                    Text(
+                        rootPath ?: "This workspace does not expose a real filesystem path",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                if (rootPath != null) {
+                    StatusText(if (indexed) "Indexed" else "Not indexed", ok = indexed)
+                }
+            }
+
+            when {
+                rootPath == null -> Text(
+                    "CodeGraph needs a shell-capable workspace with a real device path.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                codeGraphState.version == null -> Text(
+                    "Install CodeGraph first, then enable it for this workspace.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                !indexed -> Button(
+                    enabled = !codeGraphState.busy,
+                    onClick = {
+                        val current = workspace
+                        scope.launch {
+                            container.codeGraph.initWorkspace(current)
+                            indexRevision++
+                        }
+                    },
+                ) { Text("Enable for this workspace") }
+                else -> FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    FilledTonalButton(
+                        enabled = !codeGraphState.busy,
+                        onClick = {
+                            val current = workspace
+                            scope.launch {
+                                container.codeGraph.syncWorkspace(current)
+                                indexRevision++
+                            }
+                        },
+                    ) { Text("Sync") }
+                    OutlinedButton(
+                        enabled = !codeGraphState.busy,
+                        onClick = {
+                            val current = workspace
+                            scope.launch {
+                                container.codeGraph.reindexWorkspace(current)
+                                indexRevision++
+                            }
+                        },
+                    ) { Text("Re-index") }
+                    TextButton(
+                        enabled = !codeGraphState.busy,
+                        onClick = {
+                            val current = workspace
+                            scope.launch {
+                                container.codeGraph.disableWorkspace(current)
+                                indexRevision++
+                            }
+                        },
+                    ) { Text("Disable") }
+                }
+            }
+        }
+    }
+
+    SettingsPanel(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("Agent integration", style = MaterialTheme.typography.titleSmall)
+            Text(
+                "When this workspace is indexed, Harness exposes CodeGraph explore, node, impact, affected-tests and sync tools to the coding agent. Queries sync changed files before reading the graph.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

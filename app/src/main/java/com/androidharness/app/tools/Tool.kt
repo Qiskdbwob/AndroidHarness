@@ -37,6 +37,8 @@ interface Tool {
     val parametersSchema: JsonObject
     val isReadOnly: Boolean
 
+    fun isAvailable(ctx: ToolContext): Boolean = true
+
     suspend fun execute(args: JsonObject, ctx: ToolContext): ToolResult
 }
 
@@ -49,8 +51,8 @@ class ToolRegistry(private val tools: List<Tool>) {
     fun withExtra(extra: List<Tool>): ToolRegistry =
         if (extra.isEmpty()) this else ToolRegistry(tools + extra)
 
-    fun schemas(readOnlyOnly: Boolean = false) = byName.values
-        .filter { !readOnlyOnly || it.isReadOnly }
+    fun schemas(readOnlyOnly: Boolean = false, context: ToolContext? = null) = byName.values
+        .filter { (!readOnlyOnly || it.isReadOnly) && (context == null || it.isAvailable(context)) }
         .sortedBy { it.name }
         .map {
             com.androidharness.app.llm.ToolSchema(it.name, it.description, it.parametersSchema)
@@ -65,6 +67,7 @@ class ToolRegistry(private val tools: List<Tool>) {
             shizuku: com.androidharness.app.data.env.ShizukuManager,
             shellRouter: com.androidharness.app.data.env.ShellTierRouter,
             skills: com.androidharness.app.skills.SkillStore,
+            codeGraph: com.androidharness.app.data.env.CodeGraphManager,
             imageStore: com.androidharness.app.data.ImageStore? = null,
             browserController: com.androidharness.app.browser.BrowserController? = null,
             searchApi: () -> com.androidharness.app.tools.SearchApiConfig? = { null },
@@ -114,6 +117,11 @@ class ToolRegistry(private val tools: List<Tool>) {
                 SkillViewTool(skills),
                 SkillsListTool(skills),
                 SkillManageTool(skills),
+                CodeGraphExploreTool(codeGraph),
+                CodeGraphNodeTool(codeGraph),
+                CodeGraphImpactTool(codeGraph),
+                CodeGraphAffectedTool(codeGraph),
+                CodeGraphSyncTool(codeGraph),
             )
             if (imageStore != null) {
                 baseTools.add(ReadImageTool(imageStore))

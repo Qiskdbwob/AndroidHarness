@@ -95,6 +95,26 @@ fun toolPresentation(call: ToolCallData, result: ChatMessage? = null): ToolPrese
                 kind = ToolActivityKind.SEARCH,
             )
         }
+        "codegraph_explore" -> {
+            val query = arg("query") ?: "code"
+            ToolPresentation("Explored code graph", "Exploring ${query.take(48)}…", query, ToolActivityKind.SEARCH)
+        }
+        "codegraph_node" -> {
+            val node = arg("name") ?: arg("file") ?: "symbol"
+            ToolPresentation("Read code graph node", "Reading ${node.take(48)}…", node, ToolActivityKind.READ)
+        }
+        "codegraph_impact" -> {
+            val symbol = arg("symbol") ?: "symbol"
+            ToolPresentation("Analyzed change impact", "Analyzing ${symbol.take(48)}…", symbol, ToolActivityKind.SEARCH)
+        }
+        "codegraph_affected" -> ToolPresentation(
+            "Found affected tests", "Finding affected tests…", kind = ToolActivityKind.SEARCH,
+        )
+        "codegraph_sync" -> ToolPresentation(
+            if (result?.isError == true) "CodeGraph sync failed" else "Synced CodeGraph",
+            "Syncing CodeGraph…",
+            kind = ToolActivityKind.READ,
+        )
         "shell" -> {
             val command = arg("command")?.trim().orEmpty()
             val verification = isVerificationCommand(command)

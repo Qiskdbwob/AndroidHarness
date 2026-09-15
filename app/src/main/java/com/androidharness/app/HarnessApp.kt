@@ -80,6 +80,7 @@ class AppContainer(val appContext: Context) {
         com.androidharness.app.data.env.LinuxEnvironmentManager(appContext) { keys.githubToken() }
     val shizuku = com.androidharness.app.data.env.ShizukuManager(appContext)
     val shellRouter = com.androidharness.app.data.env.ShellTierRouter(appContext, shizuku, linuxEnv)
+    val codeGraph = com.androidharness.app.data.env.CodeGraphManager(linuxEnv, shellRouter)
 
     init {
         // Package-set changes must invalidate the deployed-copy cache, or the
@@ -119,7 +120,7 @@ class AppContainer(val appContext: Context) {
     )
     val browser = com.androidharness.app.browser.BrowserController(appContext, images)
     val registry = ToolRegistry.default(
-        fetchClient, todoStore, backgroundProcesses, linuxEnv, shizuku, shellRouter, skills,
+        fetchClient, todoStore, backgroundProcesses, linuxEnv, shizuku, shellRouter, skills, codeGraph,
         imageStore = images,
         browserController = browser,
         searchApi = { searchApiConfig },

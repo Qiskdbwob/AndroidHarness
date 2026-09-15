@@ -11,6 +11,7 @@ class SettingsNavigationTest {
         assertTrue(SettingsPage.MODELS in matchingSettingsPages("api\tkey"))
         assertEquals(listOf(SettingsPage.CHAT), matchingSettingsPages("repo map"))
         assertEquals(listOf(SettingsPage.PRIVACY), matchingSettingsPages("fingerprint"))
+        assertEquals(listOf(SettingsPage.CODE_INTELLIGENCE), matchingSettingsPages("codegraph affected"))
     }
 
     @Test

@@ -7,7 +7,7 @@ package com.androidharness.app.workspace
 object WorkspaceIgnore {
 
     private val DIR_NAMES = setOf(
-        ".git", ".svn", ".hg",
+        ".git", ".svn", ".hg", ".codegraph",
         "node_modules", "bower_components",
         "build", ".gradle", ".idea",
         "__pycache__", ".mypy_cache", ".pytest_cache",

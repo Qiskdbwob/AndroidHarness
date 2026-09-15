@@ -240,7 +240,10 @@ class AgentEngine(
         var systemPrompt = systemPrompt(workspace, mode, fullAccess = false, repoMapEnabled = repoMapEnabled) + if (pinnedInstructions.isBlank()) "" else "\n\nPinned user instructions:\n$pinnedInstructions"
         var promptSandboxOff = false
         val runRegistry = registry.withExtra(extraTools)
-        val tools = runRegistry.schemas(readOnlyOnly = mode == AgentMode.PLAN)
+        val tools = runRegistry.schemas(
+            readOnlyOnly = mode == AgentMode.PLAN,
+            context = ToolContext(workspace = workspace, sessionId = sessionId),
+        )
         val working = trimHistory(
             ContextHygiene.shrinkToolResults(history.map { it.withImagesResolved() }),
             maxContextTokens, options.maxOutputTokens,
@@ -1097,8 +1100,8 @@ class AgentEngine(
     // ------------------------------------------------------------------
 
     /** Tools a subagent may see: read-only, no ask_user (deadlock), no task (no nesting). */
-    private fun subagentTools(): List<com.androidharness.app.llm.ToolSchema> =
-        registry.schemas(readOnlyOnly = true).filter {
+    private fun subagentTools(ctx: ToolContext): List<com.androidharness.app.llm.ToolSchema> =
+        registry.schemas(readOnlyOnly = true, context = ctx).filter {
             it.name != "ask_user" && it.name != "task"
         }
 
@@ -1130,7 +1133,7 @@ class AgentEngine(
         val system =
             "You are a read-only research subagent inside a coding harness. " +
                 "Explore the workspace with the tools you have (read_file, list_dir, " +
-                "search_files, grep, file_info, web_fetch/search) to answer the task. " +
+                "search_files, grep, file_info, web_fetch/search, and CodeGraph when available) to answer the task. " +
                 "You must not modify anything, and you cannot ask questions; if something " +
                 "is ambiguous, state your assumption and continue. " +
                 "When reporting file properties like newlines or byte counts, inspect with file_info rather than inferring from line counts. " +
@@ -1138,11 +1141,11 @@ class AgentEngine(
                 "ONLY thing returned to the caller, so include file paths, line references " +
                 "and concrete details, and no meta-commentary."
         val history = mutableListOf(ChatMessage(role = Role.USER, text = prompt))
-        val subTools = subagentTools()
+        val ctx = ToolContext(workspace, sandboxOff)
+        val subTools = subagentTools(ctx)
         // No separate budget quota here: capping output made reasoning models
         // burn the cap on thinking before ever answering (reasoning streamed,
         // no answer). Subagents get the main loop's full output budget.
-        val ctx = ToolContext(workspace, sandboxOff)
 
         var iteration = 0
         var nudged = false

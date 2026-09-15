@@ -1046,17 +1046,26 @@ class LinuxEnvironmentManager(
     private val stagingMarker: File get() = File(stagingDir, ".harness-staged")
 
     /**
-     * Hash of the installed package set only. The GitHub token fingerprint is
+     * Hash of the installed package set plus optional tools deployed with it. The GitHub token fingerprint is
      * deliberately NOT an input anymore: auth changes propagate to the shell
      * tier via syncShellTierAuth (direct file writes), and refreshGitHub
      * re-stages the tarball in the background so the staging copy never goes
      * stale. Pinning auth to full redeploys made every logout/login pay a
      * 30-60s untar and left the UI lagging.
      */
-    fun packageSetHash(): String =
-        // Refresh deployed prefixes to include the locale compatibility command.
-        ("v10-locale\n" + installedPackages().sorted().joinToString("\n"))
+    fun packageSetHash(): String {
+        val codeGraphVersion = runCatching {
+            File(prefix, CODEGRAPH_VERSION_MARKER).readText().trim()
+        }.getOrDefault("")
+        return ("v11-codegraph\n$codeGraphVersion\n" + installedPackages().sorted().joinToString("\n"))
             .let { MessageDigest.getInstance("SHA-256").digest(it.toByteArray()).joinToString("") { b -> "%02x".format(b) } }
+    }
+
+    /** External tools installed into the prefix must refresh the staged/deployed copy too. */
+    fun invalidateExternalToolDeploy() {
+        runCatching { stagingMarker.delete() }
+        runCatching { deployStateListener?.invoke() }
+    }
 
     private fun fileSha256(file: File): String {
         val digest = MessageDigest.getInstance("SHA-256")

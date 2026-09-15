@@ -9,7 +9,7 @@ class WorkspaceIgnoreTest {
     @Test
     fun `default junk directories are ignored`() {
         for (name in listOf(
-            ".git", "node_modules", "build", ".gradle", ".idea",
+            ".git", ".codegraph", "node_modules", "build", ".gradle", ".idea",
             "__pycache__", ".next", "dist", "out", ".cache",
             "venv", ".venv", "target",
         )) {
@@ -29,6 +29,7 @@ class WorkspaceIgnoreTest {
         assertTrue(WorkspaceIgnore.shouldSkip("app/build/outputs/apk/debug.apk"))
         assertTrue(WorkspaceIgnore.shouldSkip("node_modules/okhttp/index.js"))
         assertTrue(WorkspaceIgnore.shouldSkip(".git/HEAD"))
+        assertTrue(WorkspaceIgnore.shouldSkip(".codegraph/index.db"))
         assertFalse(WorkspaceIgnore.shouldSkip("app/src/main/java/Foo.kt"))
         assertFalse(WorkspaceIgnore.shouldSkip("build.gradle.kts"))
     }
