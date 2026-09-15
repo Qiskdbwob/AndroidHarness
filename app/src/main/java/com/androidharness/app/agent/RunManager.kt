@@ -1,8 +1,6 @@
 package com.androidharness.app.agent
 
 import android.content.Context
-import android.content.Intent
-import androidx.core.content.ContextCompat
 import com.androidharness.app.AgentService
 import com.androidharness.app.PendingPrompt
 import com.androidharness.app.RuntimeNotifier
@@ -668,6 +666,13 @@ class RunManager(
         synchronized(lock) { jobs[sessionId]?.cancel() }
     }
 
+    /** Cancels every live agent run and waits for each run's cleanup. */
+    suspend fun stopAllAndJoin() {
+        val active = synchronized(lock) { jobs.values.toList() }
+        active.forEach { it.cancel() }
+        active.forEach { runCatching { it.join() } }
+    }
+
     /**
      * Cancels the run and suspends until its cleanup has finished, so a follow-up
      * [startRun] cannot race the old job's finally block.
@@ -873,19 +878,15 @@ class RunManager(
     /** Foreground service + wakelock while anything important is running. */
     fun acquireKeepalive() {
         if (keepaliveCount.getAndIncrement() == 0) {
-            runCatching {
-                ContextCompat.startForegroundService(
-                    context, Intent(context, AgentService::class.java),
-                )
-            }
+            runCatching { AgentService.acquireKeepalive(context) }
         }
     }
 
     fun releaseKeepalive() {
         if (keepaliveCount.decrementAndGet() <= 0) {
             keepaliveCount.set(0)
-            RuntimeNotifier.update("Working…")
-            runCatching { context.stopService(Intent(context, AgentService::class.java)) }
+            RuntimeNotifier.update("Running in background")
+            runCatching { AgentService.releaseKeepalive(context) }
         }
     }
 

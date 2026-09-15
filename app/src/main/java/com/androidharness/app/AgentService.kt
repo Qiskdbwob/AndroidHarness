@@ -11,6 +11,8 @@ import android.content.Intent
 import android.graphics.drawable.Icon
 import android.os.IBinder
 import android.os.PowerManager
+import android.os.Process
+import androidx.core.content.ContextCompat
 import com.androidharness.app.agent.NotificationActionReceiver
 import com.androidharness.app.agent.NotificationActionReceiver.Companion.ACTION_APPROVE
 import com.androidharness.app.agent.NotificationActionReceiver.Companion.ACTION_APPROVE_ALWAYS
@@ -28,7 +30,7 @@ import kotlinx.coroutines.launch
 
 /** Pushes the agent's live status for the notification to display. */
 object RuntimeNotifier {
-    private val _status = MutableStateFlow("Working…")
+    private val _status = MutableStateFlow("Running in background")
     val status: StateFlow<String> = _status
 
     /** Heads-up events posted when a run ends while the app may be backgrounded. */
@@ -147,7 +149,7 @@ class AgentService : Service() {
     override fun onCreate() {
         super.onCreate()
         createChannels()
-        startForeground(NOTIFICATION_ID, buildNotification("Working…"))
+        startForeground(NOTIFICATION_ID, buildNotification(RuntimeNotifier.status.value))
         scope.launch {
             RuntimeNotifier.status.collect { text ->
                 runCatching {
@@ -171,8 +173,15 @@ class AgentService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        acquireWakeLock()
-        return START_NOT_STICKY
+        when (intent?.action) {
+            ACTION_ACQUIRE_WAKELOCK -> acquireWakeLock()
+            ACTION_RELEASE_WAKELOCK -> releaseWakeLock()
+            ACTION_STOP -> {
+                stopFromNotification()
+                return START_NOT_STICKY
+            }
+        }
+        return START_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -242,9 +251,45 @@ class AgentService : Service() {
             .setContentTitle("AndroidHarness")
             .setContentText(text)
             .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setContentIntent(appPendingIntent())
             .setOnlyAlertOnce(true)
             .setOngoing(true)
+            .setAutoCancel(false)
+            .setCategory(Notification.CATEGORY_SERVICE)
+            .setShowWhen(false)
+            .addAction(
+                Notification.Action.Builder(
+                    null as Icon?, "Stop", stopPendingIntent(),
+                ).build(),
+            )
             .build()
+
+    private fun appPendingIntent(): PendingIntent = PendingIntent.getActivity(
+        this,
+        OPEN_APP_REQUEST_CODE,
+        Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+    )
+
+    private fun stopPendingIntent(): PendingIntent = PendingIntent.getService(
+        this,
+        STOP_REQUEST_CODE,
+        Intent(this, AgentService::class.java).setAction(ACTION_STOP),
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+    )
+
+    private fun stopFromNotification() {
+        scope.launch(Dispatchers.IO) {
+            val container = (applicationContext as? HarnessApp)?.container
+            runCatching { container?.runManager?.stopAllAndJoin() }
+            runCatching { container?.terminal?.stopTerminal() }
+            runCatching { container?.backgroundProcesses?.killAll() }
+            releaseWakeLock()
+            runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
+            stopSelf()
+            Process.killProcess(Process.myPid())
+        }
+    }
 
     // ------------------------------------------------------------------
     // Answerable "action needed" alerts
@@ -376,5 +421,33 @@ class AgentService : Service() {
         const val MAX_OPTION_BUTTONS = 3
 
         const val EXTRA_SESSION_ID = "session_id"
+
+        private const val ACTION_START = "com.androidharness.app.action.START_BACKGROUND"
+        private const val ACTION_ACQUIRE_WAKELOCK = "com.androidharness.app.action.ACQUIRE_WAKELOCK"
+        private const val ACTION_RELEASE_WAKELOCK = "com.androidharness.app.action.RELEASE_WAKELOCK"
+        private const val ACTION_STOP = "com.androidharness.app.action.STOP_APP"
+        private const val OPEN_APP_REQUEST_CODE = 9104
+        private const val STOP_REQUEST_CODE = 9105
+
+        fun startPersistent(context: Context) {
+            ContextCompat.startForegroundService(
+                context,
+                Intent(context, AgentService::class.java).setAction(ACTION_START),
+            )
+        }
+
+        fun acquireKeepalive(context: Context) {
+            ContextCompat.startForegroundService(
+                context,
+                Intent(context, AgentService::class.java).setAction(ACTION_ACQUIRE_WAKELOCK),
+            )
+        }
+
+        fun releaseKeepalive(context: Context) {
+            ContextCompat.startForegroundService(
+                context,
+                Intent(context, AgentService::class.java).setAction(ACTION_RELEASE_WAKELOCK),
+            )
+        }
     }
 }

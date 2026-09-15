@@ -177,6 +177,16 @@ class BgProcessStore(
 
     fun get(id: Int): BgProcessEntry? = entries[id]
 
+    /** Stops every background process launched through Harness. */
+    suspend fun killAll(): Int {
+        val ids = entries.keys.toList()
+        var killed = 0
+        for (id in ids) {
+            if (runCatching { kill(id) }.getOrDefault(false)) killed++
+        }
+        return killed
+    }
+
     suspend fun kill(id: Int): Boolean {
         val e = entries[id] ?: return false
         val logFile = File(e.cwd, e.logPath).takeIf { it.exists() }

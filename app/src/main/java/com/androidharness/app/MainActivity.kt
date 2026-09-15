@@ -62,6 +62,7 @@ class MainActivity : FragmentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         container = (application as HarnessApp).container
+        AgentService.startPersistent(this)
 
         // The foreground service + run-result notifications need this on 13+.
         if (Build.VERSION.SDK_INT >= 33 &&
