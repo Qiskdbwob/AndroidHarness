@@ -612,18 +612,30 @@ private fun CodeIntelligenceSection(
                 }
             }
 
-            // Output of the last sync, re-index or disable, shown here rather
-            // than in the install card above, which is not what was tapped.
+            // Live output of the run that is happening or has just finished,
+            // shown here rather than in the install card above, which is not
+            // what was tapped. During a long index these lines are the only
+            // sign of life, so the tail scrolls with the work.
             workspaceRun.message?.takeLast(1_200)?.let { message ->
-                Text(
-                    message,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = if (workspaceRun.failed) {
-                        MaterialTheme.colorScheme.error
-                    } else {
-                        MaterialTheme.colorScheme.onSurfaceVariant
-                    },
-                )
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .background(
+                            MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                            MaterialTheme.shapes.small,
+                        )
+                        .padding(horizontal = 10.dp, vertical = 8.dp),
+                ) {
+                    Text(
+                        message.trim().lines().takeLast(9).joinToString("\n"),
+                        style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                        color = if (workspaceRun.failed) {
+                            MaterialTheme.colorScheme.error
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        },
+                    )
+                }
             }
 
             when {

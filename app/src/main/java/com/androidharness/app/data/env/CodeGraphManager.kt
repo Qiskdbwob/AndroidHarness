@@ -3,7 +3,10 @@ package com.androidharness.app.data.env
 import android.system.Os
 import com.androidharness.app.workspace.WorkspaceFs
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
@@ -20,13 +23,30 @@ import java.util.zip.GZIPInputStream
 
 internal const val CODEGRAPH_VERSION_MARKER = ".harness-codegraph-version"
 
+/**
+ * Where a workspace run narrates itself while it is still running. Written by
+ * whichever shell tier runs the command and read back by the app, so the
+ * workspace card can show progress instead of a frozen spinner.
+ */
+internal const val CODEGRAPH_PROGRESS_LOG = ".harness-progress.log"
+
+private const val PROGRESS_POLL_MS = 400L
+
+/** Keeps the live log to the last screen or so, however long the run gets. */
+private const val PROGRESS_TAIL_CHARS = 2_000
+
+private fun shellQuote(value: String): String = "'" + value.replace("'", "'\\''") + "'"
+
 internal object CodeGraphCommands {
     private fun quote(value: String): String = "'" + value.replace("'", "'\\''") + "'"
 
     const val version = "codegraph --no-color version"
-    const val init = "codegraph --no-color init --yes ."
+    // A full build is minutes long on a real project, and --verbose is what
+    // makes it narrate: a line per phase plus a count every few percent, all
+    // plain text because the run's stdout is a file rather than a terminal.
+    const val init = "codegraph --no-color init --yes --verbose ."
     const val sync = "codegraph --no-color sync ."
-    const val reindex = "codegraph --no-color index ."
+    const val reindex = "codegraph --no-color index --verbose ."
     const val uninit = "codegraph --no-color uninit --force ."
 
     fun explore(query: String): String = "codegraph --no-color explore ${quote(query)}"
@@ -791,13 +811,99 @@ class CodeGraphManager(
             return refused("Install CodeGraph in Settings → Code intelligence first.")
         }
         _workspaceState.value = CodeGraphRunState(busy = true, action = label)
-        val result = mcp.paused { run(command, root, timeoutMs, 40_000) }
+        val result = mcp.paused { runWithProgress(root, command, timeoutMs, 40_000) }
         _workspaceState.value = CodeGraphRunState(
             message = result.output.ifBlank { if (result.ok) "$label complete." else "$label failed." },
             failed = !result.ok,
         )
         return result
     }
+
+    /**
+     * Runs a workspace command with its output redirected to a log file that is
+     * read back while the command is still writing it, so the workspace card
+     * shows what CodeGraph is doing instead of a spinner that never moves.
+     *
+     * The redirect carries the exit code through untouched (no pipe, no tee),
+     * and works in every shell tier, including the privileged one whose runner
+     * hands back a finished result rather than a stream.
+     */
+    private suspend fun runWithProgress(
+        root: File,
+        command: String,
+        timeoutMs: Int,
+        maxOutput: Int,
+    ): CodeGraphCommandResult {
+        val log = progressLog(root)
+        withContext(Dispatchers.IO) { runCatching { log.delete() } }
+        var offset = 0L
+        val tail = StringBuilder()
+        val result = coroutineScope {
+            val ticker = launch {
+                while (true) {
+                    delay(PROGRESS_POLL_MS)
+                    offset = readProgress(log, offset, tail)
+                    if (tail.isNotEmpty()) {
+                        _workspaceState.value = _workspaceState.value.copy(message = tail.trim().toString())
+                    }
+                }
+            }
+            try {
+                run("$command > ${shellQuote(log.absolutePath)} 2>&1", root, timeoutMs, maxOutput)
+            } finally {
+                ticker.cancel()
+            }
+        }
+        if (!log.isFile) {
+            // No log means the redirect never took effect (a workspace this
+            // shell cannot write) so the command never ran either: run it the
+            // plain way so the button behaves exactly as it did before.
+            return run(command, root, timeoutMs, maxOutput)
+        }
+        offset = readProgress(log, offset, tail)
+        val text = tail.trim().toString()
+        withContext(Dispatchers.IO) { runCatching { log.delete() } }
+        // Whatever the shell tier added on its own (a degraded-tier warning)
+        // arrives beside the log, not in it, and must survive.
+        val note = result.output.trim()
+        return CodeGraphCommandResult(
+            result.ok,
+            listOf(text, note).filter { it.isNotEmpty() }.joinToString("\n"),
+        )
+    }
+
+    /**
+     * Inside the index directory once it exists, and beside it during the very
+     * first `init`, which is what creates it.
+     */
+    private fun progressLog(root: File): File =
+        File(File(root, ".codegraph").takeIf { it.isDirectory } ?: root, CODEGRAPH_PROGRESS_LOG)
+
+    /**
+     * Appends whatever the log gained since [offset] onto [tail], keeping only
+     * the last [PROGRESS_TAIL_CHARS]. Reading forward from an offset rather
+     * than re-reading the file keeps a long index from copying its whole log
+     * on every poll.
+     */
+    private suspend fun readProgress(log: File, offset: Long, tail: StringBuilder): Long =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                if (!log.isFile) return@runCatching offset
+                java.io.RandomAccessFile(log, "r").use { raf ->
+                    if (raf.length() <= offset) return@use offset
+                    raf.seek(offset)
+                    val bytes = ByteArray((raf.length() - offset).coerceAtMost(64_000L).toInt())
+                    val read = raf.read(bytes)
+                    if (read > 0) {
+                        tail.append(String(bytes, 0, read).replace('\uFFFD', ' '))
+                        if (tail.length > PROGRESS_TAIL_CHARS) {
+                            tail.delete(0, tail.length - PROGRESS_TAIL_CHARS)
+                        }
+                    }
+                    offset + read
+                }
+            }.getOrDefault(offset)
+        }
 
     /** Reports a workspace run that never started, in the card that asked for it. */
     private fun refused(message: String): CodeGraphCommandResult {
