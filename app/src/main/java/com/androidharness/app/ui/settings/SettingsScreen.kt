@@ -475,6 +475,7 @@ private fun CodeIntelligenceSection(
     currentProject: ProjectEntity?,
 ) {
     val codeGraphState by container.codeGraph.state.collectAsStateWithLifecycle()
+    val workspaceRun by container.codeGraph.workspaceState.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
     val rootPath = workspace?.shellRoot?.absolutePath
     var indexRevision by remember(rootPath) { mutableStateOf(0) }
@@ -591,9 +592,12 @@ private fun CodeIntelligenceSection(
                 }
             }
 
-            // The install card's progress row is off-screen while these run, so
-            // an action in flight is shown here too, where it was tapped.
-            if (codeGraphState.busy) {
+            // Both an install and a sync make this card unusable for a moment,
+            // so the row reports whichever is running.
+            val workspaceBusy = workspaceRun.busy || codeGraphState.busy
+            val workspaceAction = workspaceRun.action ?: codeGraphState.action
+
+            if (workspaceBusy) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     androidx.compose.material3.CircularProgressIndicator(
                         strokeWidth = 2.dp,
@@ -601,11 +605,25 @@ private fun CodeIntelligenceSection(
                     )
                     Spacer(Modifier.width(8.dp))
                     Text(
-                        codeGraphState.action ?: "Working…",
+                        workspaceAction ?: "Working…",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
+            }
+
+            // Output of the last sync, re-index or disable, shown here rather
+            // than in the install card above, which is not what was tapped.
+            workspaceRun.message?.takeLast(1_200)?.let { message ->
+                Text(
+                    message,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (workspaceRun.failed) {
+                        MaterialTheme.colorScheme.error
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                )
             }
 
             when {
@@ -620,7 +638,7 @@ private fun CodeIntelligenceSection(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 !indexed -> Button(
-                    enabled = !codeGraphState.busy,
+                    enabled = !workspaceBusy,
                     onClick = {
                         val current = workspace
                         scope.launch {
@@ -634,7 +652,7 @@ private fun CodeIntelligenceSection(
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     FilledTonalButton(
-                        enabled = !codeGraphState.busy,
+                        enabled = !workspaceBusy,
                         onClick = {
                             val current = workspace
                             scope.launch {
@@ -644,7 +662,7 @@ private fun CodeIntelligenceSection(
                         },
                     ) { Text("Sync") }
                     OutlinedButton(
-                        enabled = !codeGraphState.busy,
+                        enabled = !workspaceBusy,
                         onClick = {
                             val current = workspace
                             scope.launch {
@@ -654,7 +672,7 @@ private fun CodeIntelligenceSection(
                         },
                     ) { Text("Re-index") }
                     TextButton(
-                        enabled = !codeGraphState.busy,
+                        enabled = !workspaceBusy,
                         onClick = {
                             val current = workspace
                             scope.launch {

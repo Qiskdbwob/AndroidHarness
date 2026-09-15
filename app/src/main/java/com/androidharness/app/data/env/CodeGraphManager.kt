@@ -100,25 +100,49 @@ internal object CodeGraphProvision {
     /** The release archive whose payload is architecture-independent. */
     const val BUNDLE_ASSET = "codegraph-linux-arm64.tar.gz"
 
+    /** Checksums published next to the archive, best effort. */
+    const val SUMS_ASSET = "SHA256SUMS"
+
     /** Termux package carrying the Node 24 runtime CodeGraph is built against. */
     const val NODE_PACKAGE = "nodejs-lts"
 
     fun latestPageUrl(): String = "https://github.com/$REPO/releases/latest"
+
+    fun releasesPageUrl(): String = "https://github.com/$REPO/releases"
 
     fun apiLatestUrl(): String = "https://api.github.com/repos/$REPO/releases/latest"
 
     /** Release feed: unrated, and served from the same host as the archives. */
     fun atomUrl(): String = "https://github.com/$REPO/releases.atom"
 
-    fun assetUrl(tag: String): String = "https://github.com/$REPO/releases/download/$tag/$BUNDLE_ASSET"
+    /** Registry metadata, on a host that has nothing to do with GitHub. */
+    fun registryUrl(): String = "https://registry.npmjs.org/@colbymchenry/codegraph/latest"
 
-    fun sumsUrl(tag: String): String = "https://github.com/$REPO/releases/download/$tag/SHA256SUMS"
+    /**
+     * The newest archive without naming a tag: GitHub resolves `latest` on the
+     * same host the archives are served from. This is how an install gets its
+     * files, so a release that cannot be *named* can still be installed.
+     */
+    fun latestAssetUrl(): String = "https://github.com/$REPO/releases/latest/download/$BUNDLE_ASSET"
 
-    /** Release tag from the `releases/latest` redirect target, without the API's rate limit. */
-    fun tagFromRedirect(location: String?): String? {
-        val raw = location?.substringAfterLast("/releases/tag/", "")?.trim()
-        return raw?.takeIf { it.isNotEmpty() && it != location }
+    fun latestSumsUrl(): String = "https://github.com/$REPO/releases/latest/download/$SUMS_ASSET"
+
+    /**
+     * Release tag named by a URL: a redirect target, or a link inside a page.
+     * The tag has to look like a version, so an unrelated path segment in a
+     * page full of links is never mistaken for one.
+     */
+    fun tagFromUrl(url: String?): String? {
+        val raw = url?.let { Regex("""/releases/(?:tag|download)/([^/?#"'\s]+)""").find(it)?.groupValues?.get(1) }
+        return raw?.takeIf { it.trimStart('v').firstOrNull()?.isDigit() == true }?.let(::normalizeTag)
     }
+
+    /** Newest tag named in a releases page, which lists the latest release first. */
+    fun tagFromPage(html: String): String? = tagFromUrl(html)
+
+    /** Version from registry metadata, shaped as `"version": "1.6.0"`. */
+    fun tagFromManifest(json: String): String? =
+        Regex("\"version\"\\s*:\\s*\"([^\"]+)\"").find(json)?.groupValues?.get(1)?.let(::normalizeTag)
 
     /**
      * Release tag from the releases Atom feed's newest entry. The entry title
@@ -142,6 +166,16 @@ internal object CodeGraphProvision {
         val tag = raw?.trim()?.takeIf { it.isNotEmpty() } ?: return null
         return if (tag.startsWith("v")) tag else "v$tag"
     }
+
+    /**
+     * The bare X.Y.Z in a tag or in CodeGraph's own version output, which is
+     * the form the version marker stores. The leading `v` is optional and
+     * stripped, and it cannot be fenced with `\b`: there is no word boundary
+     * between the `v` and the digit that follows it, so a tag would never
+     * match its own version.
+     */
+    fun versionIn(text: String?): String? =
+        text?.let { Regex("""v?\d+\.\d+\.\d+(?:[-+][A-Za-z0-9._-]+)?""").find(it)?.value?.removePrefix("v") }
 
     /** Expected SHA-256 of [asset] from a published SHA256SUMS file, or null when unlisted. */
     fun sha256For(sums: String, asset: String): String? = sums.lineSequence().mapNotNull { line ->
@@ -201,6 +235,18 @@ data class CodeGraphState(
 
 data class CodeGraphCommandResult(val ok: Boolean, val output: String)
 
+/**
+ * A run against one workspace. Kept apart from [CodeGraphState] so the output
+ * of a sync shows up in the workspace card that asked for it, instead of in
+ * the install card at the top of the page.
+ */
+data class CodeGraphRunState(
+    val busy: Boolean = false,
+    val action: String? = null,
+    val message: String? = null,
+    val failed: Boolean = false,
+)
+
 class CodeGraphManager(
     private val linuxEnv: LinuxEnvironmentManager,
     private val shellRouter: ShellTierRouter,
@@ -213,6 +259,17 @@ class CodeGraphManager(
         .callTimeout(30, TimeUnit.MINUTES)
         .build()
 
+    /**
+     * Metadata requests are small and can be tried against several hosts in a
+     * row, so they get a timeout that stops a dead network from turning a
+     * version check into a minute of spinning.
+     */
+    private val lookupClient = OkHttpClient.Builder()
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(15, TimeUnit.SECONDS)
+        .callTimeout(20, TimeUnit.SECONDS)
+        .build()
+
     private val marker get() = File(linuxEnv.prefix, CODEGRAPH_VERSION_MARKER)
     private val binary get() = File(linuxEnv.prefix, "bin/codegraph")
     private val home get() = File(linuxEnv.prefix, "home").apply { mkdirs() }
@@ -222,6 +279,9 @@ class CodeGraphManager(
 
     private val _state = MutableStateFlow(CodeGraphState(version = markerVersion()))
     val state: StateFlow<CodeGraphState> = _state
+
+    private val _workspaceState = MutableStateFlow(CodeGraphRunState())
+    val workspaceState: StateFlow<CodeGraphRunState> = _workspaceState
 
     fun isIndexed(workspace: WorkspaceFs?): Boolean =
         workspace?.shellRoot?.resolve(".codegraph")?.isDirectory == true
@@ -258,15 +318,20 @@ class CodeGraphManager(
         val installed = _state.value.version ?: return _state.value
         _state.value = _state.value.copy(busy = true, action = "Checking for updates", message = null, failed = false)
         val lookup = withContext(Dispatchers.IO) { lookUpLatestRelease() }
-        val latest = lookup.tag?.let { parseVersion(it) }
+        // A tag is a URL component ("v1.6.0"), the version marker holds what
+        // CodeGraph itself reports ("1.6.0"), so compare in the marker's form.
+        val latest = CodeGraphProvision.versionIn(lookup.tag)
         val next = _state.value.copy(
             busy = false,
             action = null,
             latest = latest ?: _state.value.latest,
             message = when {
-                latest == null -> "Could not check for updates (${lookup.problem ?: "no release found"})."
-                CodeGraphProvision.isNewer(latest, installed) -> "CodeGraph $latest is available."
-                else -> "CodeGraph $installed is the latest version."
+                latest != null && CodeGraphProvision.isNewer(latest, installed) -> "CodeGraph $latest is available."
+                latest != null -> "CodeGraph $installed is the latest version."
+                // The tag came back but was unreadable, which is not a network
+                // problem and must not be reported as one.
+                lookup.tag != null -> "Found CodeGraph ${lookup.tag}, but its version could not be read."
+                else -> "Could not check for updates (${lookup.problem ?: "no release found"})."
             },
             failed = latest == null,
         )
@@ -297,22 +362,21 @@ class CodeGraphManager(
         if (!linuxEnv.isReady) {
             return CodeGraphCommandResult(false, "The Linux environment could not be prepared.")
         }
-        val lookup = lookUpLatestRelease()
-        val tag = lookup.tag?.let { CodeGraphProvision.normalizeTag(it) }
-            ?: return CodeGraphCommandResult(
-                false,
-                "Could not reach GitHub to find the latest CodeGraph release (${lookup.problem ?: "no release found"}).",
-            )
         val work = File(linuxEnv.appPrivateScratch, "codegraph").apply { mkdirs() }
         val archive = File(work, CodeGraphProvision.BUNDLE_ASSET)
         try {
+            // GitHub resolves "latest" itself, so an install never waits on
+            // naming the release first, and never fails because a metadata
+            // request did.
+            setAction("Preparing the CodeGraph download")
             // Best effort, like upstream's installer: a missing SHA256SUMS
             // never blocks an install, a published one always wins.
-            val expected = runCatching { fetchText(CodeGraphProvision.sumsUrl(tag)) }.getOrNull()
+            val expected = runCatching { fetchText(CodeGraphProvision.latestSumsUrl(), lookupClient) }
+                .getOrNull()
                 ?.let { CodeGraphProvision.sha256For(it, CodeGraphProvision.BUNDLE_ASSET) }
-            setAction("Downloading CodeGraph $tag")
-            download(CodeGraphProvision.assetUrl(tag), archive, expected) { percent ->
-                setAction("Downloading CodeGraph $tag ($percent%)")
+            setAction("Downloading CodeGraph")
+            download(CodeGraphProvision.latestAssetUrl(), archive, expected) { percent ->
+                setAction("Downloading CodeGraph ($percent%)")
             }
             setAction("Unpacking CodeGraph")
             extractBundle(archive)
@@ -387,53 +451,78 @@ class CodeGraphManager(
     private data class ReleaseLookup(val tag: String?, val problem: String?)
 
     /**
-     * Resolves the newest release from three sources in order of how likely
-     * they are to answer on a phone. Each failure is kept, because a bare
-     * "could not reach GitHub" hides whether that was DNS, a rate limit or an
-     * unexpected response, and the settings page shows the reason.
+     * Resolves the newest release from several sources, cheapest and most
+     * reliable first. Each failure is kept, because a bare "could not reach
+     * GitHub" hides whether that was DNS, a rate limit or an unexpected
+     * response, and the settings page shows the reason.
      */
     private fun lookUpLatestRelease(): ReleaseLookup {
         val problems = mutableListOf<String>()
 
-        // 1. The releases/latest redirect: unrated, and the Location header
-        //    names the tag the release page would open.
-        try {
+        // 1. releases/latest, without following: the Location header names the
+        //    tag, on the same host the archives download from, and no API
+        //    quota is involved.
+        runCatching {
             client.newBuilder().followRedirects(false).build()
                 .newCall(Request.Builder().url(CodeGraphProvision.latestPageUrl()).build())
                 .execute().use { response ->
-                    CodeGraphProvision.tagFromRedirect(response.header("Location"))
+                    CodeGraphProvision.tagFromUrl(response.header("Location"))
                         ?.let { return ReleaseLookup(it, null) }
                     problems += "redirect HTTP ${response.code}"
                 }
-        } catch (e: Exception) {
-            problems += "redirect ${e.message ?: e.javaClass.simpleName}"
-        }
+        }.onFailure { problems += "redirect ${it.reason()}" }
 
-        // 2. The releases feed: also unrated, and served from the same host
-        //    the release archive downloads come from.
-        try {
-            CodeGraphProvision.tagFromAtom(fetchText(CodeGraphProvision.atomUrl()))
+        // 2. The same page followed to the end: if the header is missing the
+        //    tag is still in the URL the request landed on, or in the page.
+        runCatching {
+            lookupClient.newCall(Request.Builder().url(CodeGraphProvision.latestPageUrl()).build())
+                .execute().use { response ->
+                    CodeGraphProvision.tagFromUrl(response.request.url.toString())
+                        ?.let { return ReleaseLookup(it, null) }
+                    CodeGraphProvision.tagFromPage(response.body?.string().orEmpty())
+                        ?.let { return ReleaseLookup(it, null) }
+                    problems += "release page HTTP ${response.code}"
+                }
+        }.onFailure { problems += "release page ${it.reason()}" }
+
+        // 3. The releases page, which lists the newest tag first.
+        runCatching {
+            CodeGraphProvision.tagFromPage(fetchText(CodeGraphProvision.releasesPageUrl(), lookupClient))
+                ?.let { return ReleaseLookup(it, null) }
+            problems += "releases page had no tag"
+        }.onFailure { problems += "releases page ${it.reason()}" }
+
+        // 4. The feed: unrated, served from the same host as the archives.
+        runCatching {
+            CodeGraphProvision.tagFromAtom(fetchText(CodeGraphProvision.atomUrl(), lookupClient))
                 ?.let { return ReleaseLookup(it, null) }
             problems += "feed had no release"
-        } catch (e: Exception) {
-            problems += "feed ${e.message ?: e.javaClass.simpleName}"
-        }
+        }.onFailure { problems += "feed ${it.reason()}" }
 
-        // 3. The API last: it is rate limited per IP, so it is the one most
+        // 5. The registry, on an unrelated host.
+        runCatching {
+            CodeGraphProvision.tagFromManifest(fetchText(CodeGraphProvision.registryUrl(), lookupClient))
+                ?.let { return ReleaseLookup(it, null) }
+            problems += "registry had no version"
+        }.onFailure { problems += "registry ${it.reason()}" }
+
+        // 6. The API last: it is rate limited per IP, so it is the one most
         //    likely to answer 403 on a shared or carrier connection.
-        try {
-            CodeGraphProvision.tagFromApi(fetchText(CodeGraphProvision.apiLatestUrl()))
+        runCatching {
+            CodeGraphProvision.tagFromApi(fetchText(CodeGraphProvision.apiLatestUrl(), lookupClient))
                 ?.let { return ReleaseLookup(it, null) }
             problems += "api had no tag"
-        } catch (e: Exception) {
-            problems += "api ${e.message ?: e.javaClass.simpleName}"
-        }
+        }.onFailure { problems += "api ${it.reason()}" }
 
         return ReleaseLookup(null, problems.joinToString("; "))
     }
 
-    private fun fetchText(url: String): String =
-        client.newCall(Request.Builder().url(url).build()).execute().use { response ->
+    /** Short, readable form of a failure, for the one line the settings page shows. */
+    private fun Throwable.reason(): String =
+        message?.takeIf { it.isNotBlank() } ?: javaClass.simpleName
+
+    private fun fetchText(url: String, on: OkHttpClient = client): String =
+        on.newCall(Request.Builder().url(url).build()).execute().use { response ->
             if (!response.isSuccessful) throw IllegalStateException("HTTP ${response.code} fetching $url")
             response.body?.string() ?: throw IllegalStateException("Empty response from $url")
         }
@@ -591,20 +680,24 @@ class CodeGraphManager(
         timeoutMs: Int = 180_000,
     ): CodeGraphCommandResult {
         val root = workspace.shellRoot
-            ?: return CodeGraphCommandResult(false, "CodeGraph needs a workspace with a real filesystem path.")
+            ?: return refused("CodeGraph needs a workspace with a real filesystem path.")
         if (_state.value.version == null) refresh()
         if (_state.value.version == null) {
-            return CodeGraphCommandResult(false, "Install CodeGraph in Settings → Code intelligence first.")
+            return refused("Install CodeGraph in Settings → Code intelligence first.")
         }
-        _state.value = _state.value.copy(busy = true, action = label, message = null, failed = false)
+        _workspaceState.value = CodeGraphRunState(busy = true, action = label)
         val result = run(command, root, timeoutMs, 40_000)
-        _state.value = _state.value.copy(
-            busy = false,
-            action = null,
+        _workspaceState.value = CodeGraphRunState(
             message = result.output.ifBlank { if (result.ok) "$label complete." else "$label failed." },
             failed = !result.ok,
         )
         return result
+    }
+
+    /** Reports a workspace run that never started, in the card that asked for it. */
+    private fun refused(message: String): CodeGraphCommandResult {
+        _workspaceState.value = CodeGraphRunState(message = message, failed = true)
+        return CodeGraphCommandResult(false, message)
     }
 
     private suspend fun requireIndexed(workspace: WorkspaceFs): CodeGraphCommandResult? {
@@ -664,6 +757,5 @@ class CodeGraphManager(
     private fun markerVersion(): String? =
         runCatching { marker.readText().trim().takeIf { it.isNotEmpty() } }.getOrNull()
 
-    private fun parseVersion(output: String): String? =
-        Regex("""\b\d+\.\d+\.\d+(?:[-+][A-Za-z0-9._-]+)?\b""").find(output)?.value
+    private fun parseVersion(output: String): String? = CodeGraphProvision.versionIn(output)
 }

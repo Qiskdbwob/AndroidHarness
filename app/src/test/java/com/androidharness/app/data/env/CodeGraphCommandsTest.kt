@@ -60,15 +60,46 @@ class CodeGraphCommandsTest {
     }
 
     @Test
-    fun `release tag is read from the redirect or the api`() {
+    fun `release tag is read from a redirect, a page, the feed or the api`() {
         assertEquals(
             "v1.6.0",
-            CodeGraphProvision.tagFromRedirect("https://github.com/colbymchenry/codegraph/releases/tag/v1.6.0"),
+            CodeGraphProvision.tagFromUrl("https://github.com/colbymchenry/codegraph/releases/tag/v1.6.0"),
         )
-        assertNull(CodeGraphProvision.tagFromRedirect("https://github.com/colbymchenry/codegraph/releases/latest"))
-        assertNull(CodeGraphProvision.tagFromRedirect(null))
+        assertNull(CodeGraphProvision.tagFromUrl("https://github.com/colbymchenry/codegraph/releases/latest"))
+        assertNull(CodeGraphProvision.tagFromUrl(null))
+        // The download URL names the release too, which is how an install
+        // learns what it just fetched without a metadata request.
+        assertEquals(
+            "v1.6.0",
+            CodeGraphProvision.tagFromUrl(
+                "https://github.com/colbymchenry/codegraph/releases/download/v1.6.0/codegraph-linux-arm64.tar.gz",
+            ),
+        )
+        // A page is full of links, so only a version-shaped tag counts.
+        assertEquals(
+            "v1.6.0",
+            CodeGraphProvision.tagFromPage(
+                """<a href="/colbymchenry/codegraph/releases/tag/v1.6.0">v1.6.0</a>
+                   <a href="/colbymchenry/codegraph/releases/tag/v1.5.0">v1.5.0</a>""",
+            ),
+        )
+        assertNull(CodeGraphProvision.tagFromPage("""<a href="/colbymchenry/codegraph/releases/tag/downloads">x</a>"""))
         assertEquals("v1.6.0", CodeGraphProvision.tagFromApi("""{"tag_name": "v1.6.0", "name": "x"}"""))
         assertNull(CodeGraphProvision.tagFromApi("{}"))
+        assertEquals("v1.6.0", CodeGraphProvision.tagFromManifest("""{"name":"codegraph","version":"1.6.0"}"""))
+        assertNull(CodeGraphProvision.tagFromManifest("""{"name":"codegraph"}"""))
+    }
+
+    @Test
+    fun `the newest archive is addressable without naming a release`() {
+        assertTrue(
+            CodeGraphProvision.latestAssetUrl()
+                .endsWith("/releases/latest/download/${CodeGraphProvision.BUNDLE_ASSET}"),
+        )
+        assertTrue(
+            CodeGraphProvision.latestSumsUrl()
+                .endsWith("/releases/latest/download/${CodeGraphProvision.SUMS_ASSET}"),
+        )
     }
 
     @Test
@@ -78,6 +109,25 @@ class CodeGraphCommandsTest {
         assertEquals("v1.6.0", CodeGraphProvision.normalizeTag(" v1.6.0 "))
         assertNull(CodeGraphProvision.normalizeTag("  "))
         assertNull(CodeGraphProvision.normalizeTag(null))
+    }
+
+    @Test
+    fun `a release tag yields its version`() {
+        // The bug this guards: the version numbers used to be fenced with \b,
+        // and there is no word boundary between the "v" of a tag and the digit
+        // after it, so every tag came back unreadable and the update check
+        // blamed the network for it.
+        assertEquals("1.6.0", CodeGraphProvision.versionIn("v1.6.0"))
+        assertEquals("1.6.0", CodeGraphProvision.versionIn("1.6.0"))
+        assertEquals("1.6.0", CodeGraphProvision.versionIn(" v1.6.0\n"))
+        // What `codegraph version` prints.
+        assertEquals("1.6.0", CodeGraphProvision.versionIn("1.6.0\n"))
+        assertEquals("1.6.0", CodeGraphProvision.versionIn("codegraph 1.6.0"))
+        // Prerelease suffixes survive, since CodeGraph reports them that way.
+        assertEquals("1.6.0-rc.1", CodeGraphProvision.versionIn("v1.6.0-rc.1"))
+        assertNull(CodeGraphProvision.versionIn("no version here"))
+        assertNull(CodeGraphProvision.versionIn(""))
+        assertNull(CodeGraphProvision.versionIn(null))
     }
 
     @Test
