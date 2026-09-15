@@ -37,6 +37,7 @@ Status: early alpha.
 - Web tools: web search through keyless engines or the Brave and Tavily APIs with a key, page fetch, raw HTTP requests with JSON bodies, and GitHub API requests that authenticate automatically.
 - In-app web preview: universal preview hub for localhost ports, workspace HTML files, and web links with Eruda DevTools, console logs, and one-tap bug fixing. The agent also drives the page itself through browser tools (navigate, snapshot, click, type, scroll, eval, screenshot) with a floating live-action bubble.
 - MCP tools: connect Model Context Protocol servers over stdio or HTTP, add them by pasting a Claude config or a claude mcp add command, and sign in with OAuth when the server needs it.
+- Optional CodeGraph integration: install CodeGraph from Settings, enable its local index per workspace, and let the agent explore symbols, callers/callees, change impact, affected tests, and incremental sync without separate agent configuration.
 - Task tool: spawn subagents that work in parallel on independent chunks, each optionally on a different model.
 - Skill tools: list, view, and manage the markdown skills library from inside a run.
 - Todo and memory tools: a live todo list, a core memory file that loads at the start of every conversation, and topic files with search for everything else.
