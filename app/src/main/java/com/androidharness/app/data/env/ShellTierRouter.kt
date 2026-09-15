@@ -4,6 +4,8 @@ import android.content.Context
 import android.os.Build
 import android.os.Environment
 import com.androidharness.app.tools.ShellPolicy
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.concurrent.TimeUnit
 
@@ -95,10 +97,17 @@ class ShellTierRouter(
 
     /** Executes [command] with cwd [cwd] and returns a uniform result. */
     suspend fun run(command: String, cwd: File, timeoutMs: Int, maxOutput: Int): ShellRunResult =
-        when (val tier = resolveTier(cwd)) {
-            ExecutionTier.PRIVILEGED -> runPrivileged(command, cwd, timeoutMs, maxOutput)
-            ExecutionTier.APP_LINUX -> runApp(command, cwd, timeoutMs, maxOutput, ExecutionTier.APP_LINUX)
-            ExecutionTier.TOYBOX -> runApp(command, cwd, timeoutMs, maxOutput, ExecutionTier.TOYBOX)
+        // Both tiers block for the whole run: they poll the child every 50ms,
+        // join the reader threads and, in the privileged tier, make binder
+        // calls. Callers include Compose scopes on the main dispatcher, which
+        // would freeze the UI for the command's full duration, so the work
+        // never inherits the caller's dispatcher.
+        withContext(Dispatchers.IO) {
+            when (val tier = resolveTier(cwd)) {
+                ExecutionTier.PRIVILEGED -> runPrivileged(command, cwd, timeoutMs, maxOutput)
+                ExecutionTier.APP_LINUX -> runApp(command, cwd, timeoutMs, maxOutput, ExecutionTier.APP_LINUX)
+                ExecutionTier.TOYBOX -> runApp(command, cwd, timeoutMs, maxOutput, ExecutionTier.TOYBOX)
+            }
         }
 
     // --- privileged tier ---------------------------------------------------

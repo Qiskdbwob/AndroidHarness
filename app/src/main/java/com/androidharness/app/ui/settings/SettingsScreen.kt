@@ -482,6 +482,9 @@ private fun CodeIntelligenceSection(
 
     LaunchedEffect(rootPath) {
         container.codeGraph.refresh()
+        // Ask GitHub once per visit so the buttons can say what is actually
+        // available instead of offering a blind "Update".
+        container.codeGraph.checkForUpdates()
     }
 
     SettingsHeader("CodeGraph")
@@ -504,7 +507,12 @@ private fun CodeIntelligenceSection(
                     )
                 }
                 StatusText(
-                    codeGraphState.version?.let { "v$it" } ?: "Not installed",
+                    when {
+                        codeGraphState.version == null -> "Not installed"
+                        codeGraphState.updateAvailable -> "v${codeGraphState.version} → v${codeGraphState.latest}"
+                        codeGraphState.latest != null -> "v${codeGraphState.version} · latest"
+                        else -> "v${codeGraphState.version}"
+                    },
                     ok = codeGraphState.version != null,
                 )
             }
@@ -536,10 +544,19 @@ private fun CodeIntelligenceSection(
                         onClick = { scope.launch { container.codeGraph.installOrUpdate() } },
                     ) { Text("Install CodeGraph") }
                 } else {
-                    Button(
-                        enabled = !codeGraphState.busy,
-                        onClick = { scope.launch { container.codeGraph.installOrUpdate() } },
-                    ) { Text("Update") }
+                    // Only offer an update when a newer release actually exists;
+                    // otherwise the tap is a check that answers "already latest".
+                    if (codeGraphState.updateAvailable) {
+                        Button(
+                            enabled = !codeGraphState.busy,
+                            onClick = { scope.launch { container.codeGraph.installOrUpdate() } },
+                        ) { Text("Update to v${codeGraphState.latest}") }
+                    } else {
+                        OutlinedButton(
+                            enabled = !codeGraphState.busy,
+                            onClick = { scope.launch { container.codeGraph.checkForUpdates() } },
+                        ) { Text("Check for updates") }
+                    }
                     OutlinedButton(
                         enabled = !codeGraphState.busy,
                         onClick = { scope.launch { container.codeGraph.uninstall() } },
@@ -548,7 +565,7 @@ private fun CodeIntelligenceSection(
             }
 
             Text(
-                "Harness installs CodeGraph into its private Linux environment. No Termux app or separate CodeGraph agent setup is required.",
+                "Harness installs CodeGraph into its private Linux environment, about 170 MB with the Node runtime it needs. No Termux app, no Shizuku and no separate CodeGraph setup for your agents.",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -571,6 +588,23 @@ private fun CodeIntelligenceSection(
                 }
                 if (rootPath != null) {
                     StatusText(if (indexed) "Indexed" else "Not indexed", ok = indexed)
+                }
+            }
+
+            // The install card's progress row is off-screen while these run, so
+            // an action in flight is shown here too, where it was tapped.
+            if (codeGraphState.busy) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    androidx.compose.material3.CircularProgressIndicator(
+                        strokeWidth = 2.dp,
+                        modifier = Modifier.size(14.dp),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        codeGraphState.action ?: "Working…",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
             }
 

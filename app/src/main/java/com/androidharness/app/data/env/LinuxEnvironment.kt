@@ -379,6 +379,28 @@ class LinuxEnvironmentManager(
         index?.get(name)
     }
 
+    /**
+     * Downloads one repository package's .deb with checksum verification,
+     * without installing it. For features that ship a separate runtime next to
+     * the toolchain (the CodeGraph page pulls a Node 24 for its own use) and
+     * must not claim the package in the installed marker.
+     */
+    suspend fun downloadPackageDeb(name: String, dest: File): Boolean = withContext(Dispatchers.IO) {
+        val pkg = getPackageMeta(name) ?: return@withContext false
+        // The index is a network response, so its Filename field is untrusted:
+        // keep the download URL inside the repo pool and the local file inside
+        // the caller's directory.
+        val fileField = pkg.filename
+        val base = fileField.substringAfterLast('/')
+        if (fileField.startsWith('/') || fileField.contains('\\') ||
+            fileField.split('/').any { it.isEmpty() || it == "." || it == ".." } ||
+            !base.endsWith(".deb")
+        ) throw IllegalStateException("Unsafe package filename in the index: $fileField")
+        dest.parentFile?.mkdirs()
+        downloadVerified("$BASE_URL/$fileField", dest, pkg.sha256)
+        true
+    }
+
     /** Resolves which packages need to be downloaded/installed for [wanted] excluding already-installed ones. */
     suspend fun resolveClosure(wanted: List<String>): List<PkgMeta> = withContext(Dispatchers.IO) {
         val index = getPackageIndex()
