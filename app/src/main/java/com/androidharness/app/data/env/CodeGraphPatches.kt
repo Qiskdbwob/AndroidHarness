@@ -22,7 +22,7 @@ import java.io.File
 internal object CodeGraphBundlePatches {
 
     /** Bumped whenever [patches] changes, so an install can tell old from new. */
-    const val VERSION = 4
+    const val VERSION = 5
 
     internal data class Patch(
         val relativePath: String,
@@ -43,7 +43,7 @@ internal object CodeGraphBundlePatches {
         "    vue: 'web', svelte: 'web', astro: 'web',",
     )
 
-    // B1, B2, B3, 1 (decorates): Language gate on candidates in name matcher
+    // B1, B2, B3, 1 (decorates): Candidate filter strictly drops non-same-family candidates
     private val matcherAnchor = lines(
         "    if (ref.referenceKind === 'imports') {",
         "        return candidates.filter((c) => !crossesKnownFamily(c.language, ref.language));",
@@ -52,15 +52,37 @@ internal object CodeGraphBundlePatches {
     )
 
     private val matcherReplacement = lines(
-        "    if (ref.referenceKind === 'imports') {",
-        "        return candidates.filter((c) => sameLanguageFamily(c.language, ref.language));",
+        "    // Harness patch: filter all name-matching candidates strictly to the same language family",
+        "    return candidates.filter((c) => sameLanguageFamily(c.language, ref.language));",
+    )
+
+    // 1 (decorates & single match): Never allow cross-language exact match fallback
+    private val exactSingleAnchor = lines(
+        "    // If only one match, use it — but penalize cross-language matches",
+        "    if (candidates.length === 1) {",
+        "        const isCrossLanguage = candidates[0].language !== ref.language;",
+        "        return {",
+        "            original: ref,",
+        "            targetNodeId: candidates[0].id,",
+        "            confidence: isCrossLanguage ? 0.5 : 0.9,",
+        "            resolvedBy: 'exact-match',",
+        "        };",
         "    }",
-        "    // Harness patch: a coincidental same-named symbol in another language is",
-        "    // not a call, extends, instantiation, or decorator.",
-        "    if (ref.referenceKind === 'calls' || ref.referenceKind === 'extends' || ref.referenceKind === 'instantiates' || ref.referenceKind === 'decorates') {",
-        "        return candidates.filter((c) => sameLanguageFamily(c.language, ref.language));",
+    )
+
+    private val exactSingleReplacement = lines(
+        "    // Harness patch: if only one match, strictly require same language family",
+        "    if (candidates.length === 1) {",
+        "        if (!sameLanguageFamily(candidates[0].language, ref.language)) {",
+        "            return null;",
+        "        }",
+        "        return {",
+        "            original: ref,",
+        "            targetNodeId: candidates[0].id,",
+        "            confidence: 0.9,",
+        "            resolvedBy: 'exact-match',",
+        "        };",
         "    }",
-        "    return candidates;",
     )
 
     // 1 (decorates & fuzzy): Eliminate cross-language fuzzy resolution fallback
@@ -92,22 +114,34 @@ internal object CodeGraphBundlePatches {
         "    }",
     )
 
-    // B1, B2, B3, 1 (decorates): Language gate in resolver for solitary candidates
+    // B1, B2, B3, 1 (decorates): Drop any non-same-family resolution in resolver
     private val resolverAnchor = lines(
+        "    gateLanguage(result, ref) {",
+        "        if (!result)",
+        "            return result;",
+        "        const tgt = this.getLanguageFromNodeId(result.targetNodeId);",
+        "        if (!tgt || !ref.language)",
+        "            return result;",
+        "        if ((ref.referenceKind === 'references' || ref.referenceKind === 'function_ref') && !(0, name_matcher_1.sameLanguageFamily)(tgt, ref.language))",
+        "            return null;",
         "        if (ref.referenceKind === 'imports' && (0, name_matcher_1.crossesKnownFamily)(tgt, ref.language))",
         "            return null;",
         "        return result;",
+        "    }",
     )
 
     private val resolverReplacement = lines(
-        "        if (ref.referenceKind === 'imports' && !(0, name_matcher_1.sameLanguageFamily)(tgt, ref.language))",
-        "            return null;",
-        "        // Harness patch: the candidate filter's rule, restated for the case",
-        "        // where the foreign match was the only candidate there was.",
-        "        if ((ref.referenceKind === 'calls' || ref.referenceKind === 'extends' || ref.referenceKind === 'instantiates' || ref.referenceKind === 'decorates') &&",
-        "            !(0, name_matcher_1.sameLanguageFamily)(tgt, ref.language))",
+        "    gateLanguage(result, ref) {",
+        "        if (!result)",
+        "            return result;",
+        "        const tgt = this.getLanguageFromNodeId(result.targetNodeId);",
+        "        if (!tgt || !ref.language)",
+        "            return result;",
+        "        // Harness patch: strictly drop any resolution across disparate language families",
+        "        if (!(0, name_matcher_1.sameLanguageFamily)(tgt, ref.language))",
         "            return null;",
         "        return result;",
+        "    }",
     )
 
     // B4, 1 (decorates): Framework language gate rejecting cross-language instantiations/extends/decorates
@@ -229,6 +263,10 @@ internal object CodeGraphBundlePatches {
         "            : `Found \${subgraph.nodes.size} symbol\${subgraph.nodes.size === 1 ? '' : 's'} across \${fileGroups.size} file\${fileGroups.size === 1 ? '' : 's'}.`;",
     )
 
+    // 4: Explore cliff fraction relaxed so related files aren't pruned away prematurely
+    private val exploreCliffAnchor = "    CLIFF_FRACTION: 0.15,"
+    private val exploreCliffReplacement = "    CLIFF_FRACTION: 0.05,"
+
     // 4 & Minor 11: Raise explore output budget and search limit for small repos / natural queries
     private val exploreBudgetAnchor = lines(
         "    if (fileCount < 150) {",
@@ -255,11 +293,11 @@ internal object CodeGraphBundlePatches {
     private val exploreBudgetReplacement = lines(
         "    if (fileCount < 150) {",
         "        return {",
-        "            maxOutputChars: 24000,",
-        "            defaultMaxFiles: 8,",
-        "            maxCharsPerFile: 6500,",
+        "            maxOutputChars: 32000,",
+        "            defaultMaxFiles: 12,",
+        "            maxCharsPerFile: 7500,",
         "            gapThreshold: 7,",
-        "            maxSymbolsInFileHeader: 12,",
+        "            maxSymbolsInFileHeader: 20,",
         "            maxEdgesPerRelationshipKind: 4,",
         "            includeRelationships: false,",
         "            includeAdditionalFiles: false,",
@@ -280,10 +318,10 @@ internal object CodeGraphBundlePatches {
 
     private val exploreSearchLimitReplacement = lines(
         "        const subgraph = await cg.findRelevantContext(matchQuery, {",
-        "            searchLimit: Math.max(24, maxFiles * 2),",
+        "            searchLimit: Math.max(30, maxFiles * 3),",
         "            traversalDepth: 3,",
         "            maxNodes: 200,",
-        "            minScore: 0.1,",
+        "            minScore: 0.05,",
         "        });",
     )
 
@@ -313,7 +351,7 @@ internal object CodeGraphBundlePatches {
         "        ['PRAGMA analysis_limit=1000', 'PRAGMA optimize', 'ANALYZE nodes', 'ANALYZE edges', 'ANALYZE files', 'ANALYZE unresolved_refs']);",
     )
 
-    // B3, B7, B9, 1, 2: Migration 10 - clean existing bad edges incl. decorates, unique unresolved_refs, prune vocab orphans
+    // B3, B7, B9, 1, 2: Migration 10 & 11 - clean existing bad edges incl. decorates, unique unresolved_refs, prune vocab orphans
     private val migrationVersionAnchor = "exports.CURRENT_SCHEMA_VERSION = 9;"
     private val migrationVersionReplacement = "exports.CURRENT_SCHEMA_VERSION = 11;"
 
@@ -337,8 +375,7 @@ internal object CodeGraphBundlePatches {
         "          SELECT e.id FROM edges e",
         "          JOIN nodes s ON e.source = s.id",
         "          JOIN nodes t ON e.target = t.id",
-        "          WHERE e.kind IN ('imports', 'calls', 'extends', 'instantiates', 'decorates')",
-        "          AND s.language != t.language",
+        "          WHERE s.language != t.language",
         "          AND NOT (",
         "            (s.language IN ('kotlin','java','scala','clojure','groovy') AND t.language IN ('kotlin','java','scala','clojure','groovy')) OR",
         "            (s.language IN ('swift','objc','objcpp') AND t.language IN ('swift','objc','objcpp')) OR",
@@ -354,20 +391,20 @@ internal object CodeGraphBundlePatches {
         "        CREATE UNIQUE INDEX IF NOT EXISTS idx_unresolved_identity",
         "          ON unresolved_refs(from_node_id, reference_name, reference_kind, line, col);",
         "        DELETE FROM name_segment_vocab WHERE name NOT IN (SELECT name FROM nodes);",
+        "        UPDATE project_metadata SET value = '26' WHERE key = 'indexed_with_extraction_version';",
         "      `);",
         "        },",
         "    },",
         "    {",
         "        version: 11,",
-        "        description: 'Prune cross-language decorates edges',",
+        "        description: 'Prune cross-language decorates edges and update extraction version',",
         "        up: (db) => {",
         "            db.exec(`",
         "        DELETE FROM edges WHERE id IN (",
         "          SELECT e.id FROM edges e",
         "          JOIN nodes s ON e.source = s.id",
         "          JOIN nodes t ON e.target = t.id",
-        "          WHERE e.kind = 'decorates'",
-        "          AND s.language != t.language",
+        "          WHERE s.language != t.language",
         "          AND NOT (",
         "            (s.language IN ('kotlin','java','scala','clojure','groovy') AND t.language IN ('kotlin','java','scala','clojure','groovy')) OR",
         "            (s.language IN ('swift','objc','objcpp') AND t.language IN ('swift','objc','objcpp')) OR",
@@ -376,6 +413,7 @@ internal object CodeGraphBundlePatches {
         "            (s.language IN ('csharp','razor') AND t.language IN ('csharp','razor'))",
         "          )",
         "        );",
+        "        UPDATE project_metadata SET value = '26' WHERE key = 'indexed_with_extraction_version';",
         "      `);",
         "        },",
         "    },",
@@ -410,8 +448,7 @@ internal object CodeGraphBundlePatches {
         "          SELECT e.id FROM edges e",
         "          JOIN nodes s ON e.source = s.id",
         "          JOIN nodes t ON e.target = t.id",
-        "          WHERE e.kind IN ('imports', 'calls', 'extends', 'instantiates', 'decorates')",
-        "          AND s.language != t.language",
+        "          WHERE s.language != t.language",
         "          AND NOT (",
         "            (s.language IN ('kotlin','java','scala','clojure','groovy') AND t.language IN ('kotlin','java','scala','clojure','groovy')) OR",
         "            (s.language IN ('swift','objc','objcpp') AND t.language IN ('swift','objc','objcpp')) OR",
@@ -421,6 +458,7 @@ internal object CodeGraphBundlePatches {
         "          )",
         "        );",
         "        DELETE FROM name_segment_vocab WHERE name NOT IN (SELECT name FROM nodes);",
+        "        UPDATE project_metadata SET value = '26' WHERE key = 'indexed_with_extraction_version';",
         "            `);",
         "        } catch { /* ignore */ }",
         "    }",
@@ -444,6 +482,7 @@ internal object CodeGraphBundlePatches {
     private val patches = listOf(
         Patch("resolution/name-matcher.js", nameMatcherFamilyAnchor, nameMatcherFamilyReplacement),
         Patch("resolution/name-matcher.js", matcherAnchor, matcherReplacement),
+        Patch("resolution/name-matcher.js", exactSingleAnchor, exactSingleReplacement),
         Patch("resolution/name-matcher.js", fuzzyAnchor, fuzzyReplacement),
         Patch("resolution/index.js", resolverAnchor, resolverReplacement),
         Patch("resolution/index.js", frameworkAnchor, frameworkReplacement),
@@ -451,6 +490,7 @@ internal object CodeGraphBundlePatches {
         Patch("extraction/tree-sitter.js", treeSitterAnchor, treeSitterReplacement),
         Patch("extraction/extraction-version.js", extractionVersionAnchor, extractionVersionReplacement),
         Patch("mcp/tools.js", exploreAnchor, exploreReplacement),
+        Patch("mcp/tools.js", exploreCliffAnchor, exploreCliffReplacement),
         Patch("mcp/tools.js", exploreBudgetAnchor, exploreBudgetReplacement),
         Patch("mcp/tools.js", exploreSearchLimitAnchor, exploreSearchLimitReplacement),
         Patch("bin/codegraph.js", impactAnchor, impactReplacement),

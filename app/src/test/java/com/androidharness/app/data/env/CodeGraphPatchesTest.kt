@@ -28,6 +28,16 @@ class CodeGraphPatchesTest {
         "    }",
         "    return candidates;",
         "}",
+        "    // If only one match, use it — but penalize cross-language matches",
+        "    if (candidates.length === 1) {",
+        "        const isCrossLanguage = candidates[0].language !== ref.language;",
+        "        return {",
+        "            original: ref,",
+        "            targetNodeId: candidates[0].id,",
+        "            confidence: isCrossLanguage ? 0.5 : 0.9,",
+        "            resolvedBy: 'exact-match',",
+        "        };",
+        "    }",
         "    // Prefer same-language matches",
         "    const sameLanguageCandidates = callableCandidates.filter(n => n.language === ref.language);",
         "    const finalCandidates = sameLanguageCandidates.length > 0 ? sameLanguageCandidates : callableCandidates;",
@@ -103,6 +113,7 @@ class CodeGraphPatchesTest {
     )
 
     private val toolsSource = lines(
+        "    CLIFF_FRACTION: 0.15,",
         "    if (fileCount < 150) {",
         "        return {",
         "            // ITER3: revert iter2's aggressive body shrink (forced Read fallback —",
@@ -225,17 +236,19 @@ class CodeGraphPatchesTest {
         val queries = File(dist, "db/queries.js").readText()
 
         assertTrue("name-matcher includes web SFCs", matcher.contains("vue: 'web', svelte: 'web', astro: 'web'"))
-        assertTrue("name-matcher gates calls/extends/decorates", matcher.contains("ref.referenceKind === 'decorates'"))
+        assertTrue("name-matcher gates candidates to same language family", matcher.contains("sameLanguageFamily(c.language, ref.language)"))
+        assertTrue("name-matcher single exact match drops cross-language", matcher.contains("strictly require same language family"))
         assertTrue("name-matcher fuzzy rejects cross-language", matcher.contains("strictly same language family for fuzzy matching"))
-        assertTrue("resolver gates calls/extends/decorates", resolver.contains("ref.referenceKind === 'decorates'"))
+        assertTrue("resolver gates across disparate language families", resolver.contains("strictly drop any resolution across disparate language families"))
         assertTrue("framework gate rejects cross-language decorates", resolver.contains("ref.referenceKind === 'decorates'"))
         assertTrue("index.js performs retroactive prune on open", index.contains("pruneCrossLanguageEdges()"))
         assertTrue("import resolver supports bare python module import", importResolver.contains("bare single module imports"))
         assertTrue("tree-sitter rejects junk AST names", treeSitter.contains("name.startsWith('from ')"))
         assertTrue("extraction version bumped to 26", extractionVersion.contains("EXTRACTION_VERSION = 26;"))
         assertTrue("mcp explore shows truncation note", tools.contains("showing \${shownSymbols} of \${totalFound}"))
-        assertTrue("mcp explore raises searchLimit", tools.contains("Math.max(24, maxFiles * 2)"))
-        assertTrue("mcp explore raises base output budget", tools.contains("maxOutputChars: 24000"))
+        assertTrue("mcp explore relaxes cliff fraction", tools.contains("CLIFF_FRACTION: 0.05"))
+        assertTrue("mcp explore raises searchLimit", tools.contains("Math.max(30, maxFiles * 3)"))
+        assertTrue("mcp explore raises base output budget", tools.contains("maxOutputChars: 32000"))
         assertTrue("bin impact shows multi-def note", bin.contains("definitions named"))
         assertTrue("db maintenance excludes virtual FTS table", db.contains("ANALYZE nodes"))
         assertTrue("migrations bumps version to 11", migrations.contains("CURRENT_SCHEMA_VERSION = 11;"))
