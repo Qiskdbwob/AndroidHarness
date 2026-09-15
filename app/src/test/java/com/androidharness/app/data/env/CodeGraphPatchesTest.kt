@@ -28,6 +28,18 @@ class CodeGraphPatchesTest {
         "    }",
         "    return candidates;",
         "}",
+        "    // Prefer same-language matches",
+        "    const sameLanguageCandidates = callableCandidates.filter(n => n.language === ref.language);",
+        "    const finalCandidates = sameLanguageCandidates.length > 0 ? sameLanguageCandidates : callableCandidates;",
+        "    if (finalCandidates.length === 1) {",
+        "        const isCrossLanguage = finalCandidates[0].language !== ref.language;",
+        "        return {",
+        "            original: ref,",
+        "            targetNodeId: finalCandidates[0].id,",
+        "            confidence: isCrossLanguage ? 0.3 : 0.5,",
+        "            resolvedBy: 'fuzzy',",
+        "        };",
+        "    }",
     )
 
     private val resolverSource = lines(
@@ -54,6 +66,14 @@ class CodeGraphPatchesTest {
         "        return result;",
         "    }",
     )
+
+    private val indexSource = lines(
+        "        const db = db_1.DatabaseConnection.open(dbPath);",
+        "        const queries = new queries_1.QueryBuilder(db.getDb());",
+        "        const instance = new CodeGraph(db, queries, resolvedRoot);",
+    )
+
+    private val extractionVersionSource = "exports.EXTRACTION_VERSION = 25;"
 
     private val importResolverSource = lines(
         "function resolvePythonAbsoluteModule(ref, context) {",
@@ -83,6 +103,25 @@ class CodeGraphPatchesTest {
     )
 
     private val toolsSource = lines(
+        "    if (fileCount < 150) {",
+        "        return {",
+        "            // ITER3: revert iter2's aggressive body shrink (forced Read fallback —",
+        "            // the per-file 2.5K cap pushed the agent to Read instead of node).",
+        "            // Back to the iter1 shape (13K/4/3.8K) but keep the test-file",
+        "            // hard-exclude. The cost lever for this tier lives in steering the",
+        "            // agent to stop after 1-2 calls, not in this budget.",
+        "            maxOutputChars: 13000,",
+        "            defaultMaxFiles: 4,",
+        "            maxCharsPerFile: 3800,",
+        "            gapThreshold: 7,",
+        "            maxSymbolsInFileHeader: 5,",
+        "            maxEdgesPerRelationshipKind: 4,",
+        "            includeRelationships: false,",
+        "            includeAdditionalFiles: false,",
+        "            includeCompletenessSignal: false,",
+        "            includeBudgetNote: false,",
+        "        };",
+        "    }",
         "        const subgraph = await cg.findRelevantContext(matchQuery, {",
         "            searchLimit: 8,",
         "            traversalDepth: 3,",
@@ -150,10 +189,12 @@ class CodeGraphPatchesTest {
         File(dist, "mcp").mkdirs()
         File(dist, "bin").mkdirs()
         File(dist, "db").mkdirs()
+        File(dist, "index.js").writeText(indexSource)
         File(dist, "resolution/name-matcher.js").writeText(matcherSource)
         File(dist, "resolution/index.js").writeText(resolverSource)
         File(dist, "resolution/import-resolver.js").writeText(importResolverSource)
         File(dist, "extraction/tree-sitter.js").writeText(treeSitterSource)
+        File(dist, "extraction/extraction-version.js").writeText(extractionVersionSource)
         File(dist, "mcp/tools.js").writeText(toolsSource)
         File(dist, "bin/codegraph.js").writeText(binSource)
         File(dist, "db/index.js").writeText(dbSource)
@@ -169,12 +210,14 @@ class CodeGraphPatchesTest {
         val result = CodeGraphBundlePatches.apply(dist)
 
         assertTrue("anchors must match the shipped shape", result.unresolved.isEmpty())
-        assertEquals("all files should have applied patches", 9, result.applied.toSet().size)
+        assertEquals("all files should have applied patches", 11, result.applied.toSet().size)
 
         val matcher = File(dist, "resolution/name-matcher.js").readText()
         val resolver = File(dist, "resolution/index.js").readText()
+        val index = File(dist, "index.js").readText()
         val importResolver = File(dist, "resolution/import-resolver.js").readText()
         val treeSitter = File(dist, "extraction/tree-sitter.js").readText()
+        val extractionVersion = File(dist, "extraction/extraction-version.js").readText()
         val tools = File(dist, "mcp/tools.js").readText()
         val bin = File(dist, "bin/codegraph.js").readText()
         val db = File(dist, "db/index.js").readText()
@@ -182,18 +225,23 @@ class CodeGraphPatchesTest {
         val queries = File(dist, "db/queries.js").readText()
 
         assertTrue("name-matcher includes web SFCs", matcher.contains("vue: 'web', svelte: 'web', astro: 'web'"))
-        assertTrue("name-matcher gates calls/extends", matcher.contains("sameLanguageFamily(c.language, ref.language)"))
-        assertTrue("resolver gates calls/extends", resolver.contains("sameLanguageFamily)(tgt, ref.language)"))
-        assertTrue("framework gate rejects cross-language", resolver.contains("gateFrameworkLanguage"))
+        assertTrue("name-matcher gates calls/extends/decorates", matcher.contains("ref.referenceKind === 'decorates'"))
+        assertTrue("name-matcher fuzzy rejects cross-language", matcher.contains("strictly same language family for fuzzy matching"))
+        assertTrue("resolver gates calls/extends/decorates", resolver.contains("ref.referenceKind === 'decorates'"))
+        assertTrue("framework gate rejects cross-language decorates", resolver.contains("ref.referenceKind === 'decorates'"))
+        assertTrue("index.js performs retroactive prune on open", index.contains("pruneCrossLanguageEdges()"))
         assertTrue("import resolver supports bare python module import", importResolver.contains("bare single module imports"))
         assertTrue("tree-sitter rejects junk AST names", treeSitter.contains("name.startsWith('from ')"))
+        assertTrue("extraction version bumped to 26", extractionVersion.contains("EXTRACTION_VERSION = 26;"))
         assertTrue("mcp explore shows truncation note", tools.contains("showing \${shownSymbols} of \${totalFound}"))
         assertTrue("mcp explore raises searchLimit", tools.contains("Math.max(24, maxFiles * 2)"))
+        assertTrue("mcp explore raises base output budget", tools.contains("maxOutputChars: 24000"))
         assertTrue("bin impact shows multi-def note", bin.contains("definitions named"))
         assertTrue("db maintenance excludes virtual FTS table", db.contains("ANALYZE nodes"))
-        assertTrue("migrations bumps version to 10", migrations.contains("CURRENT_SCHEMA_VERSION = 10;"))
-        assertTrue("migrations includes version 10", migrations.contains("version: 10,"))
+        assertTrue("migrations bumps version to 11", migrations.contains("CURRENT_SCHEMA_VERSION = 11;"))
+        assertTrue("migrations includes version 11", migrations.contains("version: 11,"))
         assertTrue("queries uses INSERT OR IGNORE", queries.contains("INSERT OR IGNORE INTO unresolved_refs"))
+        assertTrue("queries has pruneCrossLanguageEdges method", queries.contains("pruneCrossLanguageEdges()"))
         assertTrue("queries prunes vocab on file deletion", queries.contains("DELETE FROM name_segment_vocab WHERE name NOT IN"))
     }
 
