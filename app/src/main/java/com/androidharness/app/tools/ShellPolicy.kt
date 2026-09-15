@@ -1,5 +1,6 @@
 package com.androidharness.app.tools
 
+import com.androidharness.app.data.env.LinuxEnvironmentManager
 import java.io.File
 
 /**
@@ -310,7 +311,10 @@ object ShellPolicy {
         vars["PWD"] = cwdPath
         vars["CWD"] = cwdPath
         vars["WORKSPACE"] = rootPath
-        vars["HOME"] = "/data/local/tmp/androidharness/linux/home"
+        // Only used to expand $HOME for the containment checks below, which
+        // care whether a path is inside the workspace, not which build's
+        // deployed copy it belongs to, so the shared root is enough.
+        vars["HOME"] = LinuxEnvironmentManager.TMP_ROOT + "/linux/home"
 
         // Extract all variable assignments in the command: VAR=value
         val assignments = extractVariableAssignments(cmd)

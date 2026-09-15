@@ -2,6 +2,7 @@ package com.androidharness.app.data.env
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -22,38 +23,41 @@ class TermuxShebangTest {
 
     private val termuxSh = "#!/data/data/com.termux/files/usr/bin/sh"
 
+    /** Stand-in for one build's deployed prefix. */
+    private val deployed = LinuxEnvironmentManager.deployedBaseFor("com.example.app") + "/linux"
+
     @Test
     fun `python interpreter shebang rewrites into the deployed prefix`() {
         assertEquals(
-            "#!${TermuxShebangs.DEPLOYED_PREFIX}/bin/python3.14",
-            TermuxShebangs.rewrittenFirstLine(pip3),
+            "#!${deployed}/bin/python3.14",
+            TermuxShebangs.rewrittenFirstLine(pip3, deployed),
         )
     }
 
     @Test
     fun `env-style shebang routes through the busybox applet`() {
         assertEquals(
-            "#!${TermuxShebangs.DEPLOYED_PREFIX}/bin/applets/env node",
-            TermuxShebangs.rewrittenFirstLine(npmCli),
+            "#!${deployed}/bin/applets/env node",
+            TermuxShebangs.rewrittenFirstLine(npmCli, deployed),
         )
     }
 
     @Test
     fun `rewritten lines never reference the termux prefix`() {
-        assertFalse(TermuxShebangs.rewrittenFirstLine(pip3)!!.contains("/data/data/com.termux"))
-        assertFalse(TermuxShebangs.rewrittenFirstLine(npmCli)!!.contains("/data/data/com.termux"))
+        assertFalse(TermuxShebangs.rewrittenFirstLine(pip3, deployed)!!.contains("/data/data/com.termux"))
+        assertFalse(TermuxShebangs.rewrittenFirstLine(npmCli, deployed)!!.contains("/data/data/com.termux"))
     }
 
     @Test
     fun `non-termux shebangs are left alone`() {
-        assertNull(TermuxShebangs.rewrittenFirstLine("#!/usr/bin/env node"))
-        assertNull(TermuxShebangs.rewrittenFirstLine("#!/system/bin/sh"))
-        assertNull(TermuxShebangs.rewrittenFirstLine(""))
+        assertNull(TermuxShebangs.rewrittenFirstLine("#!/usr/bin/env node", deployed))
+        assertNull(TermuxShebangs.rewrittenFirstLine("#!/system/bin/sh", deployed))
+        assertNull(TermuxShebangs.rewrittenFirstLine("", deployed))
     }
 
     @Test
     fun `termux paths outside files usr are not rewritable`() {
-        assertNull(TermuxShebangs.rewrittenFirstLine("#!/data/data/com.termux/files/home/x"))
+        assertNull(TermuxShebangs.rewrittenFirstLine("#!/data/data/com.termux/files/home/x", deployed))
     }
 
     @Test
@@ -70,10 +74,16 @@ class TermuxShebangTest {
     }
 
     @Test
-    fun `deployed prefix matches the tmp toolchain location`() {
+    fun `each build deploys into its own directory`() {
+        // Two builds on one device must not untar over each other: the copy a
+        // command execs has to be the one its environment was built for.
         assertEquals(
-            LinuxEnvironmentManager.TMP_PREFIX_BASE + "/linux",
-            TermuxShebangs.DEPLOYED_PREFIX,
+            "/data/local/tmp/androidharness/com.example.app",
+            LinuxEnvironmentManager.deployedBaseFor("com.example.app"),
+        )
+        assertNotEquals(
+            LinuxEnvironmentManager.deployedBaseFor("com.example.app"),
+            LinuxEnvironmentManager.deployedBaseFor("com.example.app.debug"),
         )
     }
 }

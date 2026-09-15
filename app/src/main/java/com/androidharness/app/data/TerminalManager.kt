@@ -247,7 +247,7 @@ class TerminalManager(
                 .plus("HC_DIR" to cwd.absolutePath)
                 .plus("HC_CMD" to cmd)
                 .map { "${it.key}=${it.value}" }.toTypedArray()
-            val bash = "${LinuxEnvironmentManager.TMP_PREFIX_BASE}/linux/bin/bash"
+            val bash = "${linuxEnv.tmpPrefix}/bin/bash"
             val useTmpBash = shizuku.isTmpPrefixDeployed(expected)
             val argv = if (useTmpBash) arrayOf(bash, "-c", script) else arrayOf("/system/bin/sh", "-c", script)
             val res = shizuku.runPrivileged(argv, env, cwd.absolutePath, timeoutMs = 120_000, maxBytes = 60_000)

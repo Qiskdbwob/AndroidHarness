@@ -142,15 +142,15 @@ class EnvStatusTool(
                     .append(if (tlsBundle.isFile) "ready at ${tlsBundle.absolutePath} ✓" else "missing; falling back to system anchors")
                     .append("; SSL_CERT_FILE/CURL_CA_BUNDLE/REQUESTS_CA_BUNDLE/GIT_SSL_CAINFO/NODE_EXTRA_CA_CERTS are exported to every shell ")
                     .append("(the privileged tier resolves them to its deployed copy at ")
-                    .append(com.androidharness.app.data.env.LinuxEnvironmentManager.TMP_PREFIX_BASE)
-                    .append("/linux/etc/tls/cacert.pem)\n")
+                    .append(linuxEnv.tmpPrefix)
+                    .append("/etc/tls/cacert.pem)\n")
                 append("Exec-capable scratch (Bug 2 fix): ").append(scratch)
                     .append(": extract JDK/Gradle/native tarballs HERE, never into shared storage (no exec bits, no symlinks); the env var HARNESS_SCRATCH is exported to every shell")
                     .append('\n')
                 append("Storage: ").append(storage).append('\n')
                 append("Active shell tier: ").append(tierText).append('\n')
                 append("Notes: the Shizuku server is an in-memory process, it has no on-disk binary; " +
-                    "the bundled toolchain is copied to /data/local/tmp/androidharness/linux so the " +
+                    "the bundled toolchain is copied to " + linuxEnv.tmpPrefix + " so the " +
                     "privileged shell can use bash/git/python/node anywhere. To unlock system paths " +
                     "or folders outside the app's own data, Shizuku must be running and granted; " +
                     "to reach shared storage as the app uid, \"All files access\" must be granted in " +

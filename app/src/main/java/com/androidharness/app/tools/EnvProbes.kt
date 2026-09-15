@@ -16,9 +16,13 @@ import java.io.File
  */
 internal object EnvProbes {
 
+    /**
+     * True for any root under the deployed tree (one directory per installed
+     * build). Everything down there is opaque to the app uid, so probes have
+     * to go through the privileged shell whatever build owns it.
+     */
     private fun isTmpPrefix(probeRoot: File): Boolean =
-        probeRoot.absolutePath ==
-            LinuxEnvironmentManager.TMP_PREFIX_BASE + "/linux"
+        probeRoot.absolutePath.startsWith(LinuxEnvironmentManager.TMP_ROOT + "/")
 
     /**
      * Where the toolchain copies live for the [tier] the shell tool will use:
@@ -31,8 +35,10 @@ internal object EnvProbes {
         shizuku: ShizukuManager,
         tier: com.androidharness.app.data.env.ExecutionTier,
     ): File =
-        if (tier == com.androidharness.app.data.env.ExecutionTier.PRIVILEGED && shizuku.isTmpPrefixDeployed())
-            File(LinuxEnvironmentManager.TMP_PREFIX_BASE, "linux")
+        if (tier == com.androidharness.app.data.env.ExecutionTier.PRIVILEGED &&
+            shizuku.isTmpPrefixDeployed(linuxEnv.deployedTag())
+        )
+            File(linuxEnv.tmpPrefix)
         else linuxEnv.prefix
 
     /**

@@ -125,9 +125,6 @@ internal object TermuxShebangs {
     /** Match marker for any Termux-prefixed shebang (even outside files/usr). */
     const val TERMUX_PREFIX_MARK = "#!/data/data/com.termux/"
 
-    /** Deployed shell-tier prefix, where rewritten shebangs point. */
-    const val DEPLOYED_PREFIX = LinuxEnvironmentManager.TMP_PREFIX_BASE + "/linux"
-
     /** Android-bridge wrapper commands shipped by termux-tools. */
     val SYSTEM_WRAPPERS = setOf(
         "am", "bmgr", "bu", "cmd", "content", "device_config", "dpm", "dumpsys",
@@ -146,15 +143,16 @@ internal object TermuxShebangs {
         firstLine.startsWith("#!${TERMUX_USR}bin/sh") && name in SYSTEM_WRAPPERS
 
     /**
-     * Rewrites a Termux-absolute shebang into the deployed prefix; null when
-     * the line cannot be repaired (not under files/usr, or still references
-     * the Termux prefix after rewriting). busybox provides `env` only as an
-     * applet in bin/applets, so env-style launchers route through that.
+     * Rewrites a Termux-absolute shebang into [deployedPrefix] (this build's
+     * deployed copy); null when the line cannot be repaired (not under
+     * files/usr, or still references the Termux prefix after rewriting).
+     * busybox provides `env` only as an applet in bin/applets, so env-style
+     * launchers route through that.
      */
-    fun rewrittenFirstLine(firstLine: String): String? {
+    fun rewrittenFirstLine(firstLine: String, deployedPrefix: String): String? {
         if (!firstLine.startsWith("#!$TERMUX_USR")) return null
-        var line = "#!$DEPLOYED_PREFIX/" + firstLine.removePrefix("#!$TERMUX_USR")
-        line = line.replaceFirst("$DEPLOYED_PREFIX/bin/env ", "$DEPLOYED_PREFIX/bin/applets/env ")
+        var line = "#!$deployedPrefix/" + firstLine.removePrefix("#!$TERMUX_USR")
+        line = line.replaceFirst("$deployedPrefix/bin/env ", "$deployedPrefix/bin/applets/env ")
         return if (line.contains("/data/data/com.termux")) null else line
     }
 }
@@ -239,6 +237,11 @@ class LinuxEnvironmentManager(
 ) {
 
     val prefix: File = File(context.filesDir, "linux")
+
+    /** This build's deployed copy (exec-able by the shell uid). See [deployedBaseFor]. */
+    val tmpBase: String = deployedBaseFor(context.packageName)
+    val tmpPrefix: String = "$tmpBase/linux"
+
     private val marker = File(prefix, ".harness-installed")
     private val tempDir = File(context.cacheDir, "deb-download").apply { mkdirs() }
 
@@ -629,7 +632,7 @@ class LinuxEnvironmentManager(
             val nl = text.indexOf('\n')
             val firstLine = text.lineSequence().firstOrNull()?.trim() ?: ""
             if (!firstLine.startsWith(TermuxShebangs.TERMUX_PREFIX_MARK)) return@forEach
-            val repaired = TermuxShebangs.rewrittenFirstLine(firstLine)
+            val repaired = TermuxShebangs.rewrittenFirstLine(firstLine, tmpPrefix)
             if (repaired != null && !TermuxShebangs.isWrapperScript(f.name, firstLine)) {
                 runCatching {
                     f.writeText(repaired + if (nl >= 0) text.substring(nl) else "")
@@ -911,18 +914,18 @@ class LinuxEnvironmentManager(
                 )
                 append("echo '$b64' | base64 -d > '$path' && chmod 600 '$path' && ")
             }
-            append("mkdir -p '$TMP_PREFIX/etc' '$TMP_PREFIX/home/.config/gh' && ")
-            writeB64("$TMP_PREFIX/etc/gitconfig", gitconfig)
+            append("mkdir -p '$tmpPrefix/etc' '$tmpPrefix/home/.config/gh' && ")
+            writeB64("$tmpPrefix/etc/gitconfig", gitconfig)
             if (GitHubProvision.hasToken(token)) {
-                writeB64("$TMP_PREFIX/home/.gh-token", token!!.trim() + "\n")
+                writeB64("$tmpPrefix/home/.gh-token", token!!.trim() + "\n")
             } else {
-                append("rm -f '$TMP_PREFIX/home/.gh-token' && ")
+                append("rm -f '$tmpPrefix/home/.gh-token' && ")
             }
             val hostsBody = hosts
             if (hostsBody != null) {
-                writeB64("$TMP_PREFIX/home/.config/gh/hosts.yml", hostsBody)
+                writeB64("$tmpPrefix/home/.config/gh/hosts.yml", hostsBody)
             } else {
-                append("rm -f '$TMP_PREFIX/home/.config/gh/hosts.yml' && ")
+                append("rm -f '$tmpPrefix/home/.config/gh/hosts.yml' && ")
             }
             append("echo AUTH_SYNC_OK")
         }
@@ -1019,14 +1022,15 @@ class LinuxEnvironmentManager(
 
     /**
      * Environment for the Shizuku (shell/root uid) tier, whose copy of the
-     * toolchain lives at /data/local/tmp/androidharness/linux.
+     * toolchain lives in this build's own directory under
+     * /data/local/tmp/androidharness.
      */
     fun tmpProcessEnv(): Map<String, String> = buildMap {
-        put("PATH", "$TMP_PREFIX/bin:$TMP_PREFIX/bin/applets:/system/bin:/system/xbin:/vendor/bin")
-        put("LD_LIBRARY_PATH", "$TMP_PREFIX/lib")
-        put("HOME", "$TMP_PREFIX/home")
-        put("TMPDIR", "$TMP_PREFIX/tmp")
-        put("PREFIX", TMP_PREFIX)
+        put("PATH", "$tmpPrefix/bin:$tmpPrefix/bin/applets:/system/bin:/system/xbin:/vendor/bin")
+        put("LD_LIBRARY_PATH", "$tmpPrefix/lib")
+        put("HOME", "$tmpPrefix/home")
+        put("TMPDIR", "$tmpPrefix/tmp")
+        put("PREFIX", tmpPrefix)
         // Same derivation rule as the entries below, and the same trap: the
         // deployed copy carries the preload iff the app prefix does. Pointing
         // LD_PRELOAD at a file that is not there is worse than not setting it,
@@ -1034,9 +1038,9 @@ class LinuxEnvironmentManager(
         // (setsid, sh, bash) with `CANNOT LINK EXECUTABLE ... not found`, so
         // the whole tier looks broken instead of degraded.
         if (File(prefix, "lib/libtermux-exec.so").exists()) {
-            put("LD_PRELOAD", "$TMP_PREFIX/lib/libtermux-exec.so")
+            put("LD_PRELOAD", "$tmpPrefix/lib/libtermux-exec.so")
         }
-        put("TERMUX__PREFIX", TMP_PREFIX)
+        put("TERMUX__PREFIX", tmpPrefix)
         put("TERM", "xterm-256color")
         put("LANG", "C.UTF-8")
         // Same templates fix as the app-side env, for the /data/local/tmp copy.
@@ -1046,15 +1050,15 @@ class LinuxEnvironmentManager(
         // does. A live probe here silently broke after the 0700 hardening.
         put(
             "GIT_TEMPLATE_DIR",
-            if (gitTemplatesDir().isDirectory) "$TMP_PREFIX/share/git-core/templates" else "",
+            if (gitTemplatesDir().isDirectory) "$tmpPrefix/share/git-core/templates" else "",
         )
         // Re-rooted git needs its exec helpers (git-remote-https etc.) pointed
         // at our deployed copy or HTTPS remotes abort with a missing helper.
-        put("GIT_EXEC_PATH", "$TMP_PREFIX/libexec/git-core")
+        put("GIT_EXEC_PATH", "$tmpPrefix/libexec/git-core")
         // Bug 5 fix: same safe.directory global config for the shell-uid
         // tier, written under the deployed prefix.
-        put("GIT_CONFIG_GLOBAL", "$TMP_PREFIX/etc/gitconfig")
-        put("HARNESS_GIT_CONFIG", "$TMP_PREFIX/etc/gitconfig")
+        put("GIT_CONFIG_GLOBAL", "$tmpPrefix/etc/gitconfig")
+        put("HARNESS_GIT_CONFIG", "$tmpPrefix/etc/gitconfig")
         // Bug 1 fix: the deployed copy carries its own CA bundle; export the
         // standard TLS vars so curl/python/git/node verify certificates.
         // Same derivation rule: stageForShell ships the staged bundle (from
@@ -1063,16 +1067,22 @@ class LinuxEnvironmentManager(
         // app uid failed post-0700 and fell back to /system/etc/security/cacerts
         // (a DIRECTORY) which broke all privileged-tier TLS (git exit with
         // "error adding trust anchors", curl exit 77).
-        putAll(com.androidharness.app.tools.NetTls.envVars("$TMP_PREFIX/etc/tls/cacert.pem"))
+        putAll(com.androidharness.app.tools.NetTls.envVars("$tmpPrefix/etc/tls/cacert.pem"))
         // Same derivation rule as the CA bundle above: the deployed copy is
         // staged from this prefix, so it has the OpenSSL config iff this one
         // does, and statting the 0700 deployed prefix from the app uid would
         // silently report it missing.
         File(prefix, com.androidharness.app.tools.NetTls.OPENSSL_CONF_RELATIVE_PATH)
             .takeIf { it.isFile }
-            ?.let { put("OPENSSL_CONF", "$TMP_PREFIX/${com.androidharness.app.tools.NetTls.OPENSSL_CONF_RELATIVE_PATH}") }
+            ?.let { put("OPENSSL_CONF", "$tmpPrefix/${com.androidharness.app.tools.NetTls.OPENSSL_CONF_RELATIVE_PATH}") }
         // Bug 2 fix: exec-capable scratch location for the privileged tier.
         put("HARNESS_SCRATCH", ShellPolicy.SCRATCH_TMP)
+        // The service that runs these commands lives in Shizuku's process, so
+        // it cannot know which build deployed this copy: it reads the prefix
+        // paths from here instead of assuming the legacy shared directory.
+        put("HARNESS_TMP_PREFIX", tmpPrefix)
+        put("HARNESS_TMP_LIB", "$tmpPrefix/lib")
+        put("HARNESS_TMP_BIN", "$tmpPrefix/bin")
     }
 
     // ------------------------------------------------------------------
@@ -1521,7 +1531,7 @@ class LinuxEnvironmentManager(
                             val n = runCatching { tar.read(peeked, 0, peeked.size) }.getOrDefault(-1)
                             val entryText = if (n > 0) String(peeked, 0, n, Charsets.UTF_8) else ""
                             val firstLine = entryText.lineSequence().firstOrNull()?.trim() ?: ""
-                            val rewritten = TermuxShebangs.rewrittenFirstLine(firstLine)
+                            val rewritten = TermuxShebangs.rewrittenFirstLine(firstLine, tmpPrefix)
                             val binEntry = rel.startsWith("bin/") && !rel.contains("/applets/")
                             when {
                                 TermuxShebangs.isWrapperScript(rel.substringAfterLast('/'), firstLine) ||
@@ -1573,9 +1583,26 @@ class LinuxEnvironmentManager(
 
         private const val BASE_URL = "https://packages.termux.dev/apt/termux-main"
 
-        /** Where the shell-user copy of [PREFIX] lives (exec-able by shell uid). */
-        const val TMP_PREFIX_BASE = "/data/local/tmp/androidharness"
-        private const val TMP_PREFIX = "$TMP_PREFIX_BASE/linux"
+        /** Parent directory of the shell-tier copies, one per installed build. */
+        const val TMP_ROOT = "/data/local/tmp/androidharness"
+
+        /**
+         * Deployed copy owned by one build.
+         *
+         * Per applicationId on purpose. Several builds of Harness can be
+         * installed at once (release plus debug, or an older install left
+         * behind), and every build untars its own package set into the target.
+         * At one shared path the last deploy wins: the tree then holds another
+         * build's tools, and the libraries this build's environment names (its
+         * preload, its own packages) are gone, so every binary started there
+         * dies in the linker with
+         * `CANNOT LINK EXECUTABLE ... library "..." not found`. A directory per
+         * build makes the copy provably ours.
+         */
+        fun deployedBaseFor(packageName: String): String = "$TMP_ROOT/$packageName"
+
+        /** Where builds deployed before they were namespaced left their copy. */
+        const val LEGACY_TMP_PREFIX = "$TMP_ROOT/linux"
     }
 }
 

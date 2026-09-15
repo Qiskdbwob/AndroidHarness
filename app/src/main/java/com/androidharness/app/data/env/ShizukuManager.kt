@@ -64,6 +64,9 @@ class ShizukuManager(
     @Volatile private var service: IHarnessService? = null
     private val bindRequested = AtomicBoolean(false)
 
+    /** This build's deployed copy; see [LinuxEnvironmentManager.deployedBaseFor]. */
+    private val tmpBase: String = LinuxEnvironmentManager.deployedBaseFor(context.packageName)
+
     @Volatile private var tmpPrefixDeployed = false
 
     /**
@@ -256,9 +259,29 @@ class ShizukuManager(
     ): PrivilegedResult? = withContext(Dispatchers.IO) {
         val svc = service ?: return@withContext null
         val raw = runCatching {
-            svc.exec(cmd, env, dir, maxBytes, timeoutMs)
+            svc.exec(cmd, withDeployPaths(env), dir, maxBytes, timeoutMs)
         }.getOrNull() ?: return@withContext null
         parseResult(raw)
+    }
+
+    /**
+     * Adds this build's deployed paths to the environment of every privileged
+     * command. The service runs inside Shizuku's process and has no way to know
+     * which build called it, so it takes these from the request rather than
+     * assuming the legacy shared directory, which another installed build may
+     * well have deployed over.
+     */
+    private fun withDeployPaths(env: Array<String>?): Array<String> {
+        val extra = arrayOf(
+            "HARNESS_TMP_PREFIX=$tmpBase/linux",
+            "HARNESS_TMP_LIB=$tmpBase/linux/lib",
+            "HARNESS_TMP_BIN=$tmpBase/linux/bin",
+        )
+        if (env == null) return extra
+        val kept = env.filterNot { entry ->
+            extra.any { it.substringBefore('=') == entry.substringBefore('=') }
+        }
+        return (extra.asList() + kept).toTypedArray()
     }
 
     private fun parseResult(raw: String): PrivilegedResult {
@@ -279,13 +302,14 @@ class ShizukuManager(
 
     /**
      * Deploys (or refreshes) the shell-user toolchain at
-     * /data/local/tmp/androidharness/linux by untarring the staging tarball
+     * this build's own directory under /data/local/tmp/androidharness by
+     * untarring the staging tarball
      * (shared storage, shell-readable) there. No-op when the deployed copy
      * already matches [tag], which is the package set plus the content hash of
      * the tarball it must have come from.
      */
     suspend fun ensureTmpPrefix(stagingTarPath: String, tag: String): Boolean {
-        val base = LinuxEnvironmentManager.TMP_PREFIX_BASE
+        val base = tmpBase
         // Bug 1 fix: locate the staged CA bundle (next to the tarball) so the
         // deployed toolchain gets trust anchors; fall back gracefully.
         val stagingDir = File(stagingTarPath).parentFile
@@ -363,7 +387,7 @@ class ShizukuManager(
         if (tmpPrefixDeployed && !deployCheckForced &&
             (expectedTag == null || deployedTag == expectedTag)
         ) return true
-        val base = LinuxEnvironmentManager.TMP_PREFIX_BASE
+        val base = tmpBase
         val script = if (expectedTag != null) {
             "test -x \"$base/linux/bin/bash\" && cat \"$base/.harness-hash\""
         } else {

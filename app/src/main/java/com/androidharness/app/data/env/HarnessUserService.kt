@@ -17,6 +17,20 @@ import java.util.concurrent.TimeUnit
 @Keep
 class HarnessUserService() : IHarnessService.Stub() {
 
+
+    /**
+     * Exports for the wrapper that runs a command: the deployed prefix paths
+     * come from the request environment, because this service runs inside
+     * Shizuku's process and cannot tell which build sent the command. The
+     * legacy shared directory is only a fallback for clients that predate
+     * per-build copies.
+     */
+    private fun ldPathExport(): String =
+        "export LD_LIBRARY_PATH=\"\${HARNESS_TMP_LIB:-${LinuxEnvironmentManager.LEGACY_TMP_PREFIX}/lib}:\$LD_LIBRARY_PATH\""
+
+    private fun binPathExport(): String =
+        "export PATH=\"\${HARNESS_TMP_BIN:-${LinuxEnvironmentManager.LEGACY_TMP_PREFIX}/bin}:\$PATH\""
+
     @Keep
     constructor(context: Context?) : this()
 
@@ -62,13 +76,12 @@ class HarnessUserService() : IHarnessService.Stub() {
     ): Int {
         return try {
             val wrappedCmd = if (File("/system/bin/setsid").exists()) {
-                val libDir = "${LinuxEnvironmentManager.TMP_PREFIX_BASE}/linux/lib"
                 val shBin = if (File("/system/bin/sh").exists()) "/system/bin/sh" else "sh"
                 arrayOf(
                     "/system/bin/setsid",
                     shBin,
                     "-c",
-                    "export LD_LIBRARY_PATH=\"$libDir:\$LD_LIBRARY_PATH\"; exec \"\$@\"",
+                    ldPathExport() + "; exec \"\$@\"",
                     "sh",
                     *cmd,
                 )
@@ -275,14 +288,12 @@ class HarnessUserService() : IHarnessService.Stub() {
     ): String {
         val process = try {
             val wrappedCmd = if (File("/system/bin/setsid").exists()) {
-                val libDir = "${LinuxEnvironmentManager.TMP_PREFIX_BASE}/linux/lib"
-                val binDir = "${LinuxEnvironmentManager.TMP_PREFIX_BASE}/linux/bin"
                 val shBin = if (File("/system/bin/sh").exists()) "/system/bin/sh" else "sh"
                 arrayOf(
                     "/system/bin/setsid",
                     shBin,
                     "-c",
-                    "export LD_LIBRARY_PATH=\"$libDir:\$LD_LIBRARY_PATH\"; export PATH=\"$binDir:\$PATH\"; exec \"\$@\"",
+                    ldPathExport() + "; " + binPathExport() + "; exec \"\$@\"",
                     "sh",
                     *cmd,
                 )

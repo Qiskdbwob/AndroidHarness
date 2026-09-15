@@ -116,7 +116,7 @@ class BgProcessStore(
             }
             val toolchainDeployed = shizuku.isTmpPrefixDeployed(expected)
             val cmd = if (toolchainDeployed) {
-                arrayOf("${LinuxEnvironmentManager.TMP_PREFIX_BASE}/linux/bin/bash", "-c", command)
+                arrayOf("${linuxEnv.tmpPrefix}/bin/bash", "-c", command)
             } else {
                 arrayOf("/system/bin/sh", "-c", command)
             }
