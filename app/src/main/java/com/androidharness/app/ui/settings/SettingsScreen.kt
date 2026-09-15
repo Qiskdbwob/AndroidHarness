@@ -33,11 +33,13 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.automirrored.outlined.OpenInNew
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.Archive
 import androidx.compose.material.icons.outlined.AutoStories
 import androidx.compose.material.icons.outlined.BarChart
 import androidx.compose.material.icons.outlined.CheckCircle
+import androidx.compose.material.icons.outlined.Code
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Description
 import androidx.compose.material.icons.outlined.Extension
@@ -89,9 +91,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.androidharness.app.AppContainer
+import com.androidharness.app.R
 import com.androidharness.app.agent.PermissionMode
 import com.androidharness.app.data.AppSettings
 import com.androidharness.app.data.ChatBackupException
@@ -104,6 +109,7 @@ import com.androidharness.app.data.env.ShizukuState
 import com.androidharness.app.data.env.UserServiceState
 import com.androidharness.app.ui.common.formatTokenCount
 import com.androidharness.app.ui.common.AppHeader
+import com.androidharness.app.ui.common.HarnessMark
 import com.androidharness.app.ui.common.openOAuthBrowser
 import com.androidharness.app.ui.common.AddWorkspaceDialog
 import com.androidharness.app.ui.common.BiometricAuth
@@ -253,6 +259,7 @@ fun SettingsScreen(
                         SettingsPage.ENVIRONMENT -> TerminalSection(container, envState, shizukuState, serviceState)
                         SettingsPage.BACKUP -> ChatsBackupSection(container)
                         SettingsPage.UPDATES -> UpdatesCard(container)
+                        SettingsPage.ABOUT -> AboutSection(container)
                         SettingsPage.SKILLS, SettingsPage.USAGE, SettingsPage.SETUP -> Unit
                     }
                     Spacer(Modifier.height(16.dp))
@@ -2407,6 +2414,26 @@ private fun SettingRow(
     onClick: (() -> Unit)? = null,
     divider: Boolean = false,
     trailing: @Composable RowScope.() -> Unit = {},
+) = SettingsRow(
+    leading = {
+        Icon(icon, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(22.dp))
+    },
+    title = title,
+    subtitle = subtitle,
+    onClick = onClick,
+    divider = divider,
+    trailing = trailing,
+)
+
+/** Same row, for the places that need something other than a themed icon up front. */
+@Composable
+private fun SettingsRow(
+    leading: @Composable () -> Unit,
+    title: String,
+    subtitle: String,
+    onClick: (() -> Unit)? = null,
+    divider: Boolean = false,
+    trailing: @Composable RowScope.() -> Unit = {},
 ) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
@@ -2415,7 +2442,7 @@ private fun SettingRow(
             .clickable(enabled = onClick != null) { onClick?.invoke() }
             .padding(horizontal = 14.dp, vertical = 12.dp),
     ) {
-        Icon(icon, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(22.dp))
+        leading()
         Spacer(Modifier.width(14.dp))
         Column(Modifier.weight(1f)) {
             Text(title, style = MaterialTheme.typography.bodyLarge)
@@ -2506,12 +2533,7 @@ private fun DropdownSetting(
 private fun UpdatesCard(container: AppContainer) {
     val step by container.updates.step.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
-    val version = remember {
-        runCatching {
-            container.appContext.packageManager
-                .getPackageInfo(container.appContext.packageName, 0).versionName
-        }.getOrNull() ?: "?"
-    }
+    val version = remember(container) { appVersionLabel(container.appContext) }
     SettingsPanel(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -2569,6 +2591,206 @@ private fun UpdatesCard(container: AppContainer) {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// About
+// ---------------------------------------------------------------------------
+
+private const val AUTHOR_URL = "https://github.com/Sanuu7"
+private const val REPO_URL = "https://github.com/Sanuu7/AndroidHarness"
+private const val LICENSE_URL = "https://github.com/Sanuu7/AndroidHarness/blob/main/LICENSE"
+
+/** Installed version, shared by the About page and the update card. */
+private fun appVersionLabel(context: Context): String = runCatching {
+    context.packageManager.getPackageInfo(context.packageName, 0).versionName
+}.getOrNull().orEmpty().ifBlank { "?" }
+
+/** A project AndroidHarness leans on, listed on the About page. */
+private data class Credit(val name: String, val role: String, val url: String)
+
+private val BUILT_WITH = listOf(
+    Credit("Termux", "Linux packages and shell tooling", "https://github.com/termux"),
+    Credit("Shizuku", "Elevated shell access without root", "https://github.com/RikkaApps/Shizuku"),
+    Credit("sora-editor", "The in-app code editor", "https://github.com/Rosemoe/sora-editor"),
+    Credit("Eruda", "Devtools inside the web preview", "https://github.com/liriliri/eruda"),
+)
+
+private val INSPIRED_BY = listOf(
+    Credit("Hermes Agent", "Agent loop and scheduled runs", "https://github.com/NousResearch/hermes-agent"),
+    Credit("Aider", "Repo map and edit workflow", "https://github.com/Aider-AI/aider"),
+    Credit("pi (ohmypi)", "Terminal agent design", "https://github.com/earendil-works/pi"),
+    Credit("OpenCode", "Provider and relay handling", "https://github.com/anomalyco/opencode"),
+    Credit("Claude Code", "Tool cards and permission model", "https://github.com/anthropics"),
+    Credit("Roo Code", "Approval flow and modes", "https://github.com/RooCodeInc/Roo-Code"),
+    Credit("Cline", "Approval flow and modes", "https://github.com/cline/cline"),
+    Credit("browser-use", "Agent-driven browsing", "https://github.com/browser-use/browser-use"),
+    Credit("llama.cpp", "Local server compatibility", "https://github.com/ggerganov/llama.cpp"),
+)
+
+@Composable
+private fun AboutSection(container: AppContainer) {
+    val context = LocalContext.current
+    val scheme = MaterialTheme.colorScheme
+    val version = remember(container) { appVersionLabel(container.appContext) }
+    val open: (String) -> Unit = { url ->
+        runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
+    }
+
+    SettingsPanel(Modifier.fillMaxWidth()) {
+        Column(
+            Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            HarnessMark(size = 58.dp)
+            Text("AndroidHarness", style = MaterialTheme.typography.titleLarge)
+            Text(
+                "A coding agent that lives on your phone.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = scheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+            )
+            Surface(color = scheme.surfaceContainerHigh, shape = CircleShape) {
+                Text(
+                    "Version $version",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = scheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 5.dp),
+                )
+            }
+        }
+    }
+
+    SettingsHeader("Made by")
+    SettingsPanel(Modifier.fillMaxWidth()) {
+        SettingsRow(
+            leading = { GitHubMark() },
+            title = "Sanuu",
+            subtitle = "github.com/Sanuu7",
+            onClick = { open(AUTHOR_URL) },
+            divider = true,
+            trailing = { ExternalLinkIcon() },
+        )
+        SettingsRow(
+            leading = {
+                Icon(Icons.Outlined.Code, contentDescription = null, tint = scheme.onSurfaceVariant, modifier = Modifier.size(22.dp))
+            },
+            title = "Source code",
+            subtitle = "github.com/Sanuu7/AndroidHarness",
+            onClick = { open(REPO_URL) },
+            trailing = { ExternalLinkIcon() },
+        )
+    }
+
+    SettingsHeader("License")
+    SettingsPanel(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Outlined.Description, contentDescription = null, tint = scheme.primary, modifier = Modifier.size(20.dp))
+                Spacer(Modifier.width(10.dp))
+                Text("MIT License", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
+                Surface(color = scheme.primaryContainer, shape = CircleShape) {
+                    Text(
+                        "Open source",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = scheme.onPrimaryContainer,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                    )
+                }
+            }
+            Text(
+                "Use it, change it, ship it, even inside a commercial app. The one condition is that the " +
+                    "copyright notice and the license text travel with the code. It comes with no warranty.",
+                style = MaterialTheme.typography.bodySmall,
+                color = scheme.onSurfaceVariant,
+            )
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.clickable { open(LICENSE_URL) }.padding(vertical = 4.dp),
+            ) {
+                Text("Read the full license", style = MaterialTheme.typography.labelLarge, color = scheme.primary)
+                Spacer(Modifier.width(6.dp))
+                Icon(Icons.AutoMirrored.Outlined.OpenInNew, contentDescription = null, tint = scheme.primary, modifier = Modifier.size(16.dp))
+            }
+        }
+    }
+
+    SettingsHeader("Credits")
+    SettingsPanel(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(horizontal = 16.dp, vertical = 14.dp)) {
+            Text(
+                "AndroidHarness is built on open source work and borrows ideas from the agents that came before it.",
+                style = MaterialTheme.typography.bodySmall,
+                color = scheme.onSurfaceVariant,
+            )
+        }
+        CreditsGroup("Built with", BUILT_WITH, open)
+        CreditsGroup("Inspired by", INSPIRED_BY, open)
+        HorizontalDivider(color = scheme.outlineVariant.copy(alpha = 0.4f))
+        Column(Modifier.padding(horizontal = 16.dp, vertical = 14.dp)) {
+            Text(
+                "Every project keeps its own license. AndroidHarness is not affiliated with them.",
+                style = MaterialTheme.typography.bodySmall,
+                color = scheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+/** One labelled block of the credits list, separated from the block above it. */
+@Composable
+private fun CreditsGroup(label: String, credits: List<Credit>, onOpen: (String) -> Unit) {
+    val scheme = MaterialTheme.colorScheme
+    HorizontalDivider(color = scheme.outlineVariant.copy(alpha = 0.4f))
+    Text(
+        label,
+        style = MaterialTheme.typography.labelMediumEmphasized,
+        color = scheme.onSurfaceVariant,
+        modifier = Modifier.padding(start = 16.dp, top = 14.dp, bottom = 2.dp),
+    )
+    credits.forEachIndexed { index, credit ->
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { onOpen(credit.url) }
+                .padding(horizontal = 16.dp, vertical = 10.dp),
+        ) {
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                Text(credit.name, style = MaterialTheme.typography.bodyMedium)
+                Text(credit.role, style = MaterialTheme.typography.bodySmall, color = scheme.onSurfaceVariant)
+            }
+            Icon(Icons.AutoMirrored.Outlined.OpenInNew, contentDescription = null, tint = scheme.onSurfaceVariant, modifier = Modifier.size(16.dp))
+        }
+        if (index != credits.lastIndex) {
+            HorizontalDivider(
+                Modifier.padding(start = 16.dp, end = 16.dp),
+                color = scheme.outlineVariant.copy(alpha = 0.3f),
+            )
+        }
+    }
+}
+
+/** GitHub's mark, tinted with the theme like every other icon in settings. */
+@Composable
+private fun GitHubMark() {
+    Icon(
+        painterResource(R.drawable.ic_github),
+        contentDescription = null,
+        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.size(22.dp),
+    )
+}
+
+@Composable
+private fun ExternalLinkIcon() {
+    Icon(
+        Icons.AutoMirrored.Outlined.OpenInNew,
+        contentDescription = null,
+        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.size(18.dp),
+    )
 }
 
 @Composable

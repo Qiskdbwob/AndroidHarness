@@ -161,6 +161,7 @@ private fun settingsIcon(page: SettingsPage): ImageVector = when (page) {
     SettingsPage.USAGE -> Icons.Outlined.BarChart
     SettingsPage.UPDATES -> Icons.Outlined.SystemUpdate
     SettingsPage.SETUP -> Icons.Outlined.Checklist
+    SettingsPage.ABOUT -> Icons.Outlined.Info
 }
 
 @Composable

@@ -20,8 +20,9 @@ internal enum class SettingsPage(
     ENVIRONMENT("Terminal & device", "Linux tools, storage permissions and background access", "Workspace & device", "shizuku shell packages environment battery optimization keep alive"),
     BACKUP("Chat backups", "Export and import your conversations", "App & data", "restore history archive transfer"),
     USAGE("Usage", "Token usage, costs and activity over time", "App & data", "stats statistics cache tokens"),
-    UPDATES("About & updates", "App version and available updates", "App & data", "version release download"),
+    UPDATES("Updates", "Check GitHub Releases for a newer build", "App & data", "version release download"),
     SETUP("Setup guide", "Revisit the app setup steps", "App & data", "onboarding notifications permissions"),
+    ABOUT("About", "Version, license, credits and links", "App & data", "about license mit copyright credits author sanuu github repository open source thanks"),
 }
 
 internal data class SettingsSearchEntry(
@@ -65,7 +66,10 @@ private val subSettingsEntries = listOf(
     SettingsSearchEntry("Battery optimization", "Terminal & device · Keep background agent work alive", SettingsPage.ENVIRONMENT, "background keep alive battery"),
     SettingsSearchEntry("Export chats", "Chat backups · Save conversations to a backup file", SettingsPage.BACKUP, "backup export history archive"),
     SettingsSearchEntry("Import chats", "Chat backups · Restore conversations from a backup file", SettingsPage.BACKUP, "backup import restore history"),
-    SettingsSearchEntry("Check for updates", "About & updates · Check GitHub Releases for a newer build", SettingsPage.UPDATES, "version update release download"),
+    SettingsSearchEntry("Check for updates", "Updates · Check GitHub Releases for a newer build", SettingsPage.UPDATES, "version update release download"),
+    SettingsSearchEntry("License", "About · The MIT license and what it means for forks", SettingsPage.ABOUT, "mit copyright permissive open source"),
+    SettingsSearchEntry("Credits", "About · Open source projects behind AndroidHarness", SettingsPage.ABOUT, "thanks acknowledgements inspirations projects"),
+    SettingsSearchEntry("Author", "About · Who builds AndroidHarness and where to find it", SettingsPage.ABOUT, "sanuu github repository maintainer source code"),
 )
 
 internal fun matchingSettingsEntries(query: String): List<SettingsSearchEntry> {
