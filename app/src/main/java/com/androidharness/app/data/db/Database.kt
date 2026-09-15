@@ -306,6 +306,9 @@ interface HarnessDao {
     @Query("DELETE FROM checkpoints WHERE sessionId = :sessionId AND turnId = :turnId")
     suspend fun deleteCheckpoints(sessionId: String, turnId: String)
 
+    @Delete
+    suspend fun deleteCheckpoint(checkpoint: CheckpointEntity)
+
     // snippets
     @Query("SELECT * FROM snippets ORDER BY name ASC")
     fun snippetsFlow(): Flow<List<SnippetEntity>>

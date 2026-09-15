@@ -1376,10 +1376,10 @@ class ChatViewModel(
             .getOrElse { e -> return "Rewind failed: ${e.message}" }
         _state.update { it.copy(turnsWithCheckpoints = refreshCheckpoints(sid)) }
         return when {
-            summary.filesTouched == 0 && summary.messagesDeleted == 0 -> "Nothing to rewind for that turn."
             summary.filesFailed > 0 ->
-                "Undo done, with issues: ${summary.filesRestored} file(s) restored, " +
-                    "${summary.messagesDeleted} message(s) removed, ${summary.filesFailed} could not be restored."
+                "Undo incomplete: ${summary.filesRestored} file(s) restored, ${summary.filesFailed} failed. " +
+                    "History and failed checkpoints were kept. Retry undo after fixing the file access issue."
+            summary.filesTouched == 0 && summary.messagesDeleted == 0 -> "Nothing to rewind for that turn."
             else ->
                 "Undo complete: ${summary.filesRestored} file(s) restored, " +
                     "${summary.messagesDeleted} message(s) removed."
@@ -1397,7 +1397,10 @@ class ChatViewModel(
         if (newText.isBlank()) return
         viewModelScope.launch {
             runCatching { c.runManager.rewindAndTruncate(sid, mid) }
-                .onFailure { e -> _state.update { st -> st.copy(error = "Could not rewind: ${e.message}") } }
+                .onFailure { e ->
+                    _state.update { st -> st.copy(error = "Could not rewind: ${e.message}") }
+                    return@launch
+                }
             startRun(newText)
         }
     }

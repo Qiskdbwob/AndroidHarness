@@ -746,7 +746,7 @@ class RunManager(
      * the edited text as a fresh run.
      */
     suspend fun rewindAndTruncate(sessionId: String, messageId: String) {
-        stop(sessionId)
+        stopAndJoin(sessionId)
         val msgs = sessions.messages(sessionId)
         val index = msgs.indexOfFirst { it.id == messageId }
         if (index < 0) return
@@ -754,7 +754,8 @@ class RunManager(
         val turnIds = msgs.drop(index).mapNotNull { it.turnId }.distinct().reversed()
         val fs = workspace.currentOnce()
         for (tid in turnIds) {
-            runCatching { checkpoints.rewind(sessionId, tid, fs) }
+            val result = checkpoints.rewind(sessionId, tid, fs)
+            check(result.failed == 0) { "Some files could not be restored. History and failed checkpoints were kept; retry undo." }
         }
         sessions.truncateFrom(sessionId, messageId)
     }
@@ -768,7 +769,7 @@ class RunManager(
      * are recomputed against the session baseline.
      */
     suspend fun rewindFromTurn(sessionId: String, turnId: String): RewindSummary {
-        val ordered = runCatching { checkpoints.turnsOrdered(sessionId) }.getOrDefault(emptyList())
+        val ordered = checkpoints.turnsOrdered(sessionId)
         val idx = ordered.indexOfFirst { it.turnId == turnId }
         val affectedTurns = if (idx >= 0) ordered.drop(idx).map { it.turnId } else listOf(turnId)
 
@@ -777,17 +778,19 @@ class RunManager(
         var failed = 0
         val paths = LinkedHashSet<String>()
         for (tid in affectedTurns.reversed()) {
-            val result = runCatching { checkpoints.rewind(sessionId, tid, fs) }.getOrNull() ?: continue
+            val result = checkpoints.rewind(sessionId, tid, fs)
             restored += result.restored
             failed += result.failed
             result.paths.forEach { paths += com.androidharness.app.workspace.normalizeRelPath(it) }
+            // Older snapshots must not overwrite a newer failed restore before retry.
+            if (result.failed > 0) break
         }
 
         // Chat rolls back: delete from this turn's first agent message onward.
         val msgs = sessions.messages(sessionId)
         val boundary = msgs.indexOfFirst { it.turnId == turnId && it.role != Role.USER }
         var messagesDeleted = 0
-        if (boundary >= 0) {
+        if (failed == 0 && boundary >= 0) {
             msgs[boundary].id?.let { boundaryId ->
                 messagesDeleted = msgs.size - boundary
                 sessions.truncateFrom(sessionId, boundaryId)
@@ -795,7 +798,7 @@ class RunManager(
         }
 
         // The removed turns' diff-chip rows point at messages that no longer exist.
-        sessions.deleteFileEditsForTurns(sessionId, affectedTurns)
+        if (failed == 0) sessions.deleteFileEditsForTurns(sessionId, affectedTurns)
 
         // Keep the Files-changed view honest: recompute restored paths live.
         for (path in paths) {

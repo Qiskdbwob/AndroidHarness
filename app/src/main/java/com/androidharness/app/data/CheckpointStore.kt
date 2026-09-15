@@ -56,7 +56,7 @@ class CheckpointStore(private val dao: HarnessDao) {
 
     /**
      * Restore the workspace to its state before [turnId]: replay that turn's
-     * snapshots, then drop them. Returns how many paths restored cleanly and
+     * snapshots, then drop only those restored successfully. Returns how many paths restored cleanly and
      * how many failed (failures were previously silent, the UI now reports
      * them so "undo" can't quietly lie). [RewindResult.paths] lists every
      * restored relPath so callers can refresh derived state.
@@ -70,23 +70,26 @@ class CheckpointStore(private val dao: HarnessDao) {
             val ok = runCatching {
                 val node = workspace.resolve(cp.relPath)
                 when {
-                    !cp.existedBefore -> if (node.exists) node.delete()
+                    !cp.existedBefore -> if (node.exists) check(node.delete()) { "Could not delete ${cp.relPath}" }
                     !cp.wasDirectory -> {
-                        val text = String(android.util.Base64.decode(cp.contentB64, android.util.Base64.NO_WRAP))
+                        val text = String(java.util.Base64.getDecoder().decode(cp.contentB64), Charsets.UTF_8)
                         node.writeText(text)
                     }
                     // Directory the agent removed comes back (empty).
-                    cp.wasDirectory && !node.exists -> node.mkdirs()
+                    cp.wasDirectory -> {
+                        if (!node.exists) node.mkdirs()
+                        check(node.isDirectory) { "Could not restore directory ${cp.relPath}" }
+                    }
                 }
-            }.isSuccess
+            }.onFailure { if (it is kotlinx.coroutines.CancellationException) throw it }.isSuccess
             if (ok) {
+                dao.deleteCheckpoint(cp)
                 restored++
                 paths += cp.relPath
             } else {
                 failed++
             }
         }
-        dao.deleteCheckpoints(sessionId, turnId)
         return RewindResult(restored, failed, paths)
     }
 
