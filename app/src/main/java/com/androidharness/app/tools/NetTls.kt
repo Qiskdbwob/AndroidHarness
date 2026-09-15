@@ -26,6 +26,15 @@ object NetTls {
     const val BUNDLE_RELATIVE_PATH = "etc/tls/cacert.pem"
 
     /**
+     * OpenSSL config shipped in the prefix. Termux builds bake
+     * `/data/data/com.termux/...` into every OpenSSL-based tool, and when the
+     * Termux app is installed that path is EACCES rather than missing, which
+     * Node treats as a fatal startup error ("OpenSSL configuration error").
+     * Exporting this keeps node, curl and friends on their own prefix copy.
+     */
+    const val OPENSSL_CONF_RELATIVE_PATH = "etc/tls/openssl.cnf"
+
+    /**
      * Copies the bundled asset into the prefix when missing or stale.
      * Idempotent; safe to call from any thread before shell launches.
      */

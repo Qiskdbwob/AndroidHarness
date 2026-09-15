@@ -72,11 +72,26 @@ internal object CodeGraphCommands {
         |  echo "codegraph: the Harness-installed runtime is incomplete. Reinstall it from Settings, Code intelligence." >&2
         |  exit 127
         |fi
+        |# Node opens the openssl.cnf it was built with, which for these Termux
+        |# builds is /data/data/com.termux/...: unreadable from this app, and when
+        |# the Termux app is installed that is EACCES rather than a missing file,
+        |# so Node exits instead of starting. Point it at the copy in this prefix.
+        |if [ -f "${'$'}PREFIX/${com.androidharness.app.tools.NetTls.OPENSSL_CONF_RELATIVE_PATH}" ]; then
+        |  OPENSSL_CONF="${'$'}PREFIX/${com.androidharness.app.tools.NetTls.OPENSSL_CONF_RELATIVE_PATH}"
+        |  export OPENSSL_CONF
+        |fi
         |LINKER=
         |for c in /system/bin/linker64 /apex/com.android.runtime/bin/linker64 /system/bin/linker; do
         |  if [ -x "${'$'}c" ]; then LINKER="${'$'}c"; break; fi
         |done
         |if [ -n "${'$'}LINKER" ]; then
+        |  # Started through the linker, Node reports the LINKER as process.execPath,
+        |  # so anything that re-runs Node through that path is malformed. CodeGraph's
+        |  # liveness watchdog does exactly that ("node -e") and prints
+        |  # 'expected absolute path: "-e"' while its daemon safety net fails to
+        |  # start. Harness only runs one-shot commands, so turn it off.
+        |  CODEGRAPH_NO_WATCHDOG=1
+        |  export CODEGRAPH_NO_WATCHDOG
         |  exec "${'$'}LINKER" "${'$'}NODE" --liftoff-only --disable-warning=ExperimentalWarning "${'$'}CLI" "${'$'}@"
         |fi
         |exec "${'$'}NODE" --liftoff-only --disable-warning=ExperimentalWarning "${'$'}CLI" "${'$'}@"
@@ -283,11 +298,18 @@ class CodeGraphManager(
     private val _workspaceState = MutableStateFlow(CodeGraphRunState())
     val workspaceState: StateFlow<CodeGraphRunState> = _workspaceState
 
+    /** Set once the on-disk launcher has been compared with this build's. */
+    @Volatile
+    private var launcherChecked = false
+
     fun isIndexed(workspace: WorkspaceFs?): Boolean =
         workspace?.shellRoot?.resolve(".codegraph")?.isDirectory == true
 
-    fun isAvailable(workspace: WorkspaceFs): Boolean =
-        linuxEnv.isReady && binary.exists() && isIndexed(workspace)
+    fun isAvailable(workspace: WorkspaceFs): Boolean {
+        if (!linuxEnv.isReady || !binary.exists() || !isIndexed(workspace)) return false
+        ensureLauncherCurrent()
+        return true
+    }
 
     suspend fun refresh(): CodeGraphState {
         if (!binary.exists() || !linuxEnv.isReady) {
@@ -296,6 +318,7 @@ class CodeGraphManager(
             _state.value = next
             return next
         }
+        ensureLauncherCurrent()
         val result = run(CodeGraphCommands.version, home, 30_000, 4_000)
         val version = if (result.ok) parseVersion(result.output) else null
         if (version != null) marker.writeText(version) else marker.delete()
@@ -643,6 +666,18 @@ class CodeGraphManager(
         runCatching { binary.delete() }
         binary.writeText(CodeGraphCommands.launcher())
         runCatching { Os.chmod(binary.absolutePath, 0x1ED) } // 0755
+    }
+
+    /**
+     * Rewrites the entry point when it predates this build, so a fix to the
+     * launcher (the runtime flags, the OpenSSL config) reaches an install that
+     * already exists instead of waiting for a reinstall. Once per process: the
+     * compare is small but not free, and the launcher cannot change under us.
+     */
+    private fun ensureLauncherCurrent() {
+        if (launcherChecked || !binary.exists()) return
+        launcherChecked = true
+        if (runCatching { binary.readText() }.getOrNull() != CodeGraphCommands.launcher()) writeLauncher()
     }
 
     /**

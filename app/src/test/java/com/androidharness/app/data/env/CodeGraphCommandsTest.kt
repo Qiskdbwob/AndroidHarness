@@ -48,6 +48,17 @@ class CodeGraphCommandsTest {
     }
 
     @Test
+    fun `launcher pins the openssl config and disables the linker-hostile watchdog`() {
+        val script = CodeGraphCommands.launcher()
+        // Node's built-in config path is /data/data/com.termux/..., which is
+        // EACCES (not missing) when Termux is installed, and fatal at startup.
+        assertTrue(script.contains("OPENSSL_CONF=\"${'$'}PREFIX/etc/tls/openssl.cnf\""))
+        // CodeGraph's watchdog re-runs node through process.execPath, which is
+        // the linker on this launch path, so its child dies on "-e".
+        assertTrue(script.contains("CODEGRAPH_NO_WATCHDOG=1"))
+    }
+
+    @Test
     fun `launcher starts the runtime through the linker, never through the prefix node`() {
         val script = CodeGraphCommands.launcher()
         // App-private files cannot be exec'd directly on W^X devices, so the

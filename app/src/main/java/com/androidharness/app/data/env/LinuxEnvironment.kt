@@ -760,6 +760,13 @@ class LinuxEnvironmentManager(
         // runnable despite the W^X exec restriction on app-private files.
         if (shimFile.exists()) put("BASH_ENV", shimFile.absolutePath)
         putAll(tlsEnvVars())
+        // OpenSSL-based tools read the config path they were built with, which
+        // for these Termux builds is /data/data/com.termux/...: unreadable from
+        // this app, and EACCES rather than missing when the Termux app is
+        // installed, which Node refuses to start over.
+        File(prefix, com.androidharness.app.tools.NetTls.OPENSSL_CONF_RELATIVE_PATH)
+            .takeIf { it.isFile }
+            ?.let { put("OPENSSL_CONF", it.absolutePath) }
         // Bug 2 fix: tell every spawned shell where exec-capable scratch lives.
         // This env serves APP-uid processes: they cannot write /data/local/tmp
         // (SELinux), so they get the app-private mirror; the privileged tier's
@@ -1049,6 +1056,13 @@ class LinuxEnvironmentManager(
         // (a DIRECTORY) which broke all privileged-tier TLS (git exit with
         // "error adding trust anchors", curl exit 77).
         putAll(com.androidharness.app.tools.NetTls.envVars("$TMP_PREFIX/etc/tls/cacert.pem"))
+        // Same derivation rule as the CA bundle above: the deployed copy is
+        // staged from this prefix, so it has the OpenSSL config iff this one
+        // does, and statting the 0700 deployed prefix from the app uid would
+        // silently report it missing.
+        File(prefix, com.androidharness.app.tools.NetTls.OPENSSL_CONF_RELATIVE_PATH)
+            .takeIf { it.isFile }
+            ?.let { put("OPENSSL_CONF", "$TMP_PREFIX/${com.androidharness.app.tools.NetTls.OPENSSL_CONF_RELATIVE_PATH}") }
         // Bug 2 fix: exec-capable scratch location for the privileged tier.
         put("HARNESS_SCRATCH", ShellPolicy.SCRATCH_TMP)
     }
