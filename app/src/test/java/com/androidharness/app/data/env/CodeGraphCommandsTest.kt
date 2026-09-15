@@ -91,6 +91,22 @@ class CodeGraphCommandsTest {
     }
 
     @Test
+    fun `release tag is read from the feed as well as the redirect and the api`() {
+        val feed = """
+            <feed><entry><title>v1.6.0</title><updated>x</updated></entry>
+            <entry><title>v1.5.0</title></entry></feed>
+        """.trimIndent()
+        assertEquals("v1.6.0", CodeGraphProvision.tagFromAtom(feed))
+        // A named release still yields its version.
+        assertEquals(
+            "v2.1.3",
+            CodeGraphProvision.tagFromAtom("<entry><title>Spring clean v2.1.3</title></entry>"),
+        )
+        assertNull(CodeGraphProvision.tagFromAtom("<feed></feed>"))
+        assertNull(CodeGraphProvision.tagFromAtom("<entry><title>no version here</title></entry>"))
+    }
+
+    @Test
     fun `only a later release counts as an update`() {
         assertTrue(CodeGraphProvision.isNewer("1.7.0", "1.6.0"))
         assertTrue(CodeGraphProvision.isNewer("1.6.1", "1.6.0"))

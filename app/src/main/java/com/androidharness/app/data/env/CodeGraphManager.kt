@@ -107,6 +107,9 @@ internal object CodeGraphProvision {
 
     fun apiLatestUrl(): String = "https://api.github.com/repos/$REPO/releases/latest"
 
+    /** Release feed: unrated, and served from the same host as the archives. */
+    fun atomUrl(): String = "https://github.com/$REPO/releases.atom"
+
     fun assetUrl(tag: String): String = "https://github.com/$REPO/releases/download/$tag/$BUNDLE_ASSET"
 
     fun sumsUrl(tag: String): String = "https://github.com/$REPO/releases/download/$tag/SHA256SUMS"
@@ -115,6 +118,19 @@ internal object CodeGraphProvision {
     fun tagFromRedirect(location: String?): String? {
         val raw = location?.substringAfterLast("/releases/tag/", "")?.trim()
         return raw?.takeIf { it.isNotEmpty() && it != location }
+    }
+
+    /**
+     * Release tag from the releases Atom feed's newest entry. The entry title
+     * is whatever the release was called, so a version-shaped token is pulled
+     * out of it rather than trusting the title to be the tag verbatim.
+     */
+    fun tagFromAtom(xml: String): String? {
+        val entry = Regex("<entry>(.*?)</entry>", RegexOption.DOT_MATCHES_ALL).find(xml)
+            ?.groupValues?.get(1) ?: return null
+        val title = Regex("<title>(.*?)</title>", RegexOption.DOT_MATCHES_ALL).find(entry)
+            ?.groupValues?.get(1) ?: return null
+        return Regex("""v?\d+\.\d+\.\d+(?:[-+][A-Za-z0-9._-]+)?""").find(title)?.value
     }
 
     /** Release tag from the API's `tag_name` field. */
@@ -241,13 +257,14 @@ class CodeGraphManager(
     suspend fun checkForUpdates(): CodeGraphState {
         val installed = _state.value.version ?: return _state.value
         _state.value = _state.value.copy(busy = true, action = "Checking for updates", message = null, failed = false)
-        val latest = withContext(Dispatchers.IO) { resolveTag()?.let { parseVersion(it) } }
+        val lookup = withContext(Dispatchers.IO) { lookUpLatestRelease() }
+        val latest = lookup.tag?.let { parseVersion(it) }
         val next = _state.value.copy(
             busy = false,
             action = null,
             latest = latest ?: _state.value.latest,
             message = when {
-                latest == null -> "Could not reach GitHub to check for updates."
+                latest == null -> "Could not check for updates (${lookup.problem ?: "no release found"})."
                 CodeGraphProvision.isNewer(latest, installed) -> "CodeGraph $latest is available."
                 else -> "CodeGraph $installed is the latest version."
             },
@@ -280,10 +297,11 @@ class CodeGraphManager(
         if (!linuxEnv.isReady) {
             return CodeGraphCommandResult(false, "The Linux environment could not be prepared.")
         }
-        val tag = resolveTag()
+        val lookup = lookUpLatestRelease()
+        val tag = lookup.tag?.let { CodeGraphProvision.normalizeTag(it) }
             ?: return CodeGraphCommandResult(
                 false,
-                "Could not reach GitHub to find the latest CodeGraph release.",
+                "Could not reach GitHub to find the latest CodeGraph release (${lookup.problem ?: "no release found"}).",
             )
         val work = File(linuxEnv.appPrivateScratch, "codegraph").apply { mkdirs() }
         val archive = File(work, CodeGraphProvision.BUNDLE_ASSET)
@@ -365,16 +383,53 @@ class CodeGraphManager(
     // Provisioning
     // ------------------------------------------------------------------
 
-    /** Latest published release tag, from the redirect first and the API second. */
-    private fun resolveTag(): String? {
-        val redirect = runCatching {
-            val noFollow = client.newBuilder().followRedirects(false).build()
-            noFollow.newCall(Request.Builder().url(CodeGraphProvision.latestPageUrl()).build()).execute()
-                .use { it.header("Location") }
-        }.getOrNull()
-        CodeGraphProvision.tagFromRedirect(redirect)?.let { return CodeGraphProvision.normalizeTag(it) }
-        val api = runCatching { fetchText(CodeGraphProvision.apiLatestUrl()) }.getOrNull()
-        return CodeGraphProvision.normalizeTag(api?.let { CodeGraphProvision.tagFromApi(it) })
+    /** Newest published release, or why it could not be resolved. */
+    private data class ReleaseLookup(val tag: String?, val problem: String?)
+
+    /**
+     * Resolves the newest release from three sources in order of how likely
+     * they are to answer on a phone. Each failure is kept, because a bare
+     * "could not reach GitHub" hides whether that was DNS, a rate limit or an
+     * unexpected response, and the settings page shows the reason.
+     */
+    private fun lookUpLatestRelease(): ReleaseLookup {
+        val problems = mutableListOf<String>()
+
+        // 1. The releases/latest redirect: unrated, and the Location header
+        //    names the tag the release page would open.
+        try {
+            client.newBuilder().followRedirects(false).build()
+                .newCall(Request.Builder().url(CodeGraphProvision.latestPageUrl()).build())
+                .execute().use { response ->
+                    CodeGraphProvision.tagFromRedirect(response.header("Location"))
+                        ?.let { return ReleaseLookup(it, null) }
+                    problems += "redirect HTTP ${response.code}"
+                }
+        } catch (e: Exception) {
+            problems += "redirect ${e.message ?: e.javaClass.simpleName}"
+        }
+
+        // 2. The releases feed: also unrated, and served from the same host
+        //    the release archive downloads come from.
+        try {
+            CodeGraphProvision.tagFromAtom(fetchText(CodeGraphProvision.atomUrl()))
+                ?.let { return ReleaseLookup(it, null) }
+            problems += "feed had no release"
+        } catch (e: Exception) {
+            problems += "feed ${e.message ?: e.javaClass.simpleName}"
+        }
+
+        // 3. The API last: it is rate limited per IP, so it is the one most
+        //    likely to answer 403 on a shared or carrier connection.
+        try {
+            CodeGraphProvision.tagFromApi(fetchText(CodeGraphProvision.apiLatestUrl()))
+                ?.let { return ReleaseLookup(it, null) }
+            problems += "api had no tag"
+        } catch (e: Exception) {
+            problems += "api ${e.message ?: e.javaClass.simpleName}"
+        }
+
+        return ReleaseLookup(null, problems.joinToString("; "))
     }
 
     private fun fetchText(url: String): String =
