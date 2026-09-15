@@ -18,6 +18,7 @@ private val WEB_SEARCH_PROVIDERS = setOf("keyless", "brave", "tavily")
 
 enum class ThemeMode { SYSTEM, LIGHT, DARK, AMOLED }
 
+@kotlinx.serialization.Serializable
 data class AppSettings(
     val permissionMode: PermissionMode = PermissionMode.CONFIRM_RISKY,
     val themeMode: ThemeMode = ThemeMode.SYSTEM,
@@ -169,6 +170,29 @@ class SettingsRepository(private val context: Context) {
             lastActiveSessionId = prefs[Keys.LAST_ACTIVE_SESSION],
             repoMapEnabled = prefs[Keys.REPO_MAP_ENABLED] ?: true,
         )
+    }
+
+    suspend fun restorePortable(s: AppSettings) {
+        context.settingsStore.edit { p ->
+            p[Keys.THEME_MODE] = s.themeMode.name
+            p[Keys.DYNAMIC_COLOR] = s.dynamicColor
+            p[Keys.THINKING_LEVEL] = s.thinkingLevel.name
+            p[Keys.MAX_CONTEXT] = s.maxContextTokens
+            p[Keys.MAX_OUTPUT] = s.maxOutputTokens
+            p[Keys.MAX_ITERATIONS] = s.maxIterations
+            p[Keys.KEEP_ALIVE] = s.keepAlive
+            p[Keys.DISABLED_SKILLS] = s.disabledSkills
+            p[Keys.WEB_SEARCH_PROVIDER] = s.webSearchProvider
+            p[Keys.VOICE_ENGINE] = s.voiceEngine
+            p[Keys.GROQ_WHISPER_MODEL] = s.groqWhisperModel
+            p[Keys.RESUME_LAST_CHAT] = s.resumeLastChat
+            p[Keys.REPO_MAP_ENABLED] = s.repoMapEnabled
+            p[Keys.PLANNING_MODELS_ENABLED] = s.planningModelsEnabled
+            listOf(Keys.ACTIVE_PROVIDER to s.activeProviderId, Keys.ACTIVE_MODEL to s.activeModel,
+                Keys.PLANNING_PROVIDER to s.planningProviderId, Keys.PLANNING_MODEL to s.planningModel,
+                Keys.EXECUTION_PROVIDER to s.executionProviderId, Keys.EXECUTION_MODEL to s.executionModel
+            ).forEach { (key, value) -> if (value == null) p.remove(key) else p[key] = value }
+        }
     }
 
     suspend fun setWebSearchProvider(provider: String) {

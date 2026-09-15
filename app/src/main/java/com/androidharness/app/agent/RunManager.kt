@@ -109,6 +109,9 @@ class RunManager(
     private val injections = mutableMapOf<String, Channel<String>>()
     private val turnIds = mutableMapOf<String, String>()
     private val allowedTools = mutableMapOf<String, MutableSet<String>>()
+    private val grantStore = RememberedGrants()
+    internal val rememberedGrants = grantStore.grants
+    internal fun revokeGrant(grant: RememberedGrants.Grant) = grantStore.revoke(grant)
     private val lingerJobs = mutableMapOf<String, Job>()
     private val deltaBuffers = mutableMapOf<String, DeltaBuffers>()
 
@@ -232,7 +235,7 @@ class RunManager(
         synchronized(lock) {
             turnIds[sid] = turnId
             injections[sid] = channel
-            allowedTools[sid] = mutableSetOf()
+            allowedTools[sid] = grantStore.start(sid, runWorkspace.displayPath)
             deltaBuffers[sid] = DeltaBuffers()
         }
 
@@ -403,6 +406,7 @@ class RunManager(
                     injections.remove(sid)
                     turnIds.remove(sid)
                     allowedTools.remove(sid)
+                    grantStore.finish(sid)
                     deltaBuffers.remove(sid)
                 }
                 try {
@@ -600,7 +604,9 @@ class RunManager(
     fun approve(sessionId: String, rememberForSession: Boolean) {
         val live = stateOf(sessionId)
         val pending = live.value.pendingApproval ?: return
-        if (rememberForSession) synchronized(lock) { allowedTools[sessionId]?.add(pending.grantKey) }
+        if (rememberForSession) synchronized(lock) {
+            grantStore.remember(sessionId, pending.grantKey)
+        }
         live.update { it.copy(pendingApproval = null) }
         pending.response.complete(true)
     }

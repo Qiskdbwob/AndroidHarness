@@ -250,14 +250,20 @@ fun SettingsScreen(
                         SettingsPage.GITHUB -> GitHubSection(container)
                         SettingsPage.SEARCH -> WebSearchSection(container)
                         SettingsPage.MCP -> McpSection(container)
-                        SettingsPage.WORKSPACE -> WorkspaceSection(
-                            container, projects, currentProject, workspace?.displayPath, shizukuState,
-                            onAddWorkspace = { showAddWorkspace = true },
-                            onDeleteWorkspace = { pendingDelete = it },
-                            onSelectWorkspace = { id -> scope.launch { container.workspace.setActiveProject(id) } },
-                        )
+                        SettingsPage.WORKSPACE -> {
+                            RememberedPermissionsSection(container)
+                            WorkspaceSection(
+                                container, projects, currentProject, workspace?.displayPath, shizukuState,
+                                onAddWorkspace = { showAddWorkspace = true },
+                                onDeleteWorkspace = { pendingDelete = it },
+                                onSelectWorkspace = { id -> scope.launch { container.workspace.setActiveProject(id) } },
+                            )
+                        }
                         SettingsPage.ENVIRONMENT -> TerminalSection(container, envState, shizukuState, serviceState)
-                        SettingsPage.BACKUP -> ChatsBackupSection(container)
+                        SettingsPage.BACKUP -> {
+                            SettingsBackupSection(container)
+                            ChatsBackupSection(container)
+                        }
                         SettingsPage.UPDATES -> UpdatesCard(container)
                         SettingsPage.ABOUT -> AboutSection(container)
                         SettingsPage.SKILLS, SettingsPage.USAGE, SettingsPage.SETUP -> Unit

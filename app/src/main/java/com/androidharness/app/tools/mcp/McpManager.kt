@@ -157,6 +157,34 @@ class McpManager(
         android.util.Base64.encodeToString(mac.doFinal(data), android.util.Base64.NO_WRAP)
     }.getOrNull()
 
+    suspend fun importDisabledServers(configs: List<McpServerConfig>) = ioLock.withLock {
+        withContext(Dispatchers.IO) {
+            val names = _servers.value.map { it.name }.toMutableSet()
+            val imported = configs.map { config ->
+                var name = config.name + " (restored)"
+                var suffix = 2
+                while (name in names) name = config.name + " (restored ${suffix++})"
+                names.add(name)
+                config.copy(name = name, enabled = false)
+            }
+            val list = _servers.value + imported
+            val bytes = json.encodeToString(list).toByteArray(Charsets.UTF_8)
+            val signature = computeConfigHmac(bytes) ?: error("Cannot protect restored MCP configuration.")
+            val atomic = android.util.AtomicFile(storeFile)
+            val stream = atomic.startWrite()
+            try {
+                stream.write(bytes)
+                atomic.finishWrite(stream)
+            } catch (e: Exception) {
+                atomic.failWrite(stream)
+                throw e
+            }
+            configHmacFile().writeText(signature)
+            _servers.value = list
+            _configTampered.value = false
+        }
+    }
+
     suspend fun addServer(config: McpServerConfig) =
         persist(_servers.value.filterNot { it.name == config.name } + config)
 
