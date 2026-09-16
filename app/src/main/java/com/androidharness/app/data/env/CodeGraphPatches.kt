@@ -426,6 +426,34 @@ internal object CodeGraphBundlePatches {
         "        for (const ref of resolved) {",
     )
 
+    /**
+     * Generation 9 state: the base exists and is correct, but the wrapper
+     * above it emits the old model — an import node's edge mirrored onto the
+     * file, which is where the duplicate and symbol-targeted `imports` rows
+     * came from. Only the wrapper is replaced here; the base is left alone.
+     */
+    private val createEdgesV9Anchor = lines(
+        "    createEdges(resolved) {",
+        "        const mapped = this.createEdgesBase(resolved);",
+        "        const out = [];",
+        "        for (const edge of mapped) {",
+        "            if (!edge || edge.source === edge.target) continue;",
+        "            out.push(edge);",
+        "            if (edge.kind === 'imports') {",
+        "                const srcNode = this.queries.getNodeById(edge.source);",
+        "                if (srcNode && srcNode.kind === 'import') {",
+        "                    const fileNodes = this.context.getNodesInFile(srcNode.filePath);",
+        "                    const fileNode = fileNodes ? fileNodes.find((n) => n.kind === 'file') : null;",
+        "                    if (fileNode && fileNode.id !== edge.target) {",
+        "                        out.push({ ...edge, source: fileNode.id });",
+        "                    }",
+        "                }",
+        "            }",
+        "        }",
+        "        return out;",
+        "    }",
+    )
+
     private val createEdgesWrapper = Patch(
         "resolution/index.js",
         createEdgesPristineAnchor,
@@ -436,9 +464,13 @@ internal object CodeGraphBundlePatches {
                 "        const out = [];",
                 "        for (const ref of resolved) {",
             ),
+            createEdgesV9Anchor,
         ),
-        fallbackReplacements = listOf(createEdgesCanonical + "\n" + createEdgesBaseFromLoop),
-        satisfiedMarkers = listOf("createEdgesBase(resolved) {"),
+        fallbackReplacements = listOf(createEdgesCanonical + "\n" + createEdgesBaseFromLoop, createEdgesCanonical),
+        // Not `createEdgesBase`, which every generation since 9 has: the
+        // marker has to be something only this model emits, or a device that
+        // already has the old wrapper would be left with it.
+        satisfiedMarkers = listOf("fileNodeOf(filePath)"),
     )
 
     // ------------------------------------------------------------------
@@ -914,6 +946,87 @@ internal object CodeGraphBundlePatches {
         "];",
     )
 
+    /** Drops edges that join nodes of two languages that never share a graph. */
+    private val crossLanguagePrune = lines(
+        "        DELETE FROM edges WHERE id IN (",
+        "          SELECT e.id FROM edges e",
+        "          JOIN nodes s ON e.source = s.id",
+        "          JOIN nodes t ON e.target = t.id",
+        "          WHERE s.language != t.language",
+        "          AND NOT (",
+        "            (s.language IN ('kotlin','java','scala','clojure','groovy') AND t.language IN ('kotlin','java','scala','clojure','groovy')) OR",
+        "            (s.language IN ('swift','objc','objcpp') AND t.language IN ('swift','objc','objcpp')) OR",
+        "            (s.language IN ('typescript','tsx','javascript','jsx','arkts','vue','svelte','astro') AND t.language IN ('typescript','tsx','javascript','jsx','arkts','vue','svelte','astro')) OR",
+        "            (s.language IN ('c','cpp') AND t.language IN ('c','cpp')) OR",
+        "            (s.language IN ('csharp','razor') AND t.language IN ('csharp','razor'))",
+        "          )",
+        "        );",
+    )
+
+    /**
+     * The retroactive half of the edge fix: an index that was resolved before
+     * it keeps its old rows forever, because resolution only runs for files a
+     * sync has touched, and a migration is the one thing that does run for
+     * everything. Each end of an `imports` edge is folded onto the file that
+     * owns it, which is the only shape the resolver emits now, so an edge from
+     * an import node or to an imported symbol becomes the file-to-file edge it
+     * should always have been instead of being thrown away.
+     *
+     * `OR IGNORE` is load-bearing: idx_edges_identity is unique, so a row that
+     * folds onto one already present is skipped rather than aborting the whole
+     * migration, and the cleanup below then removes it.
+     */
+    private val importFold = lines(
+        "        UPDATE OR IGNORE edges SET target = (",
+        "          SELECT f.id FROM nodes f",
+        "          WHERE f.kind = 'file'",
+        "            AND f.file_path = (SELECT n.file_path FROM nodes n WHERE n.id = edges.target)",
+        "        )",
+        "        WHERE kind = 'imports'",
+        "          AND target IN (SELECT id FROM nodes WHERE kind <> 'file')",
+        "          AND EXISTS (",
+        "            SELECT 1 FROM nodes f",
+        "            WHERE f.kind = 'file'",
+        "              AND f.file_path = (SELECT n.file_path FROM nodes n WHERE n.id = edges.target)",
+        "          );",
+        "        UPDATE OR IGNORE edges SET source = (",
+        "          SELECT f.id FROM nodes f",
+        "          WHERE f.kind = 'file'",
+        "            AND f.file_path = (SELECT n.file_path FROM nodes n WHERE n.id = edges.source)",
+        "        )",
+        "        WHERE kind = 'imports'",
+        "          AND source IN (SELECT id FROM nodes WHERE kind <> 'file')",
+        "          AND EXISTS (",
+        "            SELECT 1 FROM nodes f",
+        "            WHERE f.kind = 'file'",
+        "              AND f.file_path = (SELECT n.file_path FROM nodes n WHERE n.id = edges.source)",
+        "          );",
+        "        DELETE FROM edges WHERE kind = 'imports'",
+        "          AND (source IN (SELECT id FROM nodes WHERE kind <> 'file')",
+        "            OR target IN (SELECT id FROM nodes WHERE kind <> 'file')",
+        "            OR source = target);",
+        "        DELETE FROM edges WHERE kind = 'imports'",
+        "          AND id NOT IN (SELECT MIN(id) FROM edges WHERE kind = 'imports' GROUP BY source, target);",
+    )
+
+    private val migrationSqlTail = lines(
+        "        DELETE FROM name_segment_vocab WHERE name NOT IN (SELECT name FROM nodes);",
+        "        UPDATE project_metadata SET value = '26' WHERE key = 'indexed_with_extraction_version';",
+    )
+
+    /** The whole of migration 11, built once and reused by every shape it lands on. */
+    private val migrationEleven = lines(
+        "    {",
+        "        version: 11,",
+        "        description: 'Fold imports edges onto files, prune cross-language and junk edges, refresh the extraction version',",
+        "        up: (db) => {",
+        "            db.exec(`",
+    ) + "\n" + crossLanguagePrune + "\n" + importFold + "\n" + migrationSqlTail + "\n" + lines(
+        "      `);",
+        "        },",
+        "    },",
+    )
+
     private val migrationListReplacement = lines(
         "            db.exec('CREATE INDEX IF NOT EXISTS idx_files_generated ON files(path) WHERE generated = 1');",
         "        },",
@@ -923,61 +1036,20 @@ internal object CodeGraphBundlePatches {
         "        description: 'Prune cross-language edges, unique unresolved refs index, and prune vocab orphans',",
         "        up: (db) => {",
         "            db.exec(`",
-        "        DELETE FROM edges WHERE id IN (",
-        "          SELECT e.id FROM edges e",
-        "          JOIN nodes s ON e.source = s.id",
-        "          JOIN nodes t ON e.target = t.id",
-        "          WHERE s.language != t.language",
-        "          AND NOT (",
-        "            (s.language IN ('kotlin','java','scala','clojure','groovy') AND t.language IN ('kotlin','java','scala','clojure','groovy')) OR",
-        "            (s.language IN ('swift','objc','objcpp') AND t.language IN ('swift','objc','objcpp')) OR",
-        "            (s.language IN ('typescript','tsx','javascript','jsx','arkts','vue','svelte','astro') AND t.language IN ('typescript','tsx','javascript','jsx','arkts','vue','svelte','astro')) OR",
-        "            (s.language IN ('c','cpp') AND t.language IN ('c','cpp')) OR",
-        "            (s.language IN ('csharp','razor') AND t.language IN ('csharp','razor'))",
-        "          )",
-        "        );",
+    ) + "\n" + crossLanguagePrune + "\n" + lines(
         "        DELETE FROM unresolved_refs WHERE id NOT IN (",
         "          SELECT MIN(id) FROM unresolved_refs",
         "          GROUP BY from_node_id, reference_name, reference_kind, line, col",
         "        );",
         "        CREATE UNIQUE INDEX IF NOT EXISTS idx_unresolved_identity",
         "          ON unresolved_refs(from_node_id, reference_name, reference_kind, line, col);",
-        "        DELETE FROM name_segment_vocab WHERE name NOT IN (SELECT name FROM nodes);",
-        "        UPDATE project_metadata SET value = '26' WHERE key = 'indexed_with_extraction_version';",
+    ) + "\n" + migrationSqlTail + "\n" + lines(
         "      `);",
         "        },",
         "    },",
-        "    {",
-        "        version: 11,",
-        "        description: 'Re-prune cross-language and junk import edges, and refresh the extraction version',",
-        "        up: (db) => {",
-        "            db.exec(`",
-        "        DELETE FROM edges WHERE id IN (",
-        "          SELECT e.id FROM edges e",
-        "          JOIN nodes s ON e.source = s.id",
-        "          JOIN nodes t ON e.target = t.id",
-        "          WHERE s.language != t.language",
-        "          AND NOT (",
-        "            (s.language IN ('kotlin','java','scala','clojure','groovy') AND t.language IN ('kotlin','java','scala','clojure','groovy')) OR",
-        "            (s.language IN ('swift','objc','objcpp') AND t.language IN ('swift','objc','objcpp')) OR",
-        "            (s.language IN ('typescript','tsx','javascript','jsx','arkts','vue','svelte','astro') AND t.language IN ('typescript','tsx','javascript','jsx','arkts','vue','svelte','astro')) OR",
-        "            (s.language IN ('c','cpp') AND t.language IN ('c','cpp')) OR",
-        "            (s.language IN ('csharp','razor') AND t.language IN ('csharp','razor'))",
-        "          )",
-        "        );",
-        "        DELETE FROM edges WHERE id IN (",
-        "          SELECT e.id FROM edges e JOIN nodes t ON e.target = t.id",
-        "          WHERE e.kind = 'imports' AND t.kind = 'import' AND t.name <> '' AND TRIM(t.name, '.') = ''",
-        "        );",
-        "        DELETE FROM name_segment_vocab WHERE name NOT IN (SELECT name FROM nodes);",
-        "        UPDATE project_metadata SET value = '26' WHERE key = 'indexed_with_extraction_version';",
-        "      `);",
-        "        },",
-        "    },",
-        "];",
-    )
+    ) + "\n" + migrationEleven + "\n];"
 
-    // Generation-4..8 devices already carry a migration 10 without the
+    // Generation 4..8 devices already carry a migration 10 without the
     // metadata update and without migration 11. Rewrite its tail and append 11.
     private val migrationListFallback1 = lines(
         "        DELETE FROM name_segment_vocab WHERE name NOT IN (SELECT name FROM nodes);",
@@ -987,41 +1059,28 @@ internal object CodeGraphBundlePatches {
         "];",
     )
 
-    private val migrationListFallback1Replacement = lines(
+    private val migrationListFallback1Replacement =
+        migrationSqlTail + "\n" + lines(
+            "      `);",
+            "        },",
+            "    },",
+        ) + "\n" + migrationEleven + "\n];"
+
+    // Generation 9 files already carry a migration 11, so nothing about the
+    // list changes here: what has to go is the VACUUM inside it, which is the
+    // one statement SQLite refuses inside the transaction migrations run in.
+    // Matched on the migration body itself, since `version: 11` alone would
+    // make the patch look already applied.
+    private val migrationListFallback2 = lines(
         "        DELETE FROM name_segment_vocab WHERE name NOT IN (SELECT name FROM nodes);",
         "        UPDATE project_metadata SET value = '26' WHERE key = 'indexed_with_extraction_version';",
+        "        PRAGMA auto_vacuum = INCREMENTAL;",
+        "        VACUUM;",
         "      `);",
-        "        },",
-        "    },",
-        "    {",
-        "        version: 11,",
-        "        description: 'Re-prune cross-language and junk import edges, and refresh the extraction version',",
-        "        up: (db) => {",
-        "            db.exec(`",
-        "        DELETE FROM edges WHERE id IN (",
-        "          SELECT e.id FROM edges e",
-        "          JOIN nodes s ON e.source = s.id",
-        "          JOIN nodes t ON e.target = t.id",
-        "          WHERE s.language != t.language",
-        "          AND NOT (",
-        "            (s.language IN ('kotlin','java','scala','clojure','groovy') AND t.language IN ('kotlin','java','scala','clojure','groovy')) OR",
-        "            (s.language IN ('swift','objc','objcpp') AND t.language IN ('swift','objc','objcpp')) OR",
-        "            (s.language IN ('typescript','tsx','javascript','jsx','arkts','vue','svelte','astro') AND t.language IN ('typescript','tsx','javascript','jsx','arkts','vue','svelte','astro')) OR",
-        "            (s.language IN ('c','cpp') AND t.language IN ('c','cpp')) OR",
-        "            (s.language IN ('csharp','razor') AND t.language IN ('csharp','razor'))",
-        "          )",
-        "        );",
-        "        DELETE FROM edges WHERE id IN (",
-        "          SELECT e.id FROM edges e JOIN nodes t ON e.target = t.id",
-        "          WHERE e.kind = 'imports' AND t.kind = 'import' AND t.name <> '' AND TRIM(t.name, '.') = ''",
-        "        );",
-        "        DELETE FROM name_segment_vocab WHERE name NOT IN (SELECT name FROM nodes);",
-        "        UPDATE project_metadata SET value = '26' WHERE key = 'indexed_with_extraction_version';",
-        "      `);",
-        "        },",
-        "    },",
-        "];",
     )
+
+    private val migrationListFallback2Replacement =
+        importFold + "\n" + migrationSqlTail + "\n" + "      `);"
 
     // ------------------------------------------------------------------
     // db/queries.js
@@ -1159,6 +1218,11 @@ internal object CodeGraphBundlePatches {
             "extraction/tree-sitter.js", importHookNodeAnchor, importHookNodeReplacement,
             fallbackAnchors = listOf(importHookNodeFallback1),
             fallbackReplacements = listOf(importHookNodeFallback1Replacement),
+            // Generation 9 already emits the reference from the import node as
+            // well as the file, which is all this patch is for, so a file that
+            // carries that line is done even though its head no longer matches
+            // the pristine shape.
+            satisfiedMarkers = listOf("importNode.id !== parentId"),
         ),
         Patch("extraction/tree-sitter.js", pythonImportStmtAnchor, pythonImportStmtReplacement),
         Patch("extraction/tree-sitter.js", treeSitterAnchor, treeSitterReplacement),
@@ -1198,9 +1262,13 @@ internal object CodeGraphBundlePatches {
         ),
         Patch(
             "db/migrations.js", migrationListAnchor, migrationListReplacement,
-            fallbackAnchors = listOf(migrationListFallback1),
-            fallbackReplacements = listOf(migrationListFallback1Replacement),
-            satisfiedMarkers = listOf("version: 11,"),
+            fallbackAnchors = listOf(migrationListFallback1, migrationListFallback2),
+            fallbackReplacements = listOf(migrationListFallback1Replacement, migrationListFallback2Replacement),
+            // `version: 11` is NOT the marker: every generation since the
+            // freelist patch carries it, including the ones that vacuum inside
+            // the migration transaction. The fold is what only the fixed body
+            // has.
+            satisfiedMarkers = listOf("UPDATE OR IGNORE edges SET target"),
         ),
         Patch("db/queries.js", insertUnresolvedAnchor, insertUnresolvedReplacement),
         Patch(

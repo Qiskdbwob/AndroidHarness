@@ -206,6 +206,91 @@ class CodeGraphPatchesTest {
         "    }",
     )
 
+    /** Generation 9 tree-sitter: the dual reference is in, on a renamed const. */
+    private val treeSitterV9Source = lines(
+        "    createNode(kind, name, node, extra) {",
+        "        // Skip nodes with empty/missing names — they are not meaningful symbols",
+        "        // and would cause FK violations when edges reference them (see issue #42)",
+        "        if (!name) {",
+        "            return null;",
+        "        }",
+        "        // Harness patch: filter out junk AST tokens that pollute symbol queries",
+        "        if (name === '.' || name === '..' || name === '...' || name.startsWith('from ') || name.startsWith('import ')) {",
+        "            return null;",
+        "        }",
+        "    }",
+        "        if (this.extractor.extractImport) {",
+        "            const info = this.extractor.extractImport(node, this.source);",
+        "            if (info) {",
+        "                const importNode = this.createNode('import', info.moduleName, node, {",
+        "                    signature: info.signature,",
+        "                });",
+        "                if (!info.handledRefs && info.moduleName && this.nodeStack.length > 0) {",
+        "                    const parentId = this.nodeStack[this.nodeStack.length - 1];",
+        "                    if (parentId) {",
+        "                        this.unresolvedReferences.push({",
+        "                            fromNodeId: parentId,",
+        "                            referenceName: info.moduleName,",
+        "                            referenceKind: 'imports',",
+        "                            line: node.startPosition.row + 1,",
+        "                            column: node.startPosition.column,",
+        "                        });",
+        "                    }",
+        "                    if (importNode && importNode.id !== parentId) {",
+        "                        this.unresolvedReferences.push({",
+        "                            fromNodeId: importNode.id,",
+        "                            referenceName: info.moduleName,",
+        "                            referenceKind: 'imports',",
+        "                            line: node.startPosition.row + 1,",
+        "                            column: node.startPosition.column,",
+        "                        });",
+        "                    }",
+        "                }",
+        "                if (this.language === 'python' && node.type === 'import_statement') {",
+        "                if (child?.type === 'dotted_name') {",
+        "                    const impNode = this.createNode('import', (0, tree_sitter_helpers_1.getNodeText)(child, this.source), node, {",
+        "                        signature: importText,",
+        "                    });",
+        "                    pushModuleRef(child);",
+        "                    if (impNode) {",
+        "                        this.unresolvedReferences.push({",
+        "                            fromNodeId: impNode.id,",
+        "                            referenceName: (0, tree_sitter_helpers_1.getNodeText)(child, this.source),",
+        "                            referenceKind: 'imports',",
+        "                            line: child.startPosition.row + 1,",
+        "                            column: child.startPosition.column,",
+        "                        });",
+        "                    }",
+        "                }",
+        "            }",
+        "        }",
+    )
+
+    /** Generation 9: the base is right, the wrapper above it emits the old model. */
+    private val createEdgesV9Source = lines(
+        "    createEdges(resolved) {",
+        "        const mapped = this.createEdgesBase(resolved);",
+        "        const out = [];",
+        "        for (const edge of mapped) {",
+        "            if (!edge || edge.source === edge.target) continue;",
+        "            out.push(edge);",
+        "            if (edge.kind === 'imports') {",
+        "                const srcNode = this.queries.getNodeById(edge.source);",
+        "                if (srcNode && srcNode.kind === 'import') {",
+        "                    const fileNodes = this.context.getNodesInFile(srcNode.filePath);",
+        "                    const fileNode = fileNodes ? fileNodes.find((n) => n.kind === 'file') : null;",
+        "                    if (fileNode && fileNode.id !== edge.target) {",
+        "                        out.push({ ...edge, source: fileNode.id });",
+        "                    }",
+        "                }",
+        "            }",
+        "        }",
+        "        return out;",
+        "    }",
+        "    createEdgesBase(resolved) {",
+        "        return resolved.map((ref) => {",
+    )
+
     private val indexSource = lines(
         "        const db = db_1.DatabaseConnection.open(dbPath);",
         "        const queries = new queries_1.QueryBuilder(db.getDb());",
@@ -447,6 +532,39 @@ class CodeGraphPatchesTest {
         "];",
     )
 
+    /**
+     * Generation 9: the freelist patch is in, migration 11 and all, which is
+     * what makes it dangerous — the migration vacuums inside the transaction
+     * migrations run in, so every sync fails until the body is rewritten.
+     */
+    private val migrationsV9Source = lines(
+        "exports.CURRENT_SCHEMA_VERSION = 11;",
+        "const migrations = [",
+        "    {",
+        "        version: 10,",
+        "        description: 'Prune cross-language edges',",
+        "        up: (db) => {",
+        "            db.exec(`",
+        "        DELETE FROM name_segment_vocab WHERE name NOT IN (SELECT name FROM nodes);",
+        "        UPDATE project_metadata SET value = '26' WHERE key = 'indexed_with_extraction_version';",
+        "      `);",
+        "        },",
+        "    },",
+        "    {",
+        "        version: 11,",
+        "        description: 'Compact the database freelist after the cross-language prune',",
+        "        up: (db) => {",
+        "            db.exec(`",
+        "        DELETE FROM name_segment_vocab WHERE name NOT IN (SELECT name FROM nodes);",
+        "        UPDATE project_metadata SET value = '26' WHERE key = 'indexed_with_extraction_version';",
+        "        PRAGMA auto_vacuum = INCREMENTAL;",
+        "        VACUUM;",
+        "      `);",
+        "        },",
+        "    },",
+        "];",
+    )
+
     /** Generation 4..8 hybrid: migration 10 without the metadata update, no migration 11. */
     private val migrationsStaleSource = lines(
         "exports.CURRENT_SCHEMA_VERSION = 11;",
@@ -588,7 +706,7 @@ class CodeGraphPatchesTest {
         // The migration transaction is why the freelist is reclaimed from
         // reclaimSpace instead: VACUUM inside it fails on every sync.
         assertTrue("migration 11 never vacuums", !migrations.contains("VACUUM;"))
-        assertTrue("migration 11 drops junk import edges", migrations.contains("TRIM(t.name, '.') = ''"))
+        assertTrue("migration 11 folds legacy import edges onto files", migrations.contains("UPDATE OR IGNORE edges SET target"))
         assertTrue("queries uses INSERT OR IGNORE", queries.contains("INSERT OR IGNORE INTO unresolved_refs"))
         assertTrue("queries has pruneCrossLanguageEdges method", queries.contains("pruneCrossLanguageEdges()"))
         assertTrue("queries prunes vocab on file deletion", queries.contains("DELETE FROM name_segment_vocab WHERE name NOT IN"))
@@ -630,9 +748,50 @@ class CodeGraphPatchesTest {
         assertTrue("tools searchLimit healed", tools.contains("Math.max(30, maxFiles * 3)"))
         assertTrue("db maintenance healed", db.contains("ANALYZE nodes"))
         assertTrue("db healed to reclaim space on open", db.contains("reclaimSpace() {") && db.contains("conn.reclaimSpace();"))
-        assertTrue("migrations healed with migration 11", migrations.contains("version: 11,") && migrations.contains("TRIM(t.name, '.') = ''"))
+        assertTrue("migrations healed with migration 11", migrations.contains("version: 11,") && migrations.contains("UPDATE OR IGNORE edges SET target"))
         assertTrue("healed migration 11 does not vacuum", !migrations.contains("VACUUM;"))
         assertTrue("queries healed with prune method", queries.contains("pruneCrossLanguageEdges() {"))
+    }
+
+    /**
+     * The state a device reaches by installing one build after another: the
+     * freelist patch is in with its migration 11, which is what has to come
+     * out, and the dual import reference is in under a shape the pristine
+     * anchor no longer matches. Both have to be recognised, not re-applied and
+     * not reported as unresolved.
+     */
+    @Test
+    fun `heals a generation 9 device without leaving the vacuum in place`() {
+        val dist = bundle(
+            resolver = gateStaleSource + "\n" + createEdgesV9Source,
+            treeSitter = treeSitterV9Source,
+            migrations = migrationsV9Source,
+        )
+
+        val result = CodeGraphBundlePatches.apply(dist)
+
+        assertTrue("generation 9 must heal cleanly: ${result.unresolved}", result.unresolved.isEmpty())
+        assertTrue(
+            "the migration and the edge model are what change: ${result.applied}",
+            result.applied.contains("db/migrations.js") &&
+                result.applied.contains("resolution/index.js") &&
+                result.applied.contains("db/index.js"),
+        )
+        assertTrue(
+            "a tree-sitter file that already emits the dual reference is done",
+            !result.applied.contains("extraction/tree-sitter.js"),
+        )
+
+        val resolver = File(dist, "resolution/index.js").readText()
+        assertTrue("the old import model must be replaced", resolver.contains("fileNodeOf(filePath)"))
+        assertTrue("the mirrored import edge must be gone", !resolver.contains("out.push({ ...edge, source: fileNode.id });"))
+        assertTrue("the base must not be wrapped by itself", resolver.split("createEdgesBase(resolved) {").size - 1 == 1)
+        assertTrue("the base must still be there", resolver.contains("return resolved.map((ref) => {"))
+
+        val migrations = File(dist, "db/migrations.js").readText()
+        assertTrue("the vacuum must be gone from the migration", !migrations.contains("VACUUM;"))
+        assertTrue("legacy import edges must be folded onto files", migrations.contains("UPDATE OR IGNORE edges SET target"))
+        assertTrue("migration 11 must survive", migrations.contains("version: 11,"))
     }
 
     @Test
@@ -679,12 +838,11 @@ class CodeGraphPatchesTest {
 
         val result = CodeGraphBundlePatches.apply(dist)
 
-        assertTrue("every anchor must still match the release: ${result.unresolved}", result.unresolved.isEmpty())
-        assertEquals(
-            "every patched file should be touched",
-            CodeGraphBundlePatches.patchedFiles.size,
-            result.applied.toSet().size,
-        )
+        assertTrue("every anchor must still match the bundle: ${result.unresolved}", result.unresolved.isEmpty())
+        // Not every file changes on a bundle a previous generation already
+        // patched, so the count is asserted only for a pristine release, which
+        // the fixture test above covers. What has to hold anywhere is that
+        // nothing is left unrecognised and a second pass does nothing.
         assertTrue("a second pass must be a no-op", CodeGraphBundlePatches.apply(dist).applied.isEmpty())
     }
 }
