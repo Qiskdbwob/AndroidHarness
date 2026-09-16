@@ -25,7 +25,7 @@ import java.io.File
 internal object CodeGraphBundlePatches {
 
     /** Bumped whenever [patches] changes, so an install can tell old from new. */
-    const val VERSION = 9
+    const val VERSION = 10
 
     /** Paths (relative to `lib/dist`) that [patches] may rewrite. */
     internal val patchedFiles = listOf(
@@ -360,45 +360,85 @@ internal object CodeGraphBundlePatches {
     )
 
     /**
-     * The pristine release keeps upstream's single-expression `createEdges`.
-     * Rather than rewriting the whole body (a partial conversion is exactly
-     * what stranded devices on a broken hybrid), the original body is renamed
-     * to `createEdgesBase` and a wrapper adds the two invariants upstream
-     * lacks: no edge whose source is its own target, and every import that
-     * resolves from an import node is mirrored by an edge from the importing
-     * file, so the module graph traverses from either end. One atomic replace,
-     * so the file is never left between two shapes.
+     * One shape for `imports` edges, and the only place upstream's several
+     * shapes are folded together.
+     *
+     * Upstream emits an import edge from whichever node held the reference
+     * (the importing file, or the `import` node it also created) and for
+     * `from x import y` it points at the imported SYMBOL rather than the
+     * module. One `from zzmod import zalpha` therefore showed up three
+     * different ways at once (file → symbol, file → module, import → module),
+     * and `from . import x` produced an edge to an `import` node named `.`
+     * that means nothing. Every end is folded onto the file that owns it here,
+     * so an `imports` edge always reads file → file, which is the form
+     * explore, impact and affected walk, and duplicate rows (upstream emits
+     * the same import twice) collapse to one.
+     *
+     * The pristine body is renamed to `createEdgesBase` rather than rewritten:
+     * a partial conversion is exactly what stranded devices on a broken hybrid
+     * before, so the rename and the wrapper land in one atomic replace.
      */
+    private val createEdgesCanonical = lines(
+        "    createEdges(resolved) {",
+        "        const out = [];",
+        "        const seenImports = new Set();",
+        "        for (const edge of this.createEdgesBase(resolved)) {",
+        "            if (!edge || edge.source === edge.target) continue;",
+        "            if (edge.kind !== 'imports') {",
+        "                out.push(edge);",
+        "                continue;",
+        "            }",
+        "            const src = this.queries.getNodeById(edge.source);",
+        "            const dst = this.queries.getNodeById(edge.target);",
+        "            if (!src || !dst) continue;",
+        "            const from = src.kind === 'file' ? src : this.fileNodeOf(src.filePath);",
+        "            const to = dst.kind === 'file' ? dst : this.fileNodeOf(dst.filePath);",
+        "            if (!from || !to || from.id === to.id) continue;",
+        "            const key = from.id + '|' + to.id;",
+        "            if (seenImports.has(key)) continue;",
+        "            seenImports.add(key);",
+        "            out.push({ ...edge, source: from.id, target: to.id });",
+        "        }",
+        "        return out;",
+        "    }",
+        "    /** The `file` node of a path, or null when the path has none. */",
+        "    fileNodeOf(filePath) {",
+        "        if (!filePath) return null;",
+        "        const nodes = this.context.getNodesInFile(filePath);",
+        "        return nodes ? nodes.find((n) => n.kind === 'file') : null;",
+        "    }",
+    )
+
+    private val createEdgesPristineAnchor = lines(
+        "    createEdges(resolved) {",
+        "        return resolved.map((ref) => {",
+    )
+
+    private val createEdgesBasePristine = lines(
+        "    createEdgesBase(resolved) {",
+        "        return resolved.map((ref) => {",
+    )
+
+    /** Generation 7..9 state: the loop conversion landed, so the base is a loop. */
+    private val createEdgesBaseFromLoop = lines(
+        "    createEdgesBase(resolved) {",
+        "        const out = [];",
+        "        for (const ref of resolved) {",
+    )
+
     private val createEdgesWrapper = Patch(
         "resolution/index.js",
-        lines(
-            "    createEdges(resolved) {",
-            "        return resolved.map((ref) => {",
+        createEdgesPristineAnchor,
+        createEdgesCanonical + "\n" + createEdgesBasePristine,
+        fallbackAnchors = listOf(
+            lines(
+                "    createEdges(resolved) {",
+                "        const out = [];",
+                "        for (const ref of resolved) {",
+            ),
         ),
-        lines(
-            "    createEdges(resolved) {",
-            "        const mapped = this.createEdgesBase(resolved);",
-            "        const out = [];",
-            "        for (const edge of mapped) {",
-            "            if (!edge || edge.source === edge.target) continue;",
-            "            out.push(edge);",
-            "            if (edge.kind === 'imports') {",
-            "                const srcNode = this.queries.getNodeById(edge.source);",
-            "                if (srcNode && srcNode.kind === 'import') {",
-            "                    const fileNodes = this.context.getNodesInFile(srcNode.filePath);",
-            "                    const fileNode = fileNodes ? fileNodes.find((n) => n.kind === 'file') : null;",
-            "                    if (fileNode && fileNode.id !== edge.target) {",
-            "                        out.push({ ...edge, source: fileNode.id });",
-            "                    }",
-            "                }",
-            "            }",
-            "        }",
-            "        return out;",
-            "    }",
-            "    createEdgesBase(resolved) {",
-            "        return resolved.map((ref) => {",
-        ),
-        satisfiedMarkers = listOf("createEdgesBase(resolved) {", "out.push(edge);"),
+        fallbackReplacements = listOf(createEdgesCanonical + "\n" + createEdgesBaseFromLoop),
+        satisfiedMarkers = listOf("createEdgesBase(resolved) {"),
     )
 
     // ------------------------------------------------------------------
@@ -785,6 +825,81 @@ internal object CodeGraphBundlePatches {
         "        ['PRAGMA analysis_limit=1000', 'PRAGMA optimize', 'ANALYZE']);",
     )
 
+    // New databases get incremental auto-vacuum from the start, so the pages a
+    // later delete frees are given back to the filesystem by the next
+    // `PRAGMA incremental_vacuum` instead of sitting on the freelist forever.
+    // It has to be set before anything writes to the file, including the WAL
+    // journal mode set below it: set any later the pragma is silently deferred
+    // to the next VACUUM, and a fresh index would pay that full rewrite on its
+    // first query instead of never.
+    private val autoVacuumAnchor =
+        "    db.pragma('busy_timeout = 5000'); // MUST be first — see above"
+
+    private val autoVacuumReplacement = lines(
+        "    db.pragma('busy_timeout = 5000'); // MUST be first — see above",
+        "    // Harness patch: incremental auto-vacuum, so a prune gives its pages back.",
+        "    db.pragma('auto_vacuum = INCREMENTAL');",
+    )
+
+    // An index created before this fix has auto_vacuum = NONE, and only a
+    // VACUUM rewrites the header to change that. The migration that prunes
+    // cannot do it: VACUUM is refused inside a transaction ("cannot VACUUM from
+    // within a transaction") and migrations run in one, so it would fail every
+    // sync on the device. It runs here instead, after `runMigrations` has
+    // committed, which is the first point where the connection is between
+    // transactions.
+    private val reclaimSpaceAnchor = lines(
+        "        if (currentVersion < migrations_1.CURRENT_SCHEMA_VERSION) {",
+        "            (0, migrations_1.runMigrations)(db, currentVersion);",
+        "        }",
+    )
+
+    private val reclaimSpaceReplacement = lines(
+        "        if (currentVersion < migrations_1.CURRENT_SCHEMA_VERSION) {",
+        "            (0, migrations_1.runMigrations)(db, currentVersion);",
+        "        }",
+        "        conn.reclaimSpace();",
+    )
+
+    private val reclaimSpaceMethodAnchor = lines(
+        "    close() {",
+        "        this.db.close();",
+        "    }",
+    )
+
+    private val reclaimSpaceMethodReplacement = lines(
+        "    /**",
+        "     * Give back the pages deletes and migrations left on the freelist.",
+        "     *",
+        "     * SQLite keeps a freed page for reuse rather than shrinking the file, so",
+        "     * a prune that removes half the edges leaves the index at its old size.",
+        "     * The first pass on an existing file switches it to incremental",
+        "     * auto-vacuum, which needs one VACUUM to rewrite the header; after that",
+        "     * `PRAGMA incremental_vacuum` truncates whatever the last prune freed,",
+        "     * and there is nothing to rewrite.",
+        "     *",
+        "     * VACUUM is illegal inside a transaction, so this MUST stay outside one:",
+        "     * it is called from open() after runMigrations has committed. Failures",
+        "     * (another connection holding a read lock) are ignored, and the next",
+        "     * open retries.",
+        "     */",
+        "    reclaimSpace() {",
+        "        try {",
+        "            if (Number(this.db.pragma('auto_vacuum', { simple: true })) !== 2) {",
+        "                this.db.exec('PRAGMA auto_vacuum = INCREMENTAL');",
+        "                this.db.exec('VACUUM');",
+        "            }",
+        "            else if (Number(this.db.pragma('freelist_count', { simple: true })) > 0) {",
+        "                this.db.exec('PRAGMA incremental_vacuum');",
+        "            }",
+        "        }",
+        "        catch { /* best effort, never load-bearing for correctness */ }",
+        "    }",
+        "    close() {",
+        "        this.db.close();",
+        "    }",
+    )
+
     // ------------------------------------------------------------------
     // db/migrations.js
     // ------------------------------------------------------------------
@@ -834,7 +949,7 @@ internal object CodeGraphBundlePatches {
         "    },",
         "    {",
         "        version: 11,",
-        "        description: 'Compact the database freelist after the cross-language prune',",
+        "        description: 'Re-prune cross-language and junk import edges, and refresh the extraction version',",
         "        up: (db) => {",
         "            db.exec(`",
         "        DELETE FROM edges WHERE id IN (",
@@ -850,10 +965,12 @@ internal object CodeGraphBundlePatches {
         "            (s.language IN ('csharp','razor') AND t.language IN ('csharp','razor'))",
         "          )",
         "        );",
+        "        DELETE FROM edges WHERE id IN (",
+        "          SELECT e.id FROM edges e JOIN nodes t ON e.target = t.id",
+        "          WHERE e.kind = 'imports' AND t.kind = 'import' AND t.name <> '' AND TRIM(t.name, '.') = ''",
+        "        );",
         "        DELETE FROM name_segment_vocab WHERE name NOT IN (SELECT name FROM nodes);",
         "        UPDATE project_metadata SET value = '26' WHERE key = 'indexed_with_extraction_version';",
-        "        PRAGMA auto_vacuum = INCREMENTAL;",
-        "        VACUUM;",
         "      `);",
         "        },",
         "    },",
@@ -878,7 +995,7 @@ internal object CodeGraphBundlePatches {
         "    },",
         "    {",
         "        version: 11,",
-        "        description: 'Compact the database freelist after the cross-language prune',",
+        "        description: 'Re-prune cross-language and junk import edges, and refresh the extraction version',",
         "        up: (db) => {",
         "            db.exec(`",
         "        DELETE FROM edges WHERE id IN (",
@@ -894,10 +1011,12 @@ internal object CodeGraphBundlePatches {
         "            (s.language IN ('csharp','razor') AND t.language IN ('csharp','razor'))",
         "          )",
         "        );",
+        "        DELETE FROM edges WHERE id IN (",
+        "          SELECT e.id FROM edges e JOIN nodes t ON e.target = t.id",
+        "          WHERE e.kind = 'imports' AND t.kind = 'import' AND t.name <> '' AND TRIM(t.name, '.') = ''",
+        "        );",
         "        DELETE FROM name_segment_vocab WHERE name NOT IN (SELECT name FROM nodes);",
         "        UPDATE project_metadata SET value = '26' WHERE key = 'indexed_with_extraction_version';",
-        "        PRAGMA auto_vacuum = INCREMENTAL;",
-        "        VACUUM;",
         "      `);",
         "        },",
         "    },",
@@ -1063,6 +1182,15 @@ internal object CodeGraphBundlePatches {
             "db/index.js", maintenanceAnchor, maintenanceReplacement,
             fallbackAnchors = listOf(maintenanceFallback1),
             satisfiedMarkers = listOf("PRAGMA incremental_vacuum"),
+        ),
+        Patch("db/index.js", autoVacuumAnchor, autoVacuumReplacement),
+        Patch(
+            "db/index.js", reclaimSpaceMethodAnchor, reclaimSpaceMethodReplacement,
+            satisfiedMarkers = listOf("reclaimSpace() {"),
+        ),
+        Patch(
+            "db/index.js", reclaimSpaceAnchor, reclaimSpaceReplacement,
+            satisfiedMarkers = listOf("conn.reclaimSpace();"),
         ),
         Patch(
             "db/migrations.js", migrationVersionAnchor, migrationVersionReplacement,

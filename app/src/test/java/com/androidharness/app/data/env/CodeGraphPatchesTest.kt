@@ -274,6 +274,7 @@ class CodeGraphPatchesTest {
         "                        });",
         "                    }",
         "                }",
+        "                if (this.language === 'python' && node.type === 'import_statement') {",
         "                if (child?.type === 'dotted_name') {",
         "                    this.createNode('import', (0, tree_sitter_helpers_1.getNodeText)(child, this.source), node, {",
         "                        signature: importText,",
@@ -314,6 +315,7 @@ class CodeGraphPatchesTest {
         "                        });",
         "                    }",
         "                }",
+        "                if (this.language === 'python' && node.type === 'import_statement') {",
         "                if (child?.type === 'dotted_name') {",
         "                    const impNode = this.createNode('import', (0, tree_sitter_helpers_1.getNodeText)(child, this.source), node, {",
         "                        signature: importText,",
@@ -404,16 +406,32 @@ class CodeGraphPatchesTest {
     )
 
     private val dbSource = lines(
+        "    db.pragma('busy_timeout = 5000'); // MUST be first — see above",
+        "    db.pragma('synchronous = NORMAL'); // safe with WAL mode",
+        "        if (currentVersion < migrations_1.CURRENT_SCHEMA_VERSION) {",
+        "            (0, migrations_1.runMigrations)(db, currentVersion);",
+        "        }",
         "        await this.runPragmasOffThread(['PRAGMA analysis_limit=1000', 'PRAGMA optimize', 'PRAGMA wal_checkpoint(PASSIVE)'], ",
         "        // Worker threads unavailable — bounded in-line fallback, no checkpoint.",
         "        ['PRAGMA analysis_limit=1000', 'PRAGMA optimize']);",
+        "    close() {",
+        "        this.db.close();",
+        "    }",
     )
 
     /** Generation 4 hybrid maintenance as found on devices. */
     private val dbStaleSource = lines(
+        "    db.pragma('busy_timeout = 5000'); // MUST be first — see above",
+        "    db.pragma('synchronous = NORMAL'); // safe with WAL mode",
+        "        if (currentVersion < migrations_1.CURRENT_SCHEMA_VERSION) {",
+        "            (0, migrations_1.runMigrations)(db, currentVersion);",
+        "        }",
         "        await this.runPragmasOffThread(['PRAGMA analysis_limit=1000', 'PRAGMA optimize', 'ANALYZE', 'PRAGMA wal_checkpoint(PASSIVE)'], ",
         "        // Worker threads unavailable — bounded in-line fallback, no checkpoint.",
         "        ['PRAGMA analysis_limit=1000', 'PRAGMA optimize', 'ANALYZE']);",
+        "    close() {",
+        "        this.db.close();",
+        "    }",
     )
 
     private val migrationsSource = lines(
@@ -545,7 +563,9 @@ class CodeGraphPatchesTest {
         assertTrue("name-matcher fuzzy guarded", matcher.contains("sameLanguageCandidates = ref.language"))
         assertTrue("resolver drops self-loops and falls back to node language", resolver.contains("const refLang = ref.language || this.getLanguageFromNodeId(ref.fromNodeId);"))
         assertTrue("framework gate rejects cross-language decorates", resolver.contains("ref.referenceKind === 'decorates'"))
-        assertTrue("createEdges wrapper adds self-loop drop and dual import edge", resolver.contains("createEdgesBase(resolved) {") && resolver.contains("edge.source === edge.target") && resolver.contains("out.push({ ...edge, source: fileNode.id });"))
+        assertTrue("createEdges wrapper folds imports onto files", resolver.contains("createEdgesBase(resolved) {") && resolver.contains("const from = src.kind === 'file' ? src : this.fileNodeOf(src.filePath);") && resolver.contains("out.push({ ...edge, source: from.id, target: to.id });"))
+        assertTrue("createEdges wrapper dedupes imports", resolver.contains("seenImports.has(key)"))
+        assertTrue("createEdges wrapper drops self-loops", resolver.contains("edge.source === edge.target"))
         assertTrue("index.js performs retroactive prune on open", index.contains("pruneCrossLanguageEdges()"))
         assertTrue("import resolver supports bare python module import", importResolver.contains("bare single module imports"))
         assertTrue("import resolver matches TS relative imports", importResolver.contains("imp.source === ref.referenceName"))
@@ -560,9 +580,15 @@ class CodeGraphPatchesTest {
         assertTrue("mcp explore raises hard ceiling", tools.contains("40000);"))
         assertTrue("bin impact shows multi-def note", bin.contains("definitions named"))
         assertTrue("db maintenance excludes virtual FTS table", db.contains("ANALYZE nodes"))
+        assertTrue("db enables incremental auto-vacuum", db.contains("db.pragma('auto_vacuum = INCREMENTAL');"))
+        assertTrue("db reclaims space outside any transaction", db.contains("reclaimSpace() {") && db.contains("this.db.exec('VACUUM');"))
+        assertTrue("db calls reclaimSpace after migrations commit", db.contains("conn.reclaimSpace();"))
         assertTrue("migrations bumps version to 11", migrations.contains("CURRENT_SCHEMA_VERSION = 11;"))
         assertTrue("migrations includes version 11", migrations.contains("version: 11,"))
-        assertTrue("migrations 11 vacuums freelist", migrations.contains("PRAGMA auto_vacuum = INCREMENTAL;"))
+        // The migration transaction is why the freelist is reclaimed from
+        // reclaimSpace instead: VACUUM inside it fails on every sync.
+        assertTrue("migration 11 never vacuums", !migrations.contains("VACUUM;"))
+        assertTrue("migration 11 drops junk import edges", migrations.contains("TRIM(t.name, '.') = ''"))
         assertTrue("queries uses INSERT OR IGNORE", queries.contains("INSERT OR IGNORE INTO unresolved_refs"))
         assertTrue("queries has pruneCrossLanguageEdges method", queries.contains("pruneCrossLanguageEdges()"))
         assertTrue("queries prunes vocab on file deletion", queries.contains("DELETE FROM name_segment_vocab WHERE name NOT IN"))
@@ -598,11 +624,14 @@ class CodeGraphPatchesTest {
         assertTrue("gateLanguage healed to self-loop + language fallback", resolver.contains("const refLang = ref.language || this.getLanguageFromNodeId(ref.fromNodeId);"))
         assertTrue("createEdges repair converted the stray return", resolver.contains("const edge = {") && resolver.contains("out.push(edge);") && !resolver.contains("            return {\n                source: ref.original.fromNodeId,"))
         assertTrue("createEdges repair keeps the loop returning the array", resolver.contains("return out;"))
+        assertTrue("createEdges wrapper folded the loop shape too", resolver.contains("const from = src.kind === 'file' ? src : this.fileNodeOf(src.filePath);"))
         assertTrue("tree-sitter healed to dual refs", treeSitter.contains("importNode.id !== parentId"))
         assertTrue("tools budget healed", tools.contains("maxOutputChars: 40000"))
         assertTrue("tools searchLimit healed", tools.contains("Math.max(30, maxFiles * 3)"))
         assertTrue("db maintenance healed", db.contains("ANALYZE nodes"))
-        assertTrue("migrations healed with migration 11", migrations.contains("version: 11,") && migrations.contains("PRAGMA auto_vacuum = INCREMENTAL;"))
+        assertTrue("db healed to reclaim space on open", db.contains("reclaimSpace() {") && db.contains("conn.reclaimSpace();"))
+        assertTrue("migrations healed with migration 11", migrations.contains("version: 11,") && migrations.contains("TRIM(t.name, '.') = ''"))
+        assertTrue("healed migration 11 does not vacuum", !migrations.contains("VACUUM;"))
         assertTrue("queries healed with prune method", queries.contains("pruneCrossLanguageEdges() {"))
     }
 
@@ -615,7 +644,7 @@ class CodeGraphPatchesTest {
         val second = CodeGraphBundlePatches.apply(dist)
 
         assertTrue("a patched file must not be patched again", second.applied.isEmpty())
-        assertEquals("nothing should be unresolved either", 0, second.unresolved.size)
+        assertTrue("nothing may be unresolved either: ${second.unresolved}", second.unresolved.isEmpty())
         assertEquals("the file must be byte for byte the same", afterFirst, File(dist, "resolution/index.js").readText())
     }
 
@@ -632,5 +661,30 @@ class CodeGraphPatchesTest {
         assertTrue("nothing should be applied", result.applied.isEmpty())
         assertTrue("unresolved list must contain name-matcher", result.unresolved.contains("resolution/name-matcher.js"))
         assertEquals("an unmatched file must be untouched", other, matcher.readText())
+    }
+
+    /**
+     * The fixtures above pin the shapes we have seen on devices. This one asks
+     * the opposite question: do the anchors still match the release they are
+     * written against? Set `CODEGRAPH_RELEASE_DIST` to the unpacked `lib/dist`
+     * of a release archive to run it; the patched copy is left in the temp dir
+     * so the result can be run, not just counted.
+     */
+    @Test
+    fun `applies to a real release bundle when one is provided`() {
+        val source = System.getenv("CODEGRAPH_RELEASE_DIST")?.takeIf { it.isNotBlank() }?.let(::File) ?: return
+        val dist = File(System.getProperty("java.io.tmpdir"), "codegraph-patched-dist")
+        dist.deleteRecursively()
+        source.copyRecursively(dist, overwrite = true)
+
+        val result = CodeGraphBundlePatches.apply(dist)
+
+        assertTrue("every anchor must still match the release: ${result.unresolved}", result.unresolved.isEmpty())
+        assertEquals(
+            "every patched file should be touched",
+            CodeGraphBundlePatches.patchedFiles.size,
+            result.applied.toSet().size,
+        )
+        assertTrue("a second pass must be a no-op", CodeGraphBundlePatches.apply(dist).applied.isEmpty())
     }
 }
