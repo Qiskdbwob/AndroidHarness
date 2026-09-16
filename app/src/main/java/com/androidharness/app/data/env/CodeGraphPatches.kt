@@ -22,7 +22,7 @@ import java.io.File
 internal object CodeGraphBundlePatches {
 
     /** Bumped whenever [patches] changes, so an install can tell old from new. */
-    const val VERSION = 7
+    const val VERSION = 8
 
     internal data class Patch(
         val relativePath: String,
@@ -53,8 +53,15 @@ internal object CodeGraphBundlePatches {
     )
 
     private val matcherReplacement = lines(
-        "    // Harness patch: filter all name-matching candidates strictly to the same language family",
-        "    return candidates.filter((c) => sameLanguageFamily(c.language, ref.language));",
+        "    if (ref.referenceKind === 'imports') {",
+        "        if (!ref.language) return candidates;",
+        "        return candidates.filter((c) => sameLanguageFamily(c.language, ref.language));",
+        "    }",
+        "    if (ref.referenceKind === 'calls' || ref.referenceKind === 'extends' || ref.referenceKind === 'instantiates' || ref.referenceKind === 'decorates') {",
+        "        if (!ref.language) return candidates;",
+        "        return candidates.filter((c) => sameLanguageFamily(c.language, ref.language));",
+        "    }",
+        "    return candidates;",
     )
 
     // 1 (decorates & single match): Never allow cross-language exact match fallback
@@ -74,7 +81,7 @@ internal object CodeGraphBundlePatches {
     private val exactSingleReplacement = lines(
         "    // Harness patch: if only one match, strictly require same language family",
         "    if (candidates.length === 1) {",
-        "        if (!sameLanguageFamily(candidates[0].language, ref.language)) {",
+        "        if (ref.language && !sameLanguageFamily(candidates[0].language, ref.language)) {",
         "            return null;",
         "        }",
         "        return {",
@@ -104,7 +111,9 @@ internal object CodeGraphBundlePatches {
 
     private val fuzzyReplacement = lines(
         "    // Harness patch: strictly same language family for fuzzy matching, never cross-language",
-        "    const sameLanguageCandidates = callableCandidates.filter((n) => sameLanguageFamily(n.language, ref.language));",
+        "    const sameLanguageCandidates = ref.language",
+        "        ? callableCandidates.filter((n) => sameLanguageFamily(n.language, ref.language))",
+        "        : callableCandidates;",
         "    if (sameLanguageCandidates.length === 1) {",
         "        return {",
         "            original: ref,",
@@ -115,7 +124,7 @@ internal object CodeGraphBundlePatches {
         "    }",
     )
 
-    // B1, B2, B3, 1 (decorates): Drop any non-same-family resolution in resolver
+    // B1, B2, B3, 1 (decorates): Drop any non-same-family resolution in resolver and eliminate self-loops
     private val resolverAnchor = lines(
         "    gateLanguage(result, ref) {",
         "        if (!result)",
@@ -135,11 +144,11 @@ internal object CodeGraphBundlePatches {
         "    gateLanguage(result, ref) {",
         "        if (!result)",
         "            return result;",
+        "        if (result.targetNodeId === ref.fromNodeId)",
+        "            return null;",
         "        const tgt = this.getLanguageFromNodeId(result.targetNodeId);",
-        "        if (!tgt || !ref.language)",
-        "            return result;",
-        "        // Harness patch: strictly drop any resolution across disparate language families",
-        "        if (!(0, name_matcher_1.sameLanguageFamily)(tgt, ref.language))",
+        "        const refLang = ref.language || this.getLanguageFromNodeId(ref.fromNodeId);",
+        "        if (tgt && refLang && !(0, name_matcher_1.sameLanguageFamily)(tgt, refLang))",
         "            return null;",
         "        return result;",
         "    }",
@@ -177,50 +186,6 @@ internal object CodeGraphBundlePatches {
         "                return null;",
         "        }",
         "        return result;",
-        "    }",
-    )
-
-    // 1 & 2 & 3: createEdges creates both import-node and file-node edges, and drops self loops
-    private val createEdgesAnchor = lines(
-        "    createEdges(resolved) {",
-        "        return resolved.map((ref) => {",
-    )
-
-    private val createEdgesReplacement = lines(
-        "    createEdges(resolved) {",
-        "        const out = [];",
-        "        for (const ref of resolved) {",
-        "            if (ref.original.fromNodeId === ref.targetNodeId) continue;",
-    )
-
-    private val createEdgesEndAnchor = lines(
-        "                    ...(ref.original.referenceKind === 'function_ref' ? { fnRef: true } : {}),",
-        "                },",
-        "            };",
-        "        });",
-        "    }",
-    )
-
-    private val createEdgesEndReplacement = lines(
-        "                    ...(ref.original.referenceKind === 'function_ref' ? { fnRef: true } : {}),",
-        "                },",
-        "            };",
-        "            out.push(edge);",
-        "            if (kind === 'imports') {",
-        "                const srcNode = this.queries.getNodeById(ref.original.fromNodeId);",
-        "                if (srcNode && srcNode.kind === 'import') {",
-        "                    const fileNodes = this.context.getNodesInFile(ref.original.filePath);",
-        "                    const fileNode = fileNodes ? fileNodes.find((n) => n.kind === 'file') : null;",
-        "                    if (fileNode && fileNode.id !== ref.targetNodeId && fileNode.id !== ref.original.fromNodeId) {",
-        "                        out.push({",
-        "                            ...edge,",
-        "                            source: fileNode.id,",
-        "                        });",
-        "                    }",
-        "                }",
-        "            }",
-        "        }",
-        "        return out;",
         "    }",
     )
 
@@ -271,7 +236,7 @@ internal object CodeGraphBundlePatches {
     private val extractionVersionAnchor = "exports.EXTRACTION_VERSION = 25;"
     private val extractionVersionReplacement = "exports.EXTRACTION_VERSION = 26;"
 
-    // 1 (imports): Import nodes have outgoing imports edges to their target
+    // 1 & 2 & 3 (imports): Import nodes AND files both receive unresolved references
     private val importHookNodeAnchor = lines(
         "        if (this.extractor.extractImport) {",
         "            const info = this.extractor.extractImport(node, this.source);",
@@ -301,13 +266,20 @@ internal object CodeGraphBundlePatches {
         "                const importNode = this.createNode('import', info.moduleName, node, {",
         "                    signature: info.signature,",
         "                });",
-        "                // Create unresolved reference attached to the import node",
         "                if (!info.handledRefs && info.moduleName && this.nodeStack.length > 0) {",
         "                    const parentId = this.nodeStack[this.nodeStack.length - 1];",
-        "                    const fromId = importNode ? importNode.id : parentId;",
-        "                    if (fromId) {",
+        "                    if (parentId) {",
         "                        this.unresolvedReferences.push({",
-        "                            fromNodeId: fromId,",
+        "                            fromNodeId: parentId,",
+        "                            referenceName: info.moduleName,",
+        "                            referenceKind: 'imports',",
+        "                            line: node.startPosition.row + 1,",
+        "                            column: node.startPosition.column,",
+        "                        });",
+        "                    }",
+        "                    if (importNode && importNode.id !== parentId) {",
+        "                        this.unresolvedReferences.push({",
+        "                            fromNodeId: importNode.id,",
         "                            referenceName: info.moduleName,",
         "                            referenceKind: 'imports',",
         "                            line: node.startPosition.row + 1,",
@@ -331,10 +303,10 @@ internal object CodeGraphBundlePatches {
         "                    const impNode = this.createNode('import', (0, tree_sitter_helpers_1.getNodeText)(child, this.source), node, {",
         "                        signature: importText,",
         "                    });",
-        "                    const fromId = impNode ? impNode.id : importParentId;",
-        "                    if (fromId) {",
+        "                    pushModuleRef(child);",
+        "                    if (impNode) {",
         "                        this.unresolvedReferences.push({",
-        "                            fromNodeId: fromId,",
+        "                            fromNodeId: impNode.id,",
         "                            referenceName: (0, tree_sitter_helpers_1.getNodeText)(child, this.source),",
         "                            referenceKind: 'imports',",
         "                            line: child.startPosition.row + 1,",
@@ -394,8 +366,8 @@ internal object CodeGraphBundlePatches {
     )
 
     // 4: Preserve /storage/emulated/0/... in query path normalization
-    private val normalizeQueryAnchor = "        .replace(/\\b([A-Za-z_][\\w@]*)\\/(\\d{1,3})(?=$|[\\s,()[\\]/])/g, '$1')"
-    private val normalizeQueryReplacement = "        .replace(/(?<![\\w/])([A-Za-z_][\\w@]*)\\/(\\d{1,3})(?=$|[\\s,()[\\]])/g, '$1')"
+    private val normalizeQueryAnchor = "        .replace(/\\b([A-Za-z_][\\w@]*)\\/(\\d{1,3})(?=\$|[\\s,()[\\]/])/g, '\$1')"
+    private val normalizeQueryReplacement = "        .replace(/(?<![\\w/])([A-Za-z_][\\w@]*)\\/(\\d{1,3})(?=\$|[\\s,()[\\]])/g, '\$1')"
 
     // B10: MCP explore summary line shows total count when truncated
     private val exploreAnchor = lines(
@@ -646,7 +618,8 @@ internal object CodeGraphBundlePatches {
         "        DELETE FROM edges WHERE source = target;",
         "        DELETE FROM name_segment_vocab WHERE name NOT IN (SELECT name FROM nodes);",
         "        UPDATE project_metadata SET value = '26' WHERE key = 'indexed_with_extraction_version';",
-        "        PRAGMA incremental_vacuum;",
+        "        PRAGMA auto_vacuum = INCREMENTAL;",
+        "        VACUUM;",
         "            `);",
         "        } catch { /* ignore */ }",
         "    }",
@@ -674,8 +647,6 @@ internal object CodeGraphBundlePatches {
         Patch("resolution/name-matcher.js", fuzzyAnchor, fuzzyReplacement),
         Patch("resolution/index.js", resolverAnchor, resolverReplacement),
         Patch("resolution/index.js", frameworkAnchor, frameworkReplacement),
-        Patch("resolution/index.js", createEdgesAnchor, createEdgesReplacement),
-        Patch("resolution/index.js", createEdgesEndAnchor, createEdgesEndReplacement),
         Patch("resolution/import-resolver.js", resolveModuleImportAnchor, resolveModuleImportReplacement),
         Patch("resolution/import-resolver.js", pythonModuleImportAnchor, pythonModuleImportReplacement),
         Patch("extraction/tree-sitter.js", importHookNodeAnchor, importHookNodeReplacement),

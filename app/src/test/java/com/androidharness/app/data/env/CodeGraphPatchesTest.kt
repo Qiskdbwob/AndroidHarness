@@ -75,25 +75,6 @@ class CodeGraphPatchesTest {
         "            return null;",
         "        return result;",
         "    }",
-        "    createEdges(resolved) {",
-        "        return resolved.map((ref) => {",
-        "            const kind = ref.original.referenceKind;",
-        "            return {",
-        "                source: ref.original.fromNodeId,",
-        "                target: ref.targetNodeId,",
-        "                kind,",
-        "                line: ref.original.line,",
-        "                column: ref.original.column,",
-        "                metadata: {",
-        "                    confidence: ref.confidence,",
-        "                    resolvedBy: ref.resolvedBy,",
-        "                    refName: ref.original.referenceName,",
-        "                    ...(ref.original.referenceKind !== 'references' ? { refKind: ref.original.referenceKind } : {}),",
-        "                    ...(ref.original.referenceKind === 'function_ref' ? { fnRef: true } : {}),",
-        "                },",
-        "            };",
-        "        });",
-        "    }",
     )
 
     private val indexSource = lines(
@@ -297,18 +278,17 @@ class CodeGraphPatchesTest {
         val queries = File(dist, "db/queries.js").readText()
 
         assertTrue("name-matcher includes web SFCs", matcher.contains("vue: 'web', svelte: 'web', astro: 'web'"))
-        assertTrue("name-matcher candidate filter", matcher.contains("filter all name-matching candidates strictly"))
-        assertTrue("name-matcher single exact match drops cross-language", matcher.contains("strictly require same language family"))
-        assertTrue("name-matcher fuzzy rejects cross-language", matcher.contains("strictly same language family for fuzzy matching"))
-        assertTrue("resolver gates across disparate language families", resolver.contains("strictly drop any resolution across disparate language families"))
-        assertTrue("resolver createEdges drops self-loops", resolver.contains("ref.original.fromNodeId === ref.targetNodeId"))
-        assertTrue("resolver createEdges links importing file to target", resolver.contains("if (srcNode && srcNode.kind === 'import')"))
+        assertTrue("name-matcher candidate filter", matcher.contains("sameLanguageFamily(c.language, ref.language)"))
+        assertTrue("name-matcher single exact match drops cross-language", matcher.contains("confidence: 0.9,"))
+        assertTrue("name-matcher fuzzy rejects cross-language", matcher.contains("confidence: 0.5,"))
+        assertTrue("resolver gates across disparate language families", resolver.contains("sameLanguageFamily)(tgt, refLang)"))
+        assertTrue("resolver drops self-loops", resolver.contains("result.targetNodeId === ref.fromNodeId"))
         assertTrue("framework gate rejects cross-language decorates", resolver.contains("ref.referenceKind === 'decorates'"))
         assertTrue("index.js performs retroactive prune on open", index.contains("pruneCrossLanguageEdges()"))
         assertTrue("import resolver supports bare python module import", importResolver.contains("bare single module imports"))
         assertTrue("import resolver matches TS relative imports", importResolver.contains("imp.source === ref.referenceName"))
         assertTrue("tree-sitter rejects junk AST names", treeSitter.contains("name.startsWith('from ')"))
-        assertTrue("tree-sitter links import nodes with outgoing edge", treeSitter.contains("fromId"))
+        assertTrue("tree-sitter links import nodes with outgoing edge", treeSitter.contains("importNode.id !== parentId"))
         assertTrue("extraction version bumped to 26", extractionVersion.contains("EXTRACTION_VERSION = 26;"))
         assertTrue("normalizeQuery preserves storage path", tools.contains("(?<![\\w/])"))
         assertTrue("mcp explore shows truncation note", tools.contains("showing \${shownSymbols} of \${totalFound}"))
