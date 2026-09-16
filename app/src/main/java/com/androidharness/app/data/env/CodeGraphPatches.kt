@@ -10,10 +10,13 @@ import java.io.File
  *
  * Every patch is an exact-match edit on the JavaScript Harness unpacked, and
  * every patch is written to be idempotent: the text it inserts is also the
- * marker that says the work is already done. A patch whose anchor does not
- * appear is reported as unresolved and the file is left exactly as it was, so
- * a future release that reorganises this code degrades to plain upstream
- * behaviour instead of being corrupted.
+ * marker that says the work is already done. Because patch generations
+ * evolved while devices kept their extracted copy, a bundle on a device can
+ * be a mix of generations, so every patch also carries [Patch.fallbackAnchors]
+ * for the intermediate states older generations left behind. A patch whose
+ * anchors all miss is reported as unresolved and the file is left exactly as
+ * it was; [CodeGraphManager] then restores the pristine snapshot and retries,
+ * so an unknown stale state still converges instead of persisting forever.
  *
  * The anchors below are written as explicit line lists rather than indented
  * Kotlin strings, because `trimIndent()` would strip the very leading spaces
@@ -22,13 +25,43 @@ import java.io.File
 internal object CodeGraphBundlePatches {
 
     /** Bumped whenever [patches] changes, so an install can tell old from new. */
-    const val VERSION = 8
+    const val VERSION = 9
+
+    /** Paths (relative to `lib/dist`) that [patches] may rewrite. */
+    internal val patchedFiles = listOf(
+        "resolution/name-matcher.js",
+        "resolution/index.js",
+        "resolution/import-resolver.js",
+        "extraction/tree-sitter.js",
+        "extraction/extraction-version.js",
+        "mcp/tools.js",
+        "bin/codegraph.js",
+        "db/index.js",
+        "db/migrations.js",
+        "db/queries.js",
+        "index.js",
+    )
 
     internal data class Patch(
         val relativePath: String,
         val anchor: String,
         val replacement: String,
-        val fallbackAnchor: String? = null,
+        val fallbackAnchors: List<String> = emptyList(),
+        /** Replacements paired with [fallbackAnchors]; falls back to [replacement]. */
+        val fallbackReplacements: List<String> = emptyList(),
+        /**
+         * When set, the patch is skipped (treated as applied) once the file
+         * contains any of these texts, even if no anchor matches. Marks the
+         * end states — including repaired hybrids — whose text no longer
+         * matches this patch's own replacement.
+         */
+        val satisfiedMarkers: List<String> = emptyList(),
+        /**
+         * When set, the patch only applies to a file that already contains
+         * this text. Used for repairs of a specific hybrid state that must
+         * not fire on the pristine bundle.
+         */
+        val requiresMarker: String? = null,
     )
 
     internal data class Result(val applied: List<String>, val unresolved: List<String>) {
@@ -37,14 +70,20 @@ internal object CodeGraphBundlePatches {
 
     private fun lines(vararg lines: String): String = lines.joinToString("\n")
 
-    // B3: Add single-file-component languages to the web family
+    // ------------------------------------------------------------------
+    // resolution/name-matcher.js
+    // ------------------------------------------------------------------
+
+    // Add single-file-component languages to the web family
     private val nameMatcherFamilyAnchor = "    typescript: 'web', tsx: 'web', javascript: 'web', jsx: 'web', arkts: 'web',"
     private val nameMatcherFamilyReplacement = lines(
         "    typescript: 'web', tsx: 'web', javascript: 'web', jsx: 'web', arkts: 'web',",
         "    vue: 'web', svelte: 'web', astro: 'web',",
     )
 
-    // B1, B2, B3, 1 (decorates): Candidate filter strictly drops non-same-family candidates
+    // Candidate filter: strict same-family, guarded against refs without a
+    // language. Fallbacks cover the intermediate generations that gated only
+    // some reference kinds or lacked the guard.
     private val matcherAnchor = lines(
         "    if (ref.referenceKind === 'imports') {",
         "        return candidates.filter((c) => !crossesKnownFamily(c.language, ref.language));",
@@ -64,7 +103,21 @@ internal object CodeGraphBundlePatches {
         "    return candidates;",
     )
 
-    // 1 (decorates & single match): Never allow cross-language exact match fallback
+    // Generation 6/7 state: imports gated but no guard and no decorates.
+    private val matcherFallback1 = lines(
+        "    if (ref.referenceKind === 'imports') {",
+        "        return candidates.filter((c) => sameLanguageFamily(c.language, ref.language));",
+        "    }",
+        "    // Harness patch: a coincidental same-named symbol in another language is",
+        "    // not a call, extends, or instantiation.",
+        "    if (ref.referenceKind === 'calls' || ref.referenceKind === 'extends' || ref.referenceKind === 'instantiates') {",
+        "        return candidates.filter((c) => sameLanguageFamily(c.language, ref.language));",
+        "    }",
+        "    return candidates;",
+    )
+
+    // Single exact match must never cross a language family, and a ref with no
+    // language must not be dropped by the check.
     private val exactSingleAnchor = lines(
         "    // If only one match, use it — but penalize cross-language matches",
         "    if (candidates.length === 1) {",
@@ -93,7 +146,22 @@ internal object CodeGraphBundlePatches {
         "    }",
     )
 
-    // 1 (decorates & fuzzy): Eliminate cross-language fuzzy resolution fallback
+    // Generation 5/6 state: unconditional check without the ref.language guard.
+    private val exactSingleFallback1 = lines(
+        "    // Harness patch: if only one match, strictly require same language family",
+        "    if (candidates.length === 1) {",
+        "        if (!sameLanguageFamily(candidates[0].language, ref.language)) {",
+        "            return null;",
+        "        }",
+        "        return {",
+        "            original: ref,",
+        "            targetNodeId: candidates[0].id,",
+        "            confidence: 0.9,",
+        "            resolvedBy: 'exact-match',",
+        "        };",
+        "    }",
+    )
+
     private val fuzzyAnchor = lines(
         "    // Prefer same-language matches",
         "    const sameLanguageCandidates = callableCandidates.filter(n => n.language === ref.language);",
@@ -124,7 +192,27 @@ internal object CodeGraphBundlePatches {
         "    }",
     )
 
-    // B1, B2, B3, 1 (decorates): Drop any non-same-family resolution in resolver and eliminate self-loops
+    // Generation 6/7 state: strict filter but no ref.language guard.
+    private val fuzzyFallback1 = lines(
+        "    // Harness patch: strictly same language family for fuzzy matching, never cross-language",
+        "    const sameLanguageCandidates = callableCandidates.filter((n) => sameLanguageFamily(n.language, ref.language));",
+        "    if (sameLanguageCandidates.length === 1) {",
+        "        return {",
+        "            original: ref,",
+        "            targetNodeId: sameLanguageCandidates[0].id,",
+        "            confidence: 0.5,",
+        "            resolvedBy: 'fuzzy',",
+        "        };",
+        "    }",
+        "    return null;",
+    )
+
+    // ------------------------------------------------------------------
+    // resolution/index.js
+    // ------------------------------------------------------------------
+
+    // gateLanguage: drop self-loops, resolve the ref's language from its node
+    // when missing, and drop every cross-family resolution.
     private val resolverAnchor = lines(
         "    gateLanguage(result, ref) {",
         "        if (!result)",
@@ -154,7 +242,50 @@ internal object CodeGraphBundlePatches {
         "    }",
     )
 
-    // B4, 1 (decorates): Framework language gate rejecting cross-language instantiations/extends/decorates
+    // Generation 2..6 states: per-kind family gates without the self-loop
+    // check or the language fallback. All of them share the same opening.
+    private val gateCommonHead = lines(
+        "    gateLanguage(result, ref) {",
+        "        if (!result)",
+        "            return result;",
+        "        const tgt = this.getLanguageFromNodeId(result.targetNodeId);",
+        "        if (!tgt || !ref.language)",
+        "            return result;",
+    )
+
+    private val gateCommonTail = lines(
+        "        return result;",
+        "    }",
+    )
+
+    private val gateFallbackBodies = listOf(
+        // Generation 4/5: imports + calls/extends/instantiates blocks.
+        lines(
+            "        if ((ref.referenceKind === 'references' || ref.referenceKind === 'function_ref') && !(0, name_matcher_1.sameLanguageFamily)(tgt, ref.language))",
+            "            return null;",
+            "        if (ref.referenceKind === 'imports' && !(0, name_matcher_1.sameLanguageFamily)(tgt, ref.language))",
+            "            return null;",
+            "        // Harness patch: the candidate filter's rule, restated for the case",
+            "        // where the foreign match was the only candidate there was.",
+            "        if ((ref.referenceKind === 'calls' || ref.referenceKind === 'extends' || ref.referenceKind === 'instantiates') &&",
+            "            !(0, name_matcher_1.sameLanguageFamily)(tgt, ref.language))",
+            "            return null;",
+        ),
+        // Generation 5/6: imports + calls/extends/instantiates with a Harness comment.
+        lines(
+            "        if ((ref.referenceKind === 'references' || ref.referenceKind === 'function_ref') && !(0, name_matcher_1.sameLanguageFamily)(tgt, ref.language))",
+            "            return null;",
+            "        if (ref.referenceKind === 'imports' && !(0, name_matcher_1.sameLanguageFamily)(tgt, ref.language))",
+            "            return null;",
+            "        // Harness patch: the candidate filter's rule, restated for the case",
+            "        // where the foreign match was the only candidate there was.",
+            "        if ((ref.referenceKind === 'calls' || ref.referenceKind === 'extends' || ref.referenceKind === 'instantiates' || ref.referenceKind === 'decorates') &&",
+            "            !(0, name_matcher_1.sameLanguageFamily)(tgt, ref.language))",
+            "            return null;",
+        ),
+    )
+
+    // gateFrameworkLanguage: keep config↔code and calls bridges, gate the rest.
     private val frameworkAnchor = lines(
         "    gateFrameworkLanguage(result, ref) {",
         "        if (!result)",
@@ -189,7 +320,92 @@ internal object CodeGraphBundlePatches {
         "    }",
     )
 
-    // 1 & 2 (TS imports): resolveModuleImportToFile matches imp.source for relative TS imports
+    private val frameworkFallback1 = lines(
+        "        // Harness patch: framework resolution must not bridge disparate languages for",
+        "        // instantiations, extensions, references or imports.",
+        "        if (ref.referenceKind === 'instantiates' || ref.referenceKind === 'extends') {",
+        "            if (!(0, name_matcher_1.sameLanguageFamily)(tgt, ref.language))",
+        "                return null;",
+        "        }",
+        "        if (ref.referenceKind === 'references' || ref.referenceKind === 'imports') {",
+        "            if (!(0, name_matcher_1.sameLanguageFamily)(tgt, ref.language))",
+        "                return null;",
+        "        }",
+        "        return result;",
+        "    }",
+    )
+
+    /**
+     * Repairs the hybrid createEdges a patch generation left on some devices:
+     * the loop conversion landed but the pristine `return { … }` stayed inside
+     * the loop body, so the function returns a single edge object on the first
+     * reference — `.length` is undefined, insertEdges is never called, and
+     * every resolution edge silently vanishes while the refs are deleted as
+     * resolved. Converting that stray `return {` into `const edge = {` makes
+     * the loop whole again. Guarded by requiresMarker so it never fires on a
+     * pristine bundle.
+     */
+    private val createEdgesRepair = Patch(
+        "resolution/index.js",
+        lines(
+            "            return {",
+            "                source: ref.original.fromNodeId,",
+        ),
+        lines(
+            "            const edge = {",
+            "                source: ref.original.fromNodeId,",
+        ),
+        requiresMarker = "out.push(edge);",
+        satisfiedMarkers = listOf("const edge = {", "createEdgesBase(resolved) {"),
+    )
+
+    /**
+     * The pristine release keeps upstream's single-expression `createEdges`.
+     * Rather than rewriting the whole body (a partial conversion is exactly
+     * what stranded devices on a broken hybrid), the original body is renamed
+     * to `createEdgesBase` and a wrapper adds the two invariants upstream
+     * lacks: no edge whose source is its own target, and every import that
+     * resolves from an import node is mirrored by an edge from the importing
+     * file, so the module graph traverses from either end. One atomic replace,
+     * so the file is never left between two shapes.
+     */
+    private val createEdgesWrapper = Patch(
+        "resolution/index.js",
+        lines(
+            "    createEdges(resolved) {",
+            "        return resolved.map((ref) => {",
+        ),
+        lines(
+            "    createEdges(resolved) {",
+            "        const mapped = this.createEdgesBase(resolved);",
+            "        const out = [];",
+            "        for (const edge of mapped) {",
+            "            if (!edge || edge.source === edge.target) continue;",
+            "            out.push(edge);",
+            "            if (edge.kind === 'imports') {",
+            "                const srcNode = this.queries.getNodeById(edge.source);",
+            "                if (srcNode && srcNode.kind === 'import') {",
+            "                    const fileNodes = this.context.getNodesInFile(srcNode.filePath);",
+            "                    const fileNode = fileNodes ? fileNodes.find((n) => n.kind === 'file') : null;",
+            "                    if (fileNode && fileNode.id !== edge.target) {",
+            "                        out.push({ ...edge, source: fileNode.id });",
+            "                    }",
+            "                }",
+            "            }",
+            "        }",
+            "        return out;",
+            "    }",
+            "    createEdgesBase(resolved) {",
+            "        return resolved.map((ref) => {",
+        ),
+        satisfiedMarkers = listOf("createEdgesBase(resolved) {", "out.push(edge);"),
+    )
+
+    // ------------------------------------------------------------------
+    // resolution/import-resolver.js
+    // ------------------------------------------------------------------
+
+    // Relative module paths (./dep_mod) resolve through the import source.
     private val resolveModuleImportAnchor = lines(
         "function resolveModuleImportToFile(ref, imports, context) {",
         "    if (ref.referenceKind !== 'imports')",
@@ -216,27 +432,37 @@ internal object CodeGraphBundlePatches {
         "        if (imp.isNamespace || imp.isDefault || imp.source === ref.referenceName) {",
     )
 
-    // 2: Retroactive prune of cross-language edges on CodeGraph.open
-    private val openPruneAnchor = lines(
-        "        const db = db_1.DatabaseConnection.open(dbPath);",
-        "        const queries = new queries_1.QueryBuilder(db.getDb());",
-        "        const instance = new CodeGraph(db, queries, resolvedRoot);",
+    private val pythonModuleImportAnchor = lines(
+        "function resolvePythonAbsoluteModule(ref, context) {",
+        "    if (ref.referenceKind !== 'imports')",
+        "        return null;",
+        "    // Only a DOTTED `import a.b.c` ref carries its full module path. A bare leaf",
+        "    // (`from app.api.routes import authentication`) is ambiguous on its own — three",
+        "    // `authentication.py` files may exist — so leave it to resolveModuleImportToFile,",
+        "    // which uses the import's source (`app.api.routes`) to build the full path.",
+        "    if (!ref.referenceName.includes('.'))",
+        "        return null;",
+        "    const hit = findPythonModuleFile(ref.referenceName, context, ref.filePath);",
+        "    return hit ? { original: ref, targetNodeId: hit.id, confidence: 0.9, resolvedBy: 'import' } : null;",
+        "}",
     )
 
-    private val openPruneReplacement = lines(
-        "        const db = db_1.DatabaseConnection.open(dbPath);",
-        "        const queries = new queries_1.QueryBuilder(db.getDb());",
-        "        try {",
-        "            queries.pruneCrossLanguageEdges();",
-        "        } catch { /* ignore */ }",
-        "        const instance = new CodeGraph(db, queries, resolvedRoot);",
+    private val pythonModuleImportReplacement = lines(
+        "function resolvePythonAbsoluteModule(ref, context) {",
+        "    if (ref.referenceKind !== 'imports')",
+        "        return null;",
+        "    // Harness patch: allow bare single module imports (import b) as well as dotted paths",
+        "    const hit = findPythonModuleFile(ref.referenceName, context, ref.filePath);",
+        "    return hit ? { original: ref, targetNodeId: hit.id, confidence: 0.9, resolvedBy: 'import' } : null;",
+        "}",
     )
 
-    // 2: Extraction version bump to 26
-    private val extractionVersionAnchor = "exports.EXTRACTION_VERSION = 25;"
-    private val extractionVersionReplacement = "exports.EXTRACTION_VERSION = 26;"
+    // ------------------------------------------------------------------
+    // extraction/tree-sitter.js
+    // ------------------------------------------------------------------
 
-    // 1 & 2 & 3 (imports): Import nodes AND files both receive unresolved references
+    // Import statements produce references from BOTH the enclosing file and
+    // the import node, so traversal works from either end of the module graph.
     private val importHookNodeAnchor = lines(
         "        if (this.extractor.extractImport) {",
         "            const info = this.extractor.extractImport(node, this.source);",
@@ -289,6 +515,48 @@ internal object CodeGraphBundlePatches {
         "                }",
     )
 
+    // Generation 7 state: the import node REPLACED the file as the ref source.
+    private val importHookNodeFallback1 = lines(
+        "                // Create unresolved reference attached to the import node",
+        "                if (!info.handledRefs && info.moduleName && this.nodeStack.length > 0) {",
+        "                    const parentId = this.nodeStack[this.nodeStack.length - 1];",
+        "                    const fromId = importNode ? importNode.id : parentId;",
+        "                    if (fromId) {",
+        "                        this.unresolvedReferences.push({",
+        "                            fromNodeId: fromId,",
+        "                            referenceName: info.moduleName,",
+        "                            referenceKind: 'imports',",
+        "                            line: node.startPosition.row + 1,",
+        "                            column: node.startPosition.column,",
+        "                        });",
+        "                    }",
+        "                }",
+    )
+
+    private val importHookNodeFallback1Replacement = lines(
+        "                if (!info.handledRefs && info.moduleName && this.nodeStack.length > 0) {",
+        "                    const parentId = this.nodeStack[this.nodeStack.length - 1];",
+        "                    if (parentId) {",
+        "                        this.unresolvedReferences.push({",
+        "                            fromNodeId: parentId,",
+        "                            referenceName: info.moduleName,",
+        "                            referenceKind: 'imports',",
+        "                            line: node.startPosition.row + 1,",
+        "                            column: node.startPosition.column,",
+        "                        });",
+        "                    }",
+        "                    if (importNode && importNode.id !== parentId) {",
+        "                        this.unresolvedReferences.push({",
+        "                            fromNodeId: importNode.id,",
+        "                            referenceName: info.moduleName,",
+        "                            referenceKind: 'imports',",
+        "                            line: node.startPosition.row + 1,",
+        "                            column: node.startPosition.column,",
+        "                        });",
+        "                    }",
+        "                }",
+    )
+
     private val pythonImportStmtAnchor = lines(
         "                if (child?.type === 'dotted_name') {",
         "                    this.createNode('import', (0, tree_sitter_helpers_1.getNodeText)(child, this.source), node, {",
@@ -316,33 +584,7 @@ internal object CodeGraphBundlePatches {
         "                }",
     )
 
-    // B6: Python single-level module import (import b)
-    private val pythonModuleImportAnchor = lines(
-        "function resolvePythonAbsoluteModule(ref, context) {",
-        "    if (ref.referenceKind !== 'imports')",
-        "        return null;",
-        "    // Only a DOTTED `import a.b.c` ref carries its full module path. A bare leaf",
-        "    // (`from app.api.routes import authentication`) is ambiguous on its own — three",
-        "    // `authentication.py` files may exist — so leave it to resolveModuleImportToFile,",
-        "    // which uses the import's source (`app.api.routes`) to build the full path.",
-        "    if (!ref.referenceName.includes('.'))",
-        "        return null;",
-        "    const hit = findPythonModuleFile(ref.referenceName, context, ref.filePath);",
-        "    return hit ? { original: ref, targetNodeId: hit.id, confidence: 0.9, resolvedBy: 'import' } : null;",
-        "}",
-    )
-
-    private val pythonModuleImportReplacement = lines(
-        "function resolvePythonAbsoluteModule(ref, context) {",
-        "    if (ref.referenceKind !== 'imports')",
-        "        return null;",
-        "    // Harness patch: allow bare single module imports (import b) as well as dotted paths",
-        "    const hit = findPythonModuleFile(ref.referenceName, context, ref.filePath);",
-        "    return hit ? { original: ref, targetNodeId: hit.id, confidence: 0.9, resolvedBy: 'import' } : null;",
-        "}",
-    )
-
-    // B9: Tree-sitter createNode rejects non-symbol junk
+    // Junk AST tokens must not become queryable symbols.
     private val treeSitterAnchor = lines(
         "    createNode(kind, name, node, extra) {",
         "        // Skip nodes with empty/missing names — they are not meaningful symbols",
@@ -365,11 +607,22 @@ internal object CodeGraphBundlePatches {
         "        }",
     )
 
-    // 4: Preserve /storage/emulated/0/... in query path normalization
+    // ------------------------------------------------------------------
+    // extraction/extraction-version.js
+    // ------------------------------------------------------------------
+
+    private val extractionVersionAnchor = "exports.EXTRACTION_VERSION = 25;"
+    private val extractionVersionReplacement = "exports.EXTRACTION_VERSION = 26;"
+
+    // ------------------------------------------------------------------
+    // mcp/tools.js
+    // ------------------------------------------------------------------
+
+    // Preserve /storage/emulated/0/… in query path normalization: the old
+    // word-boundary form ate the "/0" segment of Android shared-storage paths.
     private val normalizeQueryAnchor = "        .replace(/\\b([A-Za-z_][\\w@]*)\\/(\\d{1,3})(?=\$|[\\s,()[\\]/])/g, '\$1')"
     private val normalizeQueryReplacement = "        .replace(/(?<![\\w/])([A-Za-z_][\\w@]*)\\/(\\d{1,3})(?=\$|[\\s,()[\\]])/g, '\$1')"
 
-    // B10: MCP explore summary line shows total count when truncated
     private val exploreAnchor = lines(
         "        let summaryLine = survivors.length > 0",
         "            ? `Found \${shownSymbols} symbol\${shownSymbols === 1 ? '' : 's'} across \${survivors.length} file\${survivors.length === 1 ? '' : 's'}.`",
@@ -384,11 +637,9 @@ internal object CodeGraphBundlePatches {
         "            : `Found \${subgraph.nodes.size} symbol\${subgraph.nodes.size === 1 ? '' : 's'} across \${fileGroups.size} file\${fileGroups.size === 1 ? '' : 's'}.`;",
     )
 
-    // 7: Explore cliff fraction relaxed so related files aren't pruned away prematurely
     private val exploreCliffAnchor = "    CLIFF_FRACTION: 0.15,"
     private val exploreCliffReplacement = "    CLIFF_FRACTION: 0.05,"
 
-    // 7 & Minor 11: Raise explore output budget and search limit for small repos / natural queries
     private val exploreBudgetAnchor = lines(
         "    if (fileCount < 150) {",
         "        return {",
@@ -428,6 +679,46 @@ internal object CodeGraphBundlePatches {
         "    }",
     )
 
+    // Generation 3 state: 24000/8/6500/12 without the comment block.
+    private val exploreBudgetFallback1 = lines(
+        "    if (fileCount < 150) {",
+        "        return {",
+        "            maxOutputChars: 24000,",
+        "            defaultMaxFiles: 8,",
+        "            maxCharsPerFile: 6500,",
+        "            gapThreshold: 7,",
+        "            maxSymbolsInFileHeader: 12,",
+        "            maxEdgesPerRelationshipKind: 4,",
+        "            includeRelationships: false,",
+        "            includeAdditionalFiles: false,",
+        "            includeCompletenessSignal: false,",
+        "            includeBudgetNote: false,",
+        "        };",
+        "    }",
+    )
+
+    // Generation 5 state: 32000/12/7500/20.
+    private val exploreBudgetFallback2 = lines(
+        "    if (fileCount < 150) {",
+        "        return {",
+        "            maxOutputChars: 32000,",
+        "            defaultMaxFiles: 12,",
+        "            maxCharsPerFile: 7500,",
+        "            gapThreshold: 7,",
+        "            maxSymbolsInFileHeader: 20,",
+        "            maxEdgesPerRelationshipKind: 4,",
+        "            includeRelationships: false,",
+        "            includeAdditionalFiles: false,",
+        "            includeCompletenessSignal: false,",
+        "            includeBudgetNote: false,",
+        "        };",
+        "    }",
+    )
+
+    // The hard ceiling caps the whole response regardless of the budget.
+    private val exploreHardCeilingAnchor = "        const hardCeiling = Math.min(Math.round(budget.maxOutputChars * 1.5), 25000);"
+    private val exploreHardCeilingReplacement = "        const hardCeiling = Math.min(Math.round(budget.maxOutputChars * 1.5), 40000);"
+
     private val exploreSearchLimitAnchor = lines(
         "        const subgraph = await cg.findRelevantContext(matchQuery, {",
         "            searchLimit: 8,",
@@ -446,7 +737,18 @@ internal object CodeGraphBundlePatches {
         "        });",
     )
 
-    // B5: CLI impact multi-definition note
+    // Generation 4 state: 24/2 scaling without the minScore change.
+    private val exploreSearchLimitFallback1 = lines(
+        "            searchLimit: Math.max(24, maxFiles * 2),",
+        "            traversalDepth: 3,",
+        "            maxNodes: 200,",
+        "            minScore: 0.2,",
+    )
+
+    // ------------------------------------------------------------------
+    // bin/codegraph.js
+    // ------------------------------------------------------------------
+
     private val impactAnchor = lines(
         "            else {",
         "                console.log(chalk.bold(`\\nImpact of changing \"\${symbol}\" — \${mergedNodes.size} affected symbols:\\n`));",
@@ -459,7 +761,12 @@ internal object CodeGraphBundlePatches {
         "                console.log(chalk.bold(`\\nImpact of changing \"\${symbol}\"\${multiNote} — \${mergedNodes.size} affected symbols:\\n`));",
     )
 
-    // B8, 6 & Minor 12: Database maintenance analyzes real tables only + incremental vacuum
+    // ------------------------------------------------------------------
+    // db/index.js
+    // ------------------------------------------------------------------
+
+    // Maintenance: analyze the real tables (not the FTS shadows) and keep the
+    // freelist drained. Fallback covers the intermediate plain-ANALYZE state.
     private val maintenanceAnchor = lines(
         "        await this.runPragmasOffThread(['PRAGMA analysis_limit=1000', 'PRAGMA optimize', 'PRAGMA wal_checkpoint(PASSIVE)'], ",
         "        // Worker threads unavailable — bounded in-line fallback, no checkpoint.",
@@ -472,45 +779,21 @@ internal object CodeGraphBundlePatches {
         "        ['PRAGMA analysis_limit=1000', 'PRAGMA optimize', 'ANALYZE nodes', 'ANALYZE edges', 'ANALYZE files', 'ANALYZE unresolved_refs', 'PRAGMA incremental_vacuum']);",
     )
 
-    // B3, B7, B9, 1, 2, 6: Migration 10 & 11 - clean edges, vacuum freelist, unique unresolved_refs
+    private val maintenanceFallback1 = lines(
+        "        await this.runPragmasOffThread(['PRAGMA analysis_limit=1000', 'PRAGMA optimize', 'ANALYZE', 'PRAGMA wal_checkpoint(PASSIVE)'], ",
+        "        // Worker threads unavailable — bounded in-line fallback, no checkpoint.",
+        "        ['PRAGMA analysis_limit=1000', 'PRAGMA optimize', 'ANALYZE']);",
+    )
+
+    // ------------------------------------------------------------------
+    // db/migrations.js
+    // ------------------------------------------------------------------
+
     private val migrationVersionAnchor = "exports.CURRENT_SCHEMA_VERSION = 9;"
-    private val migrationVersionFallback = "exports.CURRENT_SCHEMA_VERSION = 10;"
     private val migrationVersionReplacement = "exports.CURRENT_SCHEMA_VERSION = 11;"
 
     private val migrationListAnchor = lines(
         "            db.exec('CREATE INDEX IF NOT EXISTS idx_files_generated ON files(path) WHERE generated = 1');",
-        "        },",
-        "    },",
-        "];",
-    )
-
-    private val migrationListFallback = lines(
-        "        version: 10,",
-        "        description: 'Prune cross-language edges, unique unresolved refs index, and prune vocab orphans',",
-        "        up: (db) => {",
-        "            db.exec(`",
-        "        DELETE FROM edges WHERE id IN (",
-        "          SELECT e.id FROM edges e",
-        "          JOIN nodes s ON e.source = s.id",
-        "          JOIN nodes t ON e.target = t.id",
-        "          WHERE s.language != t.language",
-        "          AND NOT (",
-        "            (s.language IN ('kotlin','java','scala','clojure','groovy') AND t.language IN ('kotlin','java','scala','clojure','groovy')) OR",
-        "            (s.language IN ('swift','objc','objcpp') AND t.language IN ('swift','objc','objcpp')) OR",
-        "            (s.language IN ('typescript','tsx','javascript','jsx','arkts','vue','svelte','astro') AND t.language IN ('typescript','tsx','javascript','jsx','arkts','vue','svelte','astro')) OR",
-        "            (s.language IN ('c','cpp') AND t.language IN ('c','cpp')) OR",
-        "            (s.language IN ('csharp','razor') AND t.language IN ('csharp','razor'))",
-        "          )",
-        "        );",
-        "        DELETE FROM unresolved_refs WHERE id NOT IN (",
-        "          SELECT MIN(id) FROM unresolved_refs",
-        "          GROUP BY from_node_id, reference_name, reference_kind, line, col",
-        "        );",
-        "        CREATE UNIQUE INDEX IF NOT EXISTS idx_unresolved_identity",
-        "          ON unresolved_refs(from_node_id, reference_name, reference_kind, line, col);",
-        "        DELETE FROM name_segment_vocab WHERE name NOT IN (SELECT name FROM nodes);",
-        "        UPDATE project_metadata SET value = '26' WHERE key = 'indexed_with_extraction_version';",
-        "      `);",
         "        },",
         "    },",
         "];",
@@ -551,7 +834,7 @@ internal object CodeGraphBundlePatches {
         "    },",
         "    {",
         "        version: 11,",
-        "        description: 'Prune cross-language decorates edges and compact freelist space',",
+        "        description: 'Compact the database freelist after the cross-language prune',",
         "        up: (db) => {",
         "            db.exec(`",
         "        DELETE FROM edges WHERE id IN (",
@@ -567,7 +850,6 @@ internal object CodeGraphBundlePatches {
         "            (s.language IN ('csharp','razor') AND t.language IN ('csharp','razor'))",
         "          )",
         "        );",
-        "        DELETE FROM edges WHERE source = target;",
         "        DELETE FROM name_segment_vocab WHERE name NOT IN (SELECT name FROM nodes);",
         "        UPDATE project_metadata SET value = '26' WHERE key = 'indexed_with_extraction_version';",
         "        PRAGMA auto_vacuum = INCREMENTAL;",
@@ -578,11 +860,57 @@ internal object CodeGraphBundlePatches {
         "];",
     )
 
-    // B7: insertUnresolvedRefsBatch uses INSERT OR IGNORE
+    // Generation-4..8 devices already carry a migration 10 without the
+    // metadata update and without migration 11. Rewrite its tail and append 11.
+    private val migrationListFallback1 = lines(
+        "        DELETE FROM name_segment_vocab WHERE name NOT IN (SELECT name FROM nodes);",
+        "      `);",
+        "        },",
+        "    },",
+        "];",
+    )
+
+    private val migrationListFallback1Replacement = lines(
+        "        DELETE FROM name_segment_vocab WHERE name NOT IN (SELECT name FROM nodes);",
+        "        UPDATE project_metadata SET value = '26' WHERE key = 'indexed_with_extraction_version';",
+        "      `);",
+        "        },",
+        "    },",
+        "    {",
+        "        version: 11,",
+        "        description: 'Compact the database freelist after the cross-language prune',",
+        "        up: (db) => {",
+        "            db.exec(`",
+        "        DELETE FROM edges WHERE id IN (",
+        "          SELECT e.id FROM edges e",
+        "          JOIN nodes s ON e.source = s.id",
+        "          JOIN nodes t ON e.target = t.id",
+        "          WHERE s.language != t.language",
+        "          AND NOT (",
+        "            (s.language IN ('kotlin','java','scala','clojure','groovy') AND t.language IN ('kotlin','java','scala','clojure','groovy')) OR",
+        "            (s.language IN ('swift','objc','objcpp') AND t.language IN ('swift','objc','objcpp')) OR",
+        "            (s.language IN ('typescript','tsx','javascript','jsx','arkts','vue','svelte','astro') AND t.language IN ('typescript','tsx','javascript','jsx','arkts','vue','svelte','astro')) OR",
+        "            (s.language IN ('c','cpp') AND t.language IN ('c','cpp')) OR",
+        "            (s.language IN ('csharp','razor') AND t.language IN ('csharp','razor'))",
+        "          )",
+        "        );",
+        "        DELETE FROM name_segment_vocab WHERE name NOT IN (SELECT name FROM nodes);",
+        "        UPDATE project_metadata SET value = '26' WHERE key = 'indexed_with_extraction_version';",
+        "        PRAGMA auto_vacuum = INCREMENTAL;",
+        "        VACUUM;",
+        "      `);",
+        "        },",
+        "    },",
+        "];",
+    )
+
+    // ------------------------------------------------------------------
+    // db/queries.js
+    // ------------------------------------------------------------------
+
     private val insertUnresolvedAnchor = "this.runBatched('insertUnresolvedRefs', 'INSERT INTO unresolved_refs (from_node_id, reference_name, reference_kind, line, col, candidates, file_path, language) VALUES ', '(?,?,?,?,?,?,?,?)', rows);"
     private val insertUnresolvedReplacement = "this.runBatched('insertUnresolvedRefs', 'INSERT OR IGNORE INTO unresolved_refs (from_node_id, reference_name, reference_kind, line, col, candidates, file_path, language) VALUES ', '(?,?,?,?,?,?,?,?)', rows);"
 
-    // B9, 2, 6: deleteNodesByFile prunes name_segment_vocab orphans + pruneCrossLanguageEdges method
     private val deleteNodesAnchor = lines(
         "    deleteNodesByFile(filePath) {",
         "        if (!this.stmts.deleteNodesByFile) {",
@@ -598,7 +926,7 @@ internal object CodeGraphBundlePatches {
         "    }",
     )
 
-    private val deleteNodesReplacement = lines(
+    private val pruneMethod = lines(
         "    pruneCrossLanguageEdges() {",
         "        try {",
         "            this.db.exec(`",
@@ -615,14 +943,15 @@ internal object CodeGraphBundlePatches {
         "            (s.language IN ('csharp','razor') AND t.language IN ('csharp','razor'))",
         "          )",
         "        );",
-        "        DELETE FROM edges WHERE source = target;",
         "        DELETE FROM name_segment_vocab WHERE name NOT IN (SELECT name FROM nodes);",
         "        UPDATE project_metadata SET value = '26' WHERE key = 'indexed_with_extraction_version';",
-        "        PRAGMA auto_vacuum = INCREMENTAL;",
-        "        VACUUM;",
+        "        PRAGMA incremental_vacuum;",
         "            `);",
         "        } catch { /* ignore */ }",
         "    }",
+    )
+
+    private val deleteNodesReplacement = pruneMethod + "\n" + lines(
         "    deleteNodesByFile(filePath) {",
         "        if (!this.stmts.deleteNodesByFile) {",
         "            this.stmts.deleteNodesByFile = this.db.prepare('DELETE FROM nodes WHERE file_path = ?');",
@@ -640,30 +969,118 @@ internal object CodeGraphBundlePatches {
         "    }",
     )
 
+    // Generation 6/7 state: the vocab prune exists but the method is missing.
+    private val deleteNodesFallback1 = lines(
+        "        this.stmts.deleteNodesByFile.run(filePath);",
+        "        try {",
+        "            this.db.exec('DELETE FROM name_segment_vocab WHERE name NOT IN (SELECT name FROM nodes)');",
+        "        } catch { /* ignore */ }",
+        "    }",
+    )
+
+    private val deleteNodesFallback1Replacement = lines(
+        "        this.stmts.deleteNodesByFile.run(filePath);",
+        "        try {",
+        "            this.db.exec('DELETE FROM name_segment_vocab WHERE name NOT IN (SELECT name FROM nodes)');",
+        "        } catch { /* ignore */ }",
+        "    }",
+    ) + "\n" + pruneMethod
+
+    // ------------------------------------------------------------------
+    // index.js
+    // ------------------------------------------------------------------
+
+    private val openPruneAnchor = lines(
+        "        const db = db_1.DatabaseConnection.open(dbPath);",
+        "        const queries = new queries_1.QueryBuilder(db.getDb());",
+        "        const instance = new CodeGraph(db, queries, resolvedRoot);",
+    )
+
+    private val openPruneReplacement = lines(
+        "        const db = db_1.DatabaseConnection.open(dbPath);",
+        "        const queries = new queries_1.QueryBuilder(db.getDb());",
+        "        try {",
+        "            queries.pruneCrossLanguageEdges();",
+        "        } catch { /* ignore */ }",
+        "        const instance = new CodeGraph(db, queries, resolvedRoot);",
+    )
+
+    // ------------------------------------------------------------------
+
     private val patches = listOf(
         Patch("resolution/name-matcher.js", nameMatcherFamilyAnchor, nameMatcherFamilyReplacement),
-        Patch("resolution/name-matcher.js", matcherAnchor, matcherReplacement),
-        Patch("resolution/name-matcher.js", exactSingleAnchor, exactSingleReplacement),
-        Patch("resolution/name-matcher.js", fuzzyAnchor, fuzzyReplacement),
-        Patch("resolution/index.js", resolverAnchor, resolverReplacement),
-        Patch("resolution/index.js", frameworkAnchor, frameworkReplacement),
+        Patch(
+            "resolution/name-matcher.js", matcherAnchor, matcherReplacement,
+            fallbackAnchors = listOf(matcherFallback1),
+            satisfiedMarkers = listOf("ref.referenceKind === 'decorates') {\n        if (!ref.language) return candidates;"),
+        ),
+        Patch(
+            "resolution/name-matcher.js", exactSingleAnchor, exactSingleReplacement,
+            fallbackAnchors = listOf(exactSingleFallback1),
+        ),
+        Patch(
+            "resolution/name-matcher.js", fuzzyAnchor, fuzzyReplacement,
+            fallbackAnchors = listOf(fuzzyFallback1),
+        ),
+        Patch(
+            "resolution/index.js", resolverAnchor, resolverReplacement,
+            fallbackAnchors = gateFallbackBodies.map { body -> gateCommonHead + "\n" + body + "\n" + gateCommonTail },
+            satisfiedMarkers = listOf("const refLang = ref.language || this.getLanguageFromNodeId(ref.fromNodeId);"),
+        ),
+        Patch(
+            "resolution/index.js", frameworkAnchor, frameworkReplacement,
+            fallbackAnchors = listOf(frameworkFallback1),
+            satisfiedMarkers = listOf("ref.referenceKind === 'decorates') {"),
+        ),
+        createEdgesRepair,
+        createEdgesWrapper,
         Patch("resolution/import-resolver.js", resolveModuleImportAnchor, resolveModuleImportReplacement),
         Patch("resolution/import-resolver.js", pythonModuleImportAnchor, pythonModuleImportReplacement),
-        Patch("extraction/tree-sitter.js", importHookNodeAnchor, importHookNodeReplacement),
+        Patch(
+            "extraction/tree-sitter.js", importHookNodeAnchor, importHookNodeReplacement,
+            fallbackAnchors = listOf(importHookNodeFallback1),
+            fallbackReplacements = listOf(importHookNodeFallback1Replacement),
+        ),
         Patch("extraction/tree-sitter.js", pythonImportStmtAnchor, pythonImportStmtReplacement),
         Patch("extraction/tree-sitter.js", treeSitterAnchor, treeSitterReplacement),
         Patch("extraction/extraction-version.js", extractionVersionAnchor, extractionVersionReplacement),
         Patch("mcp/tools.js", normalizeQueryAnchor, normalizeQueryReplacement),
         Patch("mcp/tools.js", exploreAnchor, exploreReplacement),
         Patch("mcp/tools.js", exploreCliffAnchor, exploreCliffReplacement),
-        Patch("mcp/tools.js", exploreBudgetAnchor, exploreBudgetReplacement),
-        Patch("mcp/tools.js", exploreSearchLimitAnchor, exploreSearchLimitReplacement),
+        Patch(
+            "mcp/tools.js", exploreBudgetAnchor, exploreBudgetReplacement,
+            fallbackAnchors = listOf(exploreBudgetFallback1, exploreBudgetFallback2),
+            satisfiedMarkers = listOf("maxOutputChars: 40000,"),
+        ),
+        Patch("mcp/tools.js", exploreHardCeilingAnchor, exploreHardCeilingReplacement),
+        Patch(
+            "mcp/tools.js", exploreSearchLimitAnchor, exploreSearchLimitReplacement,
+            fallbackAnchors = listOf(exploreSearchLimitFallback1),
+            satisfiedMarkers = listOf("searchLimit: Math.max(30, maxFiles * 3),"),
+        ),
         Patch("bin/codegraph.js", impactAnchor, impactReplacement),
-        Patch("db/index.js", maintenanceAnchor, maintenanceReplacement),
-        Patch("db/migrations.js", migrationVersionAnchor, migrationVersionReplacement, migrationVersionFallback),
-        Patch("db/migrations.js", migrationListAnchor, migrationListReplacement, migrationListFallback),
+        Patch(
+            "db/index.js", maintenanceAnchor, maintenanceReplacement,
+            fallbackAnchors = listOf(maintenanceFallback1),
+            satisfiedMarkers = listOf("PRAGMA incremental_vacuum"),
+        ),
+        Patch(
+            "db/migrations.js", migrationVersionAnchor, migrationVersionReplacement,
+            satisfiedMarkers = listOf("CURRENT_SCHEMA_VERSION = 11;"),
+        ),
+        Patch(
+            "db/migrations.js", migrationListAnchor, migrationListReplacement,
+            fallbackAnchors = listOf(migrationListFallback1),
+            fallbackReplacements = listOf(migrationListFallback1Replacement),
+            satisfiedMarkers = listOf("version: 11,"),
+        ),
         Patch("db/queries.js", insertUnresolvedAnchor, insertUnresolvedReplacement),
-        Patch("db/queries.js", deleteNodesAnchor, deleteNodesReplacement),
+        Patch(
+            "db/queries.js", deleteNodesAnchor, deleteNodesReplacement,
+            fallbackAnchors = listOf(deleteNodesFallback1),
+            fallbackReplacements = listOf(deleteNodesFallback1Replacement),
+            satisfiedMarkers = listOf("pruneCrossLanguageEdges() {"),
+        ),
         Patch("index.js", openPruneAnchor, openPruneReplacement),
     )
 
@@ -684,18 +1101,28 @@ internal object CodeGraphBundlePatches {
             // The inserted text doubles as the record that this patch is in
             // place, which is what keeps a second run from nesting copies.
             if (text.contains(patch.replacement)) continue
-            val anchor = when {
-                text.contains(patch.anchor) -> patch.anchor
-                patch.fallbackAnchor != null && text.contains(patch.fallbackAnchor) -> patch.fallbackAnchor
-                else -> null
+            if (patch.satisfiedMarkers.any { text.contains(it) }) continue
+            if (patch.requiresMarker != null && !text.contains(patch.requiresMarker)) continue
+            var replaced = false
+            if (text.contains(patch.anchor)) {
+                runCatching { file.writeText(text.replace(patch.anchor, patch.replacement)) }
+                    .onSuccess { replaced = true }
             }
-            if (anchor == null) {
+            if (!replaced) {
+                val fallbacks = patch.fallbackAnchors.withIndex()
+                for ((i, fallback) in fallbacks) {
+                    if (!text.contains(fallback)) continue
+                    val replacement = patch.fallbackReplacements.getOrNull(i) ?: patch.replacement
+                    runCatching { file.writeText(text.replace(fallback, replacement)) }
+                        .onSuccess { replaced = true }
+                    break
+                }
+            }
+            if (replaced) {
+                applied += patch.relativePath
+            } else {
                 unresolved += patch.relativePath
-                continue
             }
-            runCatching { file.writeText(text.replace(anchor, patch.replacement)) }
-                .onSuccess { applied += patch.relativePath }
-                .onFailure { unresolved += patch.relativePath }
         }
         return Result(applied, unresolved)
     }

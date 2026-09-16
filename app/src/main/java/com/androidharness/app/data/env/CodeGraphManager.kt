@@ -352,6 +352,13 @@ class CodeGraphManager(
     /** The bundle's JavaScript, which is what the Harness patches edit. */
     private val bundleDist get() = File(bundleLib, "dist")
 
+    /**
+     * Unpatched copy of `lib/dist` kept at provision time. When the live copy
+     * is a hybrid no patch generation recognises, the self-heal restores the
+     * patchable files from here instead of leaving the hybrid in place.
+     */
+    private val pristineDist get() = File(root, "bundle.pristine/lib/dist")
+
     private val _state = MutableStateFlow(CodeGraphState(version = markerVersion()))
     val state: StateFlow<CodeGraphState> = _state
 
@@ -481,7 +488,21 @@ class CodeGraphManager(
         }
         writeLauncher()
         // A fresh download is the unpatched release, so the fixes go on before
-        // anything can run it.
+        // anything can run it. A pristine copy of the patchable files is kept
+        // beside the bundle so the per-launch patch pass can self-heal a copy
+        // that several patch generations left in an unrecognisable state.
+        runCatching {
+            val pristine = pristineDist
+            pristine.deleteRecursively()
+            pristine.mkdirs()
+            for (rel in CodeGraphBundlePatches.patchedFiles) {
+                val src = File(bundleDist, rel)
+                if (!src.isFile) continue
+                val dst = File(pristine, rel)
+                dst.parentFile?.mkdirs()
+                src.copyTo(dst, overwrite = true)
+            }
+        }
         CodeGraphBundlePatches.apply(bundleDist)
         ensureTelemetryOff()
         removeLegacyNpmInstall()
@@ -760,11 +781,32 @@ class CodeGraphManager(
      * Runs once per process, on the same path that keeps the launcher and the
      * telemetry config current, so an install that already exists picks them up
      * instead of waiting for a reinstall.
+     *
+     * A copy whose state no patch generation fully recognises (installations
+     * that lived through several patch generations can be a mix) is restored
+     * file-by-file from the pristine snapshot taken at provision time and
+     * patched again, so an unknown hybrid state converges instead of
+     * persisting on the device forever.
      */
     private fun ensureBundlePatched() {
         if (bundlePatchChecked) return
         bundlePatchChecked = true
-        val result = runCatching { CodeGraphBundlePatches.apply(bundleDist) }.getOrNull() ?: return
+        var result = runCatching { CodeGraphBundlePatches.apply(bundleDist) }.getOrNull() ?: return
+        if (result.unresolved.isNotEmpty()) {
+            val pristine = pristineDist
+            if (pristine.isDirectory) {
+                var restored = false
+                for (rel in CodeGraphBundlePatches.patchedFiles) {
+                    val src = File(pristine, rel)
+                    if (!src.isFile) continue
+                    val dst = File(bundleDist, rel)
+                    if (dst.isFile && runCatching { src.copyTo(dst, overwrite = true) }.isSuccess) restored = true
+                }
+                if (restored) {
+                    result = runCatching { CodeGraphBundlePatches.apply(bundleDist) }.getOrNull() ?: result
+                }
+            }
+        }
         // The staged tarball is only rewritten when it looks stale, so a change
         // to the bundle has to invalidate it or the privileged tier keeps
         // running the copy it deployed before the fix.
