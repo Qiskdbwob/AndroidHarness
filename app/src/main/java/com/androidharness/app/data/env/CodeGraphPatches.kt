@@ -25,7 +25,7 @@ import java.io.File
 internal object CodeGraphBundlePatches {
 
     /** Bumped whenever [patches] changes, so an install can tell old from new. */
-    const val VERSION = 10
+    const val VERSION = 11
 
     /** Paths (relative to `lib/dist`) that [patches] may rewrite. */
     internal val patchedFiles = listOf(
@@ -40,6 +40,7 @@ internal object CodeGraphBundlePatches {
         "db/migrations.js",
         "db/queries.js",
         "index.js",
+        "context/index.js",
     )
 
     internal data class Patch(
@@ -656,6 +657,24 @@ internal object CodeGraphBundlePatches {
         "                }",
     )
 
+    // Generation 7 state: this block emitted the reference from the import node
+    // ONLY, no file ref, and routed it through a local `fromId`. It sits on the
+    // device beside a hook block from a later generation, which is what an
+    // installation that lived through several patch generations looks like.
+    private val pythonImportStmtFallback1 = lines(
+        "                    const fromId = impNode ? impNode.id : importParentId;",
+        "                    if (fromId) {",
+        "                        this.unresolvedReferences.push({",
+        "                            fromNodeId: fromId,",
+    )
+
+    private val pythonImportStmtFallback1Replacement = lines(
+        "                    pushModuleRef(child);",
+        "                    if (impNode) {",
+        "                        this.unresolvedReferences.push({",
+        "                            fromNodeId: impNode.id,",
+    )
+
     // Junk AST tokens must not become queryable symbols.
     private val treeSitterAnchor = lines(
         "    createNode(kind, name, node, extra) {",
@@ -1183,6 +1202,146 @@ internal object CodeGraphBundlePatches {
         "        const instance = new CodeGraph(db, queries, resolvedRoot);",
     )
 
+    /*
+     * The segment-vocab supplement hands `explore` names whose NAME SEGMENTS
+     * overlap the query, which is what lets a prose question reach a camelCase
+     * symbol ("auto-scroll to bottom" -> `pinFeedIfNearBottom`). Its single-word
+     * tier accepts one rare word, and for prose that is reasonable evidence.
+     *
+     * For a query with no whitespace it is not: `nonexistent_thing_xyz` is
+     * someone naming a symbol, and the only thing `thing` proves is that the
+     * repo has other names containing that word. Feeding those seeds back made
+     * explore answer a name that does not exist with an unrelated file, under
+     * "Found 1 symbol across 1 file" and the verbatim-source banner that tells
+     * the caller to trust it as a Read. So a name-shaped query has to be
+     * reached by the whole token, or by several of its segments at once; one
+     * fragment of the name is a coincidence, and the honest answer is that
+     * nothing matched.
+     */
+    private val segmentSeedAnchor = lines(
+        "        let seedNames = options?.seedNames;",
+        "        if (seedNames === undefined) {",
+        "            try {",
+        "                seedNames = this.getSegmentMatches((0, identifier_segments_1.extractSegmentSearchWords)(query), 8)",
+        "                    .map((m) => m.name);",
+        "            }",
+    )
+
+    private val segmentSeedReplacement = lines(
+        "        let seedNames = options?.seedNames;",
+        "        if (seedNames === undefined) {",
+        "            try {",
+        "                const rawQuery = query.trim();",
+        "                const nameLikeQuery = !/\\s/.test(rawQuery);",
+        "                const wholeQuery = rawQuery.toLowerCase();",
+        "                seedNames = this.getSegmentMatches((0, identifier_segments_1.extractSegmentSearchWords)(query), 8)",
+        "                    .filter((m) => !nameLikeQuery || m.matchedWords.length >= 2 || m.matchedWords.includes(wholeQuery))",
+        "                    .map((m) => m.name);",
+        "            }",
+    )
+
+    // ------------------------------------------------------------------
+    // context/index.js
+    // ------------------------------------------------------------------
+
+    /*
+     * Explore answers a name that does not exist with an unrelated file.
+     *
+     * Two of findRelevantContext's steps break a query into pieces and accept
+     * any ONE piece matching: the definition-prefix pass tries each extracted
+     * symbol on its own, and the text pass FTS-searches each term on its own
+     * ("broader coverage", so that a prose question reaches every word). For a
+     * query with no whitespace that is wrong, because the pieces are not words
+     * the caller wrote: `nonexistent_thing_xyz` is a name, and `thing` is a
+     * fragment of it, so `thingFactory` coming back is not a near miss. It was
+     * reported as "Found 1 symbol across 1 file" under the banner that tells the
+     * caller to trust the source as a Read, which is how a wrong file gets read
+     * as the right one.
+     *
+     * A name-shaped query therefore needs the whole token, or at least two of
+     * its fragments agreeing on one symbol, which is the same rule the segment
+     * seeds use. Prose keeps the per-word behaviour it was designed for.
+     */
+    private val definitionFragmentAnchor = lines(
+        "            for (const sym of expandedSymbols) {",
+        "                // Title-case the symbol: \"REST\" → \"Rest\", \"bulk\" → \"Bulk\", \"allocation\" → \"Allocation\"",
+        "                const titleCased = sym.charAt(0).toUpperCase() + sym.slice(1).toLowerCase();",
+        "                if (titleCased === sym)",
+    )
+
+    private val definitionFragmentReplacement = lines(
+        "            const wholeNameQuery = query.trim().toLowerCase();",
+        "            const nameShapedQuery = !/\\s/.test(query.trim());",
+        "            for (const sym of expandedSymbols) {",
+        "                // A fragment of a name-shaped query is not the name: skip it,",
+        "                // so `ThingFactory` cannot answer `nonexistent_thing_xyz` just",
+        "                // by starting with \"thing\". The whole token still matches.",
+        "                if (nameShapedQuery && sym.toLowerCase() !== wholeNameQuery && wholeNameQuery.includes(sym.toLowerCase()))",
+        "                    continue;",
+        "                // Title-case the symbol: \"REST\" → \"Rest\", \"bulk\" → \"Bulk\", \"allocation\" → \"Allocation\"",
+        "                const titleCased = sym.charAt(0).toUpperCase() + sym.slice(1).toLowerCase();",
+        "                if (titleCased === sym)",
+    )
+
+    private val termSearchAnchor = lines(
+        "                for (const term of searchTerms) {",
+        "                    const termResults = this.queries.searchNodes(term, {",
+        "                        limit: opts.searchLimit * 2,",
+        "                        kinds: searchKinds,",
+        "                    });",
+        "                    for (const r of termResults) {",
+        "                        const existing = termResultsMap.get(r.node.id);",
+        "                        if (existing) {",
+        "                            existing.termHits++;",
+        "                            existing.result.score = Math.max(existing.result.score, r.score);",
+        "                        }",
+        "                        else {",
+        "                            termResultsMap.set(r.node.id, { result: r, termHits: 1 });",
+        "                        }",
+        "                    }",
+        "                }",
+    )
+
+    private val termSearchReplacement = lines(
+        "                const wholeNameQuery = query.trim().toLowerCase();",
+        "                const nameShapedQuery = !/\\s/.test(query.trim());",
+        "                for (const term of searchTerms) {",
+        "                    const termIsWholeName = term.trim().toLowerCase() === wholeNameQuery;",
+        "                    const termResults = this.queries.searchNodes(term, {",
+        "                        limit: opts.searchLimit * 2,",
+        "                        kinds: searchKinds,",
+        "                    });",
+        "                    for (const r of termResults) {",
+        "                        const existing = termResultsMap.get(r.node.id);",
+        "                        if (existing) {",
+        "                            existing.termHits++;",
+        "                            if (termIsWholeName)",
+        "                                existing.wholeNameHit = true;",
+        "                            existing.result.score = Math.max(existing.result.score, r.score);",
+        "                        }",
+        "                        else {",
+        "                            termResultsMap.set(r.node.id, { result: r, termHits: 1, wholeNameHit: termIsWholeName });",
+        "                        }",
+        "                    }",
+        "                }",
+    )
+
+    private val termResultsFilterAnchor = lines(
+        "                textResults = Array.from(termResultsMap.values())",
+        "                    .map(({ result, termHits }) => ({",
+    )
+
+    private val termResultsFilterReplacement = lines(
+        "                textResults = Array.from(termResultsMap.values())",
+        "                    // One fragment of a name-shaped query matching one symbol is a",
+        "                    // coincidence, so it needs the whole name or two of its",
+        "                    // fragments on the same symbol. Answering a name that does not",
+        "                    // exist with a plausible file is worse than answering nothing:",
+        "                    // the caller reads that source as authoritative.",
+        "                    .filter(({ termHits, wholeNameHit }) => !nameShapedQuery || wholeNameHit || termHits >= 2)",
+        "                    .map(({ result, termHits }) => ({",
+    )
+
     // ------------------------------------------------------------------
 
     private val patches = listOf(
@@ -1224,7 +1383,11 @@ internal object CodeGraphBundlePatches {
             // the pristine shape.
             satisfiedMarkers = listOf("importNode.id !== parentId"),
         ),
-        Patch("extraction/tree-sitter.js", pythonImportStmtAnchor, pythonImportStmtReplacement),
+        Patch(
+            "extraction/tree-sitter.js", pythonImportStmtAnchor, pythonImportStmtReplacement,
+            fallbackAnchors = listOf(pythonImportStmtFallback1),
+            fallbackReplacements = listOf(pythonImportStmtFallback1Replacement),
+        ),
         Patch("extraction/tree-sitter.js", treeSitterAnchor, treeSitterReplacement),
         Patch("extraction/extraction-version.js", extractionVersionAnchor, extractionVersionReplacement),
         Patch("mcp/tools.js", normalizeQueryAnchor, normalizeQueryReplacement),
@@ -1278,6 +1441,10 @@ internal object CodeGraphBundlePatches {
             satisfiedMarkers = listOf("pruneCrossLanguageEdges() {"),
         ),
         Patch("index.js", openPruneAnchor, openPruneReplacement),
+        Patch("index.js", segmentSeedAnchor, segmentSeedReplacement),
+        Patch("context/index.js", definitionFragmentAnchor, definitionFragmentReplacement),
+        Patch("context/index.js", termSearchAnchor, termSearchReplacement),
+        Patch("context/index.js", termResultsFilterAnchor, termResultsFilterReplacement),
     )
 
     /**

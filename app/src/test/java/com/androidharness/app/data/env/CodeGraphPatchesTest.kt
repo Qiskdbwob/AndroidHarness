@@ -291,10 +291,44 @@ class CodeGraphPatchesTest {
         "        return resolved.map((ref) => {",
     )
 
+    private val contextSource = lines(
+        "            for (const sym of expandedSymbols) {",
+        "                // Title-case the symbol: \"REST\" \u2192 \"Rest\", \"bulk\" \u2192 \"Bulk\", \"allocation\" \u2192 \"Allocation\"",
+        "                const titleCased = sym.charAt(0).toUpperCase() + sym.slice(1).toLowerCase();",
+        "                if (titleCased === sym)",
+        "                    continue;",
+        "            }",
+        "                for (const term of searchTerms) {",
+        "                    const termResults = this.queries.searchNodes(term, {",
+        "                        limit: opts.searchLimit * 2,",
+        "                        kinds: searchKinds,",
+        "                    });",
+        "                    for (const r of termResults) {",
+        "                        const existing = termResultsMap.get(r.node.id);",
+        "                        if (existing) {",
+        "                            existing.termHits++;",
+        "                            existing.result.score = Math.max(existing.result.score, r.score);",
+        "                        }",
+        "                        else {",
+        "                            termResultsMap.set(r.node.id, { result: r, termHits: 1 });",
+        "                        }",
+        "                    }",
+        "                }",
+        "                textResults = Array.from(termResultsMap.values())",
+        "                    .map(({ result, termHits }) => ({",
+    )
+
     private val indexSource = lines(
         "        const db = db_1.DatabaseConnection.open(dbPath);",
         "        const queries = new queries_1.QueryBuilder(db.getDb());",
         "        const instance = new CodeGraph(db, queries, resolvedRoot);",
+        "        let seedNames = options?.seedNames;",
+        "        if (seedNames === undefined) {",
+        "            try {",
+        "                seedNames = this.getSegmentMatches((0, identifier_segments_1.extractSegmentSearchWords)(query), 8)",
+        "                    .map((m) => m.name);",
+        "            }",
+        "        }",
     )
 
     private val extractionVersionSource = "exports.EXTRACTION_VERSION = 25;"
@@ -633,6 +667,7 @@ class CodeGraphPatchesTest {
         db: String = dbSource,
         migrations: String = migrationsSource,
         queries: String = queriesSource,
+        context: String = contextSource,
     ): File {
         val dist = tempDir()
         File(dist, "resolution").mkdirs()
@@ -640,7 +675,9 @@ class CodeGraphPatchesTest {
         File(dist, "mcp").mkdirs()
         File(dist, "bin").mkdirs()
         File(dist, "db").mkdirs()
+        File(dist, "context").mkdirs()
         File(dist, "index.js").writeText(indexSource)
+        File(dist, "context/index.js").writeText(context)
         File(dist, "resolution/name-matcher.js").writeText(matcher)
         File(dist, "resolution/index.js").writeText(resolver)
         File(dist, "resolution/import-resolver.js").writeText(importResolverSource)
