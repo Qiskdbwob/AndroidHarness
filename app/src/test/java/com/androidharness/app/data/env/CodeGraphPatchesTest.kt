@@ -75,6 +75,25 @@ class CodeGraphPatchesTest {
         "            return null;",
         "        return result;",
         "    }",
+        "    createEdges(resolved) {",
+        "        return resolved.map((ref) => {",
+        "            const kind = ref.original.referenceKind;",
+        "            return {",
+        "                source: ref.original.fromNodeId,",
+        "                target: ref.targetNodeId,",
+        "                kind,",
+        "                line: ref.original.line,",
+        "                column: ref.original.column,",
+        "                metadata: {",
+        "                    confidence: ref.confidence,",
+        "                    resolvedBy: ref.resolvedBy,",
+        "                    refName: ref.original.referenceName,",
+        "                    ...(ref.original.referenceKind !== 'references' ? { refKind: ref.original.referenceKind } : {}),",
+        "                    ...(ref.original.referenceKind === 'function_ref' ? { fnRef: true } : {}),",
+        "                },",
+        "            };",
+        "        });",
+        "    }",
     )
 
     private val indexSource = lines(
@@ -86,6 +105,22 @@ class CodeGraphPatchesTest {
     private val extractionVersionSource = "exports.EXTRACTION_VERSION = 25;"
 
     private val importResolverSource = lines(
+        "function resolveModuleImportToFile(ref, imports, context) {",
+        "    if (ref.referenceKind !== 'imports')",
+        "        return null;",
+        "    if (ref.referenceName.includes('.'))",
+        "        return null;",
+        "    for (const imp of imports) {",
+        "        if (imp.localName !== ref.referenceName)",
+        "            continue;",
+        "        let modulePath;",
+        "        if (imp.isNamespace || imp.isDefault) {",
+        "            modulePath = imp.source;",
+        "        }",
+        "        return null;",
+        "    }",
+        "    return null;",
+        "}",
         "function resolvePythonAbsoluteModule(ref, context) {",
         "    if (ref.referenceKind !== 'imports')",
         "        return null;",
@@ -138,6 +173,7 @@ class CodeGraphPatchesTest {
     )
 
     private val toolsSource = lines(
+        "        .replace(/\\b([A-Za-z_][\\w@]*)\\/(\\d{1,3})(?=$|[\\s,()[\\]/])/g, '$1')",
         "    CLIFF_FRACTION: 0.15,",
         "    if (fileCount < 150) {",
         "        return {",
@@ -245,7 +281,7 @@ class CodeGraphPatchesTest {
 
         val result = CodeGraphBundlePatches.apply(dist)
 
-        assertTrue("anchors must match the shipped shape", result.unresolved.isEmpty())
+        assertTrue("anchors must match the shipped shape: ${result.unresolved}", result.unresolved.isEmpty())
         assertEquals("all files should have applied patches", 11, result.applied.toSet().size)
 
         val matcher = File(dist, "resolution/name-matcher.js").readText()
@@ -265,16 +301,20 @@ class CodeGraphPatchesTest {
         assertTrue("name-matcher single exact match drops cross-language", matcher.contains("strictly require same language family"))
         assertTrue("name-matcher fuzzy rejects cross-language", matcher.contains("strictly same language family for fuzzy matching"))
         assertTrue("resolver gates across disparate language families", resolver.contains("strictly drop any resolution across disparate language families"))
+        assertTrue("resolver createEdges drops self-loops", resolver.contains("ref.original.fromNodeId === ref.targetNodeId"))
+        assertTrue("resolver createEdges links importing file to target", resolver.contains("if (srcNode && srcNode.kind === 'import')"))
         assertTrue("framework gate rejects cross-language decorates", resolver.contains("ref.referenceKind === 'decorates'"))
         assertTrue("index.js performs retroactive prune on open", index.contains("pruneCrossLanguageEdges()"))
         assertTrue("import resolver supports bare python module import", importResolver.contains("bare single module imports"))
+        assertTrue("import resolver matches TS relative imports", importResolver.contains("imp.source === ref.referenceName"))
         assertTrue("tree-sitter rejects junk AST names", treeSitter.contains("name.startsWith('from ')"))
         assertTrue("tree-sitter links import nodes with outgoing edge", treeSitter.contains("fromId"))
         assertTrue("extraction version bumped to 26", extractionVersion.contains("EXTRACTION_VERSION = 26;"))
+        assertTrue("normalizeQuery preserves storage path", tools.contains("(?<![\\w/])"))
         assertTrue("mcp explore shows truncation note", tools.contains("showing \${shownSymbols} of \${totalFound}"))
         assertTrue("mcp explore relaxes cliff fraction", tools.contains("CLIFF_FRACTION: 0.05"))
         assertTrue("mcp explore raises searchLimit", tools.contains("Math.max(30, maxFiles * 3)"))
-        assertTrue("mcp explore raises base output budget", tools.contains("maxOutputChars: 32000"))
+        assertTrue("mcp explore raises base output budget", tools.contains("maxOutputChars: 40000"))
         assertTrue("bin impact shows multi-def note", bin.contains("definitions named"))
         assertTrue("db maintenance excludes virtual FTS table", db.contains("ANALYZE nodes"))
         assertTrue("migrations bumps version to 11", migrations.contains("CURRENT_SCHEMA_VERSION = 11;"))

@@ -22,7 +22,7 @@ import java.io.File
 internal object CodeGraphBundlePatches {
 
     /** Bumped whenever [patches] changes, so an install can tell old from new. */
-    const val VERSION = 6
+    const val VERSION = 7
 
     internal data class Patch(
         val relativePath: String,
@@ -180,6 +180,77 @@ internal object CodeGraphBundlePatches {
         "    }",
     )
 
+    // 1 & 2 & 3: createEdges creates both import-node and file-node edges, and drops self loops
+    private val createEdgesAnchor = lines(
+        "    createEdges(resolved) {",
+        "        return resolved.map((ref) => {",
+    )
+
+    private val createEdgesReplacement = lines(
+        "    createEdges(resolved) {",
+        "        const out = [];",
+        "        for (const ref of resolved) {",
+        "            if (ref.original.fromNodeId === ref.targetNodeId) continue;",
+    )
+
+    private val createEdgesEndAnchor = lines(
+        "                    ...(ref.original.referenceKind === 'function_ref' ? { fnRef: true } : {}),",
+        "                },",
+        "            };",
+        "        });",
+        "    }",
+    )
+
+    private val createEdgesEndReplacement = lines(
+        "                    ...(ref.original.referenceKind === 'function_ref' ? { fnRef: true } : {}),",
+        "                },",
+        "            };",
+        "            out.push(edge);",
+        "            if (kind === 'imports') {",
+        "                const srcNode = this.queries.getNodeById(ref.original.fromNodeId);",
+        "                if (srcNode && srcNode.kind === 'import') {",
+        "                    const fileNodes = this.context.getNodesInFile(ref.original.filePath);",
+        "                    const fileNode = fileNodes ? fileNodes.find((n) => n.kind === 'file') : null;",
+        "                    if (fileNode && fileNode.id !== ref.targetNodeId && fileNode.id !== ref.original.fromNodeId) {",
+        "                        out.push({",
+        "                            ...edge,",
+        "                            source: fileNode.id,",
+        "                        });",
+        "                    }",
+        "                }",
+        "            }",
+        "        }",
+        "        return out;",
+        "    }",
+    )
+
+    // 1 & 2 (TS imports): resolveModuleImportToFile matches imp.source for relative TS imports
+    private val resolveModuleImportAnchor = lines(
+        "function resolveModuleImportToFile(ref, imports, context) {",
+        "    if (ref.referenceKind !== 'imports')",
+        "        return null;",
+        "    if (ref.referenceName.includes('.'))",
+        "        return null;",
+        "    for (const imp of imports) {",
+        "        if (imp.localName !== ref.referenceName)",
+        "            continue;",
+        "        let modulePath;",
+        "        if (imp.isNamespace || imp.isDefault) {",
+    )
+
+    private val resolveModuleImportReplacement = lines(
+        "function resolveModuleImportToFile(ref, imports, context) {",
+        "    if (ref.referenceKind !== 'imports')",
+        "        return null;",
+        "    if (ref.referenceName.includes('.') && !ref.referenceName.startsWith('.'))",
+        "        return null;",
+        "    for (const imp of imports) {",
+        "        if (imp.localName !== ref.referenceName && imp.source !== ref.referenceName)",
+        "            continue;",
+        "        let modulePath;",
+        "        if (imp.isNamespace || imp.isDefault || imp.source === ref.referenceName) {",
+    )
+
     // 2: Retroactive prune of cross-language edges on CodeGraph.open
     private val openPruneAnchor = lines(
         "        const db = db_1.DatabaseConnection.open(dbPath);",
@@ -322,6 +393,10 @@ internal object CodeGraphBundlePatches {
         "        }",
     )
 
+    // 4: Preserve /storage/emulated/0/... in query path normalization
+    private val normalizeQueryAnchor = "        .replace(/\\b([A-Za-z_][\\w@]*)\\/(\\d{1,3})(?=$|[\\s,()[\\]/])/g, '$1')"
+    private val normalizeQueryReplacement = "        .replace(/(?<![\\w/])([A-Za-z_][\\w@]*)\\/(\\d{1,3})(?=$|[\\s,()[\\]])/g, '$1')"
+
     // B10: MCP explore summary line shows total count when truncated
     private val exploreAnchor = lines(
         "        let summaryLine = survivors.length > 0",
@@ -337,11 +412,11 @@ internal object CodeGraphBundlePatches {
         "            : `Found \${subgraph.nodes.size} symbol\${subgraph.nodes.size === 1 ? '' : 's'} across \${fileGroups.size} file\${fileGroups.size === 1 ? '' : 's'}.`;",
     )
 
-    // 4: Explore cliff fraction relaxed so related files aren't pruned away prematurely
+    // 7: Explore cliff fraction relaxed so related files aren't pruned away prematurely
     private val exploreCliffAnchor = "    CLIFF_FRACTION: 0.15,"
     private val exploreCliffReplacement = "    CLIFF_FRACTION: 0.05,"
 
-    // 4 & Minor 11: Raise explore output budget and search limit for small repos / natural queries
+    // 7 & Minor 11: Raise explore output budget and search limit for small repos / natural queries
     private val exploreBudgetAnchor = lines(
         "    if (fileCount < 150) {",
         "        return {",
@@ -367,11 +442,11 @@ internal object CodeGraphBundlePatches {
     private val exploreBudgetReplacement = lines(
         "    if (fileCount < 150) {",
         "        return {",
-        "            maxOutputChars: 32000,",
-        "            defaultMaxFiles: 12,",
-        "            maxCharsPerFile: 7500,",
+        "            maxOutputChars: 40000,",
+        "            defaultMaxFiles: 20,",
+        "            maxCharsPerFile: 8000,",
         "            gapThreshold: 7,",
-        "            maxSymbolsInFileHeader: 20,",
+        "            maxSymbolsInFileHeader: 30,",
         "            maxEdgesPerRelationshipKind: 4,",
         "            includeRelationships: false,",
         "            includeAdditionalFiles: false,",
@@ -412,7 +487,7 @@ internal object CodeGraphBundlePatches {
         "                console.log(chalk.bold(`\\nImpact of changing \"\${symbol}\"\${multiNote} — \${mergedNodes.size} affected symbols:\\n`));",
     )
 
-    // B8, 4 & Minor 12: Database maintenance analyzes real tables only + incremental vacuum
+    // B8, 6 & Minor 12: Database maintenance analyzes real tables only + incremental vacuum
     private val maintenanceAnchor = lines(
         "        await this.runPragmasOffThread(['PRAGMA analysis_limit=1000', 'PRAGMA optimize', 'PRAGMA wal_checkpoint(PASSIVE)'], ",
         "        // Worker threads unavailable — bounded in-line fallback, no checkpoint.",
@@ -425,7 +500,7 @@ internal object CodeGraphBundlePatches {
         "        ['PRAGMA analysis_limit=1000', 'PRAGMA optimize', 'ANALYZE nodes', 'ANALYZE edges', 'ANALYZE files', 'ANALYZE unresolved_refs', 'PRAGMA incremental_vacuum']);",
     )
 
-    // B3, B7, B9, 1, 2, 4: Migration 10 & 11 - clean edges, vacuum freelist, unique unresolved_refs
+    // B3, B7, B9, 1, 2, 6: Migration 10 & 11 - clean edges, vacuum freelist, unique unresolved_refs
     private val migrationVersionAnchor = "exports.CURRENT_SCHEMA_VERSION = 9;"
     private val migrationVersionFallback = "exports.CURRENT_SCHEMA_VERSION = 10;"
     private val migrationVersionReplacement = "exports.CURRENT_SCHEMA_VERSION = 11;"
@@ -520,6 +595,7 @@ internal object CodeGraphBundlePatches {
         "            (s.language IN ('csharp','razor') AND t.language IN ('csharp','razor'))",
         "          )",
         "        );",
+        "        DELETE FROM edges WHERE source = target;",
         "        DELETE FROM name_segment_vocab WHERE name NOT IN (SELECT name FROM nodes);",
         "        UPDATE project_metadata SET value = '26' WHERE key = 'indexed_with_extraction_version';",
         "        PRAGMA auto_vacuum = INCREMENTAL;",
@@ -534,7 +610,7 @@ internal object CodeGraphBundlePatches {
     private val insertUnresolvedAnchor = "this.runBatched('insertUnresolvedRefs', 'INSERT INTO unresolved_refs (from_node_id, reference_name, reference_kind, line, col, candidates, file_path, language) VALUES ', '(?,?,?,?,?,?,?,?)', rows);"
     private val insertUnresolvedReplacement = "this.runBatched('insertUnresolvedRefs', 'INSERT OR IGNORE INTO unresolved_refs (from_node_id, reference_name, reference_kind, line, col, candidates, file_path, language) VALUES ', '(?,?,?,?,?,?,?,?)', rows);"
 
-    // B9, 2, 4: deleteNodesByFile prunes name_segment_vocab orphans + pruneCrossLanguageEdges method
+    // B9, 2, 6: deleteNodesByFile prunes name_segment_vocab orphans + pruneCrossLanguageEdges method
     private val deleteNodesAnchor = lines(
         "    deleteNodesByFile(filePath) {",
         "        if (!this.stmts.deleteNodesByFile) {",
@@ -567,6 +643,7 @@ internal object CodeGraphBundlePatches {
         "            (s.language IN ('csharp','razor') AND t.language IN ('csharp','razor'))",
         "          )",
         "        );",
+        "        DELETE FROM edges WHERE source = target;",
         "        DELETE FROM name_segment_vocab WHERE name NOT IN (SELECT name FROM nodes);",
         "        UPDATE project_metadata SET value = '26' WHERE key = 'indexed_with_extraction_version';",
         "        PRAGMA incremental_vacuum;",
@@ -597,11 +674,15 @@ internal object CodeGraphBundlePatches {
         Patch("resolution/name-matcher.js", fuzzyAnchor, fuzzyReplacement),
         Patch("resolution/index.js", resolverAnchor, resolverReplacement),
         Patch("resolution/index.js", frameworkAnchor, frameworkReplacement),
+        Patch("resolution/index.js", createEdgesAnchor, createEdgesReplacement),
+        Patch("resolution/index.js", createEdgesEndAnchor, createEdgesEndReplacement),
+        Patch("resolution/import-resolver.js", resolveModuleImportAnchor, resolveModuleImportReplacement),
         Patch("resolution/import-resolver.js", pythonModuleImportAnchor, pythonModuleImportReplacement),
         Patch("extraction/tree-sitter.js", importHookNodeAnchor, importHookNodeReplacement),
         Patch("extraction/tree-sitter.js", pythonImportStmtAnchor, pythonImportStmtReplacement),
         Patch("extraction/tree-sitter.js", treeSitterAnchor, treeSitterReplacement),
         Patch("extraction/extraction-version.js", extractionVersionAnchor, extractionVersionReplacement),
+        Patch("mcp/tools.js", normalizeQueryAnchor, normalizeQueryReplacement),
         Patch("mcp/tools.js", exploreAnchor, exploreReplacement),
         Patch("mcp/tools.js", exploreCliffAnchor, exploreCliffReplacement),
         Patch("mcp/tools.js", exploreBudgetAnchor, exploreBudgetReplacement),

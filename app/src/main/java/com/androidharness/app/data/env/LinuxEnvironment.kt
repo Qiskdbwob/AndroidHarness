@@ -1111,7 +1111,8 @@ class LinuxEnvironmentManager(
         val codeGraphVersion = runCatching {
             File(prefix, CODEGRAPH_VERSION_MARKER).readText().trim()
         }.getOrDefault("")
-        return ("v11-codegraph\n$codeGraphVersion\n" + installedPackages().sorted().joinToString("\n"))
+        val bundlePatchVersion = CodeGraphBundlePatches.VERSION
+        return ("v20-codegraph-p$bundlePatchVersion\n$codeGraphVersion\n" + installedPackages().sorted().joinToString("\n"))
             .let { MessageDigest.getInstance("SHA-256").digest(it.toByteArray()).joinToString("") { b -> "%02x".format(b) } }
     }
 
