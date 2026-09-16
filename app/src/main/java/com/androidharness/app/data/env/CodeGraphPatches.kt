@@ -22,12 +22,13 @@ import java.io.File
 internal object CodeGraphBundlePatches {
 
     /** Bumped whenever [patches] changes, so an install can tell old from new. */
-    const val VERSION = 5
+    const val VERSION = 6
 
     internal data class Patch(
         val relativePath: String,
         val anchor: String,
         val replacement: String,
+        val fallbackAnchor: String? = null,
     )
 
     internal data class Result(val applied: List<String>, val unresolved: List<String>) {
@@ -199,6 +200,79 @@ internal object CodeGraphBundlePatches {
     private val extractionVersionAnchor = "exports.EXTRACTION_VERSION = 25;"
     private val extractionVersionReplacement = "exports.EXTRACTION_VERSION = 26;"
 
+    // 1 (imports): Import nodes have outgoing imports edges to their target
+    private val importHookNodeAnchor = lines(
+        "        if (this.extractor.extractImport) {",
+        "            const info = this.extractor.extractImport(node, this.source);",
+        "            if (info) {",
+        "                this.createNode('import', info.moduleName, node, {",
+        "                    signature: info.signature,",
+        "                });",
+        "                // Create unresolved reference unless the hook handled it",
+        "                if (!info.handledRefs && info.moduleName && this.nodeStack.length > 0) {",
+        "                    const parentId = this.nodeStack[this.nodeStack.length - 1];",
+        "                    if (parentId) {",
+        "                        this.unresolvedReferences.push({",
+        "                            fromNodeId: parentId,",
+        "                            referenceName: info.moduleName,",
+        "                            referenceKind: 'imports',",
+        "                            line: node.startPosition.row + 1,",
+        "                            column: node.startPosition.column,",
+        "                        });",
+        "                    }",
+        "                }",
+    )
+
+    private val importHookNodeReplacement = lines(
+        "        if (this.extractor.extractImport) {",
+        "            const info = this.extractor.extractImport(node, this.source);",
+        "            if (info) {",
+        "                const importNode = this.createNode('import', info.moduleName, node, {",
+        "                    signature: info.signature,",
+        "                });",
+        "                // Create unresolved reference attached to the import node",
+        "                if (!info.handledRefs && info.moduleName && this.nodeStack.length > 0) {",
+        "                    const parentId = this.nodeStack[this.nodeStack.length - 1];",
+        "                    const fromId = importNode ? importNode.id : parentId;",
+        "                    if (fromId) {",
+        "                        this.unresolvedReferences.push({",
+        "                            fromNodeId: fromId,",
+        "                            referenceName: info.moduleName,",
+        "                            referenceKind: 'imports',",
+        "                            line: node.startPosition.row + 1,",
+        "                            column: node.startPosition.column,",
+        "                        });",
+        "                    }",
+        "                }",
+    )
+
+    private val pythonImportStmtAnchor = lines(
+        "                if (child?.type === 'dotted_name') {",
+        "                    this.createNode('import', (0, tree_sitter_helpers_1.getNodeText)(child, this.source), node, {",
+        "                        signature: importText,",
+        "                    });",
+        "                    pushModuleRef(child);",
+        "                }",
+    )
+
+    private val pythonImportStmtReplacement = lines(
+        "                if (child?.type === 'dotted_name') {",
+        "                    const impNode = this.createNode('import', (0, tree_sitter_helpers_1.getNodeText)(child, this.source), node, {",
+        "                        signature: importText,",
+        "                    });",
+        "                    const fromId = impNode ? impNode.id : importParentId;",
+        "                    if (fromId) {",
+        "                        this.unresolvedReferences.push({",
+        "                            fromNodeId: fromId,",
+        "                            referenceName: (0, tree_sitter_helpers_1.getNodeText)(child, this.source),",
+        "                            referenceKind: 'imports',",
+        "                            line: child.startPosition.row + 1,",
+        "                            column: child.startPosition.column,",
+        "                        });",
+        "                    }",
+        "                }",
+    )
+
     // B6: Python single-level module import (import b)
     private val pythonModuleImportAnchor = lines(
         "function resolvePythonAbsoluteModule(ref, context) {",
@@ -338,7 +412,7 @@ internal object CodeGraphBundlePatches {
         "                console.log(chalk.bold(`\\nImpact of changing \"\${symbol}\"\${multiNote} — \${mergedNodes.size} affected symbols:\\n`));",
     )
 
-    // B8 & Minor 12: Database maintenance analyzes real tables only, excluding virtual FTS tables
+    // B8, 4 & Minor 12: Database maintenance analyzes real tables only + incremental vacuum
     private val maintenanceAnchor = lines(
         "        await this.runPragmasOffThread(['PRAGMA analysis_limit=1000', 'PRAGMA optimize', 'PRAGMA wal_checkpoint(PASSIVE)'], ",
         "        // Worker threads unavailable — bounded in-line fallback, no checkpoint.",
@@ -346,17 +420,50 @@ internal object CodeGraphBundlePatches {
     )
 
     private val maintenanceReplacement = lines(
-        "        await this.runPragmasOffThread(['PRAGMA analysis_limit=1000', 'PRAGMA optimize', 'ANALYZE nodes', 'ANALYZE edges', 'ANALYZE files', 'ANALYZE unresolved_refs', 'PRAGMA wal_checkpoint(PASSIVE)'], ",
+        "        await this.runPragmasOffThread(['PRAGMA analysis_limit=1000', 'PRAGMA optimize', 'ANALYZE nodes', 'ANALYZE edges', 'ANALYZE files', 'ANALYZE unresolved_refs', 'PRAGMA incremental_vacuum', 'PRAGMA wal_checkpoint(PASSIVE)'], ",
         "        // Worker threads unavailable — bounded in-line fallback, no checkpoint.",
-        "        ['PRAGMA analysis_limit=1000', 'PRAGMA optimize', 'ANALYZE nodes', 'ANALYZE edges', 'ANALYZE files', 'ANALYZE unresolved_refs']);",
+        "        ['PRAGMA analysis_limit=1000', 'PRAGMA optimize', 'ANALYZE nodes', 'ANALYZE edges', 'ANALYZE files', 'ANALYZE unresolved_refs', 'PRAGMA incremental_vacuum']);",
     )
 
-    // B3, B7, B9, 1, 2: Migration 10 & 11 - clean existing bad edges incl. decorates, unique unresolved_refs, prune vocab orphans
+    // B3, B7, B9, 1, 2, 4: Migration 10 & 11 - clean edges, vacuum freelist, unique unresolved_refs
     private val migrationVersionAnchor = "exports.CURRENT_SCHEMA_VERSION = 9;"
+    private val migrationVersionFallback = "exports.CURRENT_SCHEMA_VERSION = 10;"
     private val migrationVersionReplacement = "exports.CURRENT_SCHEMA_VERSION = 11;"
 
     private val migrationListAnchor = lines(
         "            db.exec('CREATE INDEX IF NOT EXISTS idx_files_generated ON files(path) WHERE generated = 1');",
+        "        },",
+        "    },",
+        "];",
+    )
+
+    private val migrationListFallback = lines(
+        "        version: 10,",
+        "        description: 'Prune cross-language edges, unique unresolved refs index, and prune vocab orphans',",
+        "        up: (db) => {",
+        "            db.exec(`",
+        "        DELETE FROM edges WHERE id IN (",
+        "          SELECT e.id FROM edges e",
+        "          JOIN nodes s ON e.source = s.id",
+        "          JOIN nodes t ON e.target = t.id",
+        "          WHERE s.language != t.language",
+        "          AND NOT (",
+        "            (s.language IN ('kotlin','java','scala','clojure','groovy') AND t.language IN ('kotlin','java','scala','clojure','groovy')) OR",
+        "            (s.language IN ('swift','objc','objcpp') AND t.language IN ('swift','objc','objcpp')) OR",
+        "            (s.language IN ('typescript','tsx','javascript','jsx','arkts','vue','svelte','astro') AND t.language IN ('typescript','tsx','javascript','jsx','arkts','vue','svelte','astro')) OR",
+        "            (s.language IN ('c','cpp') AND t.language IN ('c','cpp')) OR",
+        "            (s.language IN ('csharp','razor') AND t.language IN ('csharp','razor'))",
+        "          )",
+        "        );",
+        "        DELETE FROM unresolved_refs WHERE id NOT IN (",
+        "          SELECT MIN(id) FROM unresolved_refs",
+        "          GROUP BY from_node_id, reference_name, reference_kind, line, col",
+        "        );",
+        "        CREATE UNIQUE INDEX IF NOT EXISTS idx_unresolved_identity",
+        "          ON unresolved_refs(from_node_id, reference_name, reference_kind, line, col);",
+        "        DELETE FROM name_segment_vocab WHERE name NOT IN (SELECT name FROM nodes);",
+        "        UPDATE project_metadata SET value = '26' WHERE key = 'indexed_with_extraction_version';",
+        "      `);",
         "        },",
         "    },",
         "];",
@@ -397,7 +504,7 @@ internal object CodeGraphBundlePatches {
         "    },",
         "    {",
         "        version: 11,",
-        "        description: 'Prune cross-language decorates edges and update extraction version',",
+        "        description: 'Prune cross-language decorates edges and compact freelist space',",
         "        up: (db) => {",
         "            db.exec(`",
         "        DELETE FROM edges WHERE id IN (",
@@ -413,7 +520,10 @@ internal object CodeGraphBundlePatches {
         "            (s.language IN ('csharp','razor') AND t.language IN ('csharp','razor'))",
         "          )",
         "        );",
+        "        DELETE FROM name_segment_vocab WHERE name NOT IN (SELECT name FROM nodes);",
         "        UPDATE project_metadata SET value = '26' WHERE key = 'indexed_with_extraction_version';",
+        "        PRAGMA auto_vacuum = INCREMENTAL;",
+        "        VACUUM;",
         "      `);",
         "        },",
         "    },",
@@ -424,7 +534,7 @@ internal object CodeGraphBundlePatches {
     private val insertUnresolvedAnchor = "this.runBatched('insertUnresolvedRefs', 'INSERT INTO unresolved_refs (from_node_id, reference_name, reference_kind, line, col, candidates, file_path, language) VALUES ', '(?,?,?,?,?,?,?,?)', rows);"
     private val insertUnresolvedReplacement = "this.runBatched('insertUnresolvedRefs', 'INSERT OR IGNORE INTO unresolved_refs (from_node_id, reference_name, reference_kind, line, col, candidates, file_path, language) VALUES ', '(?,?,?,?,?,?,?,?)', rows);"
 
-    // B9, 2: deleteNodesByFile prunes name_segment_vocab orphans + pruneCrossLanguageEdges method
+    // B9, 2, 4: deleteNodesByFile prunes name_segment_vocab orphans + pruneCrossLanguageEdges method
     private val deleteNodesAnchor = lines(
         "    deleteNodesByFile(filePath) {",
         "        if (!this.stmts.deleteNodesByFile) {",
@@ -459,6 +569,7 @@ internal object CodeGraphBundlePatches {
         "        );",
         "        DELETE FROM name_segment_vocab WHERE name NOT IN (SELECT name FROM nodes);",
         "        UPDATE project_metadata SET value = '26' WHERE key = 'indexed_with_extraction_version';",
+        "        PRAGMA incremental_vacuum;",
         "            `);",
         "        } catch { /* ignore */ }",
         "    }",
@@ -487,6 +598,8 @@ internal object CodeGraphBundlePatches {
         Patch("resolution/index.js", resolverAnchor, resolverReplacement),
         Patch("resolution/index.js", frameworkAnchor, frameworkReplacement),
         Patch("resolution/import-resolver.js", pythonModuleImportAnchor, pythonModuleImportReplacement),
+        Patch("extraction/tree-sitter.js", importHookNodeAnchor, importHookNodeReplacement),
+        Patch("extraction/tree-sitter.js", pythonImportStmtAnchor, pythonImportStmtReplacement),
         Patch("extraction/tree-sitter.js", treeSitterAnchor, treeSitterReplacement),
         Patch("extraction/extraction-version.js", extractionVersionAnchor, extractionVersionReplacement),
         Patch("mcp/tools.js", exploreAnchor, exploreReplacement),
@@ -495,8 +608,8 @@ internal object CodeGraphBundlePatches {
         Patch("mcp/tools.js", exploreSearchLimitAnchor, exploreSearchLimitReplacement),
         Patch("bin/codegraph.js", impactAnchor, impactReplacement),
         Patch("db/index.js", maintenanceAnchor, maintenanceReplacement),
-        Patch("db/migrations.js", migrationVersionAnchor, migrationVersionReplacement),
-        Patch("db/migrations.js", migrationListAnchor, migrationListReplacement),
+        Patch("db/migrations.js", migrationVersionAnchor, migrationVersionReplacement, migrationVersionFallback),
+        Patch("db/migrations.js", migrationListAnchor, migrationListReplacement, migrationListFallback),
         Patch("db/queries.js", insertUnresolvedAnchor, insertUnresolvedReplacement),
         Patch("db/queries.js", deleteNodesAnchor, deleteNodesReplacement),
         Patch("index.js", openPruneAnchor, openPruneReplacement),
@@ -519,11 +632,16 @@ internal object CodeGraphBundlePatches {
             // The inserted text doubles as the record that this patch is in
             // place, which is what keeps a second run from nesting copies.
             if (text.contains(patch.replacement)) continue
-            if (!text.contains(patch.anchor)) {
+            val anchor = when {
+                text.contains(patch.anchor) -> patch.anchor
+                patch.fallbackAnchor != null && text.contains(patch.fallbackAnchor) -> patch.fallbackAnchor
+                else -> null
+            }
+            if (anchor == null) {
                 unresolved += patch.relativePath
                 continue
             }
-            runCatching { file.writeText(text.replace(patch.anchor, patch.replacement)) }
+            runCatching { file.writeText(text.replace(anchor, patch.replacement)) }
                 .onSuccess { applied += patch.relativePath }
                 .onFailure { unresolved += patch.relativePath }
         }

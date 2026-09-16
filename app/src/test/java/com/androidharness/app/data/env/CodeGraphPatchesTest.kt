@@ -110,6 +110,31 @@ class CodeGraphPatchesTest {
         "        const id = generateNodeId();",
         "        return { id, name };",
         "    }",
+        "        if (this.extractor.extractImport) {",
+        "            const info = this.extractor.extractImport(node, this.source);",
+        "            if (info) {",
+        "                this.createNode('import', info.moduleName, node, {",
+        "                    signature: info.signature,",
+        "                });",
+        "                // Create unresolved reference unless the hook handled it",
+        "                if (!info.handledRefs && info.moduleName && this.nodeStack.length > 0) {",
+        "                    const parentId = this.nodeStack[this.nodeStack.length - 1];",
+        "                    if (parentId) {",
+        "                        this.unresolvedReferences.push({",
+        "                            fromNodeId: parentId,",
+        "                            referenceName: info.moduleName,",
+        "                            referenceKind: 'imports',",
+        "                            line: node.startPosition.row + 1,",
+        "                            column: node.startPosition.column,",
+        "                        });",
+        "                    }",
+        "                }",
+        "                if (child?.type === 'dotted_name') {",
+        "                    this.createNode('import', (0, tree_sitter_helpers_1.getNodeText)(child, this.source), node, {",
+        "                        signature: importText,",
+        "                    });",
+        "                    pushModuleRef(child);",
+        "                }",
     )
 
     private val toolsSource = lines(
@@ -236,7 +261,7 @@ class CodeGraphPatchesTest {
         val queries = File(dist, "db/queries.js").readText()
 
         assertTrue("name-matcher includes web SFCs", matcher.contains("vue: 'web', svelte: 'web', astro: 'web'"))
-        assertTrue("name-matcher gates candidates to same language family", matcher.contains("sameLanguageFamily(c.language, ref.language)"))
+        assertTrue("name-matcher candidate filter", matcher.contains("filter all name-matching candidates strictly"))
         assertTrue("name-matcher single exact match drops cross-language", matcher.contains("strictly require same language family"))
         assertTrue("name-matcher fuzzy rejects cross-language", matcher.contains("strictly same language family for fuzzy matching"))
         assertTrue("resolver gates across disparate language families", resolver.contains("strictly drop any resolution across disparate language families"))
@@ -244,6 +269,7 @@ class CodeGraphPatchesTest {
         assertTrue("index.js performs retroactive prune on open", index.contains("pruneCrossLanguageEdges()"))
         assertTrue("import resolver supports bare python module import", importResolver.contains("bare single module imports"))
         assertTrue("tree-sitter rejects junk AST names", treeSitter.contains("name.startsWith('from ')"))
+        assertTrue("tree-sitter links import nodes with outgoing edge", treeSitter.contains("fromId"))
         assertTrue("extraction version bumped to 26", extractionVersion.contains("EXTRACTION_VERSION = 26;"))
         assertTrue("mcp explore shows truncation note", tools.contains("showing \${shownSymbols} of \${totalFound}"))
         assertTrue("mcp explore relaxes cliff fraction", tools.contains("CLIFF_FRACTION: 0.05"))
@@ -253,6 +279,7 @@ class CodeGraphPatchesTest {
         assertTrue("db maintenance excludes virtual FTS table", db.contains("ANALYZE nodes"))
         assertTrue("migrations bumps version to 11", migrations.contains("CURRENT_SCHEMA_VERSION = 11;"))
         assertTrue("migrations includes version 11", migrations.contains("version: 11,"))
+        assertTrue("migrations 11 vacuums freelist", migrations.contains("PRAGMA auto_vacuum = INCREMENTAL;"))
         assertTrue("queries uses INSERT OR IGNORE", queries.contains("INSERT OR IGNORE INTO unresolved_refs"))
         assertTrue("queries has pruneCrossLanguageEdges method", queries.contains("pruneCrossLanguageEdges()"))
         assertTrue("queries prunes vocab on file deletion", queries.contains("DELETE FROM name_segment_vocab WHERE name NOT IN"))
