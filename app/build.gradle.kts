@@ -78,6 +78,19 @@ android {
     }
 }
 
+// AGP's instrumented-test tooling (the Unified Test Platform) drags in gRPC's
+// netty 4.1.93/4.1.110, both below the fixed 4.1.137. Those configurations only
+// exist to run tests on a device and never reach the APK, so lifting netty here
+// touches nothing the app ships. The whole group moves together on purpose:
+// mixing 4.1.x netty modules across a version boundary breaks at runtime.
+configurations.configureEach {
+    if (name.startsWith("unified-test-platform")) {
+        resolutionStrategy.eachDependency {
+            if (requested.group == "io.netty") useVersion("4.1.137.Final")
+        }
+    }
+}
+
 dependencies {
     ksp(libs.room.compiler)
 
