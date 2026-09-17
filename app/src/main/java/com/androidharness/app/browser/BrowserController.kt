@@ -448,13 +448,17 @@ class BrowserController(
      * begin, then for its document to commit and finish loading. The page probe
      * is only spent when the client callbacks have nothing to report (a WebView
      * whose client is not ours), because it costs a JS round trip per poll.
+     *
+     * [generationBefore] is passed in rather than read here: a caller that
+     * triggers a navigation has to capture the baseline BEFORE its own call,
+     * since onPageStarted can fire before that call returns.
      */
     private suspend fun awaitNavigation(
+        generationBefore: Int,
         urlBefore: String?,
         detectMs: Long = 2_500,
         finishMs: Long = 15_000,
     ): NavigationOutcome {
-        val generationBefore = loadTracker.currentGeneration
         var probe: PageLoadTracker.DocumentProbe? = null
 
         var started = PageLoadTracker.didStart(loadTracker.snapshot(probe), generationBefore, urlBefore)
@@ -555,9 +559,13 @@ class BrowserController(
         }
     }
 
-    /** Settle sequence after a mutating action: catch navigation, then scroll. */
-    private suspend fun awaitSettle(urlBefore: String?): NavigationOutcome {
-        val outcome = awaitNavigation(urlBefore)
+    /**
+     * Settle sequence after a mutating action: catch navigation, then scroll.
+     * The baseline is captured here, before the caller's action could have
+     * started one.
+     */
+    private suspend fun awaitSettle(generationBefore: Int, urlBefore: String?): NavigationOutcome {
+        val outcome = awaitNavigation(generationBefore, urlBefore)
         if (!outcome.started) delay(350) // brief settle for SPA re-renders
         awaitScrollSettle()
         return outcome
@@ -604,6 +612,7 @@ class BrowserController(
             // the new document look like the one we started on.
             val before = committedPageUrl()
             clearDownloadReport()
+            val generationBefore = loadTracker.currentGeneration
             withContext(Dispatchers.Main) {
                 val wv = getOrCreateWebView()
                 if (localUrl != null) {
@@ -613,7 +622,7 @@ class BrowserController(
                     wv.loadUrl(LocalPortProbe.normalizeLocalUrl(target))
                 }
             }
-            val outcome = awaitNavigation(before, detectMs = 2_500, finishMs = NAVIGATE_TIMEOUT_MS)
+            val outcome = awaitNavigation(generationBefore, before, detectMs = 2_500, finishMs = NAVIGATE_TIMEOUT_MS)
             // A download is a failure whether or not a navigation was observed:
             // either way no document is coming and the browser still shows the
             // previous page. Reporting that as a successful navigate is the bug
@@ -677,6 +686,7 @@ class BrowserController(
         // Read where the page is BEFORE the click: a click that navigates must
         // be waited out, and a click that does not must not be.
         val before = committedPageUrl()
+        val generationBefore = loadTracker.currentGeneration
         try {
             val raw = evalRaw(js)
             val error = parseActionError(raw)
@@ -684,7 +694,7 @@ class BrowserController(
                 track("click", detail, ok = false)
                 throw IllegalStateException(error)
             }
-            val outcome = awaitSettle(before)
+            val outcome = awaitSettle(generationBefore, before)
             return withActionNote(extractState(), raw, elementId, target).withLoadNote(outcome)
         } catch (e: IllegalStateException) {
             throw e
@@ -709,6 +719,7 @@ class BrowserController(
         val js = buildTypeJs(target, text, clearFirst)
 
         val before = committedPageUrl()
+        val generationBefore = loadTracker.currentGeneration
         try {
             val raw = evalRaw(js)
             val error = parseActionError(raw)
@@ -716,7 +727,7 @@ class BrowserController(
                 track("type", detail, ok = false)
                 throw IllegalStateException(error)
             }
-            val outcome = awaitSettle(before)
+            val outcome = awaitSettle(generationBefore, before)
             return withActionNote(extractState(), raw, elementId, target).withLoadNote(outcome)
         } catch (e: IllegalStateException) {
             throw e
@@ -762,72 +773,93 @@ class BrowserController(
 
     /**
      * Go back in WebView history. If a step lands on a 301/302 redirect that
-     * bounces back to the starting page, retries up to 5 times.
+     * bounces back to the starting page, retries up to [MAX_HISTORY_STEPS] times.
      *
-     * Nothing is done at all until the current navigation has finished: a page
-     * that is still loading (a link click whose document has not committed yet)
-     * has no history entry of its own, so goBack() from it lands on the entry
-     * BEFORE the page the user just left and silently skips it (on-device QA,
-     * 2026-09-17: navigate→click link→back landed two entries behind).
+     * Two things must hold before a step is judged, or the retry walks backwards
+     * through entries the caller never asked to skip (on-device QA, 2026-09-17:
+     * navigate → click a link → back landed on an entry older than the page just
+     * left, because the landing was read while the step was still loading and
+     * every `Apage.html?...` compared as the same document):
+     *
+     *  - the current navigation is finished first, so a page whose document has
+     *    not committed yet cannot make goBack() skip past it;
+     *  - the landing is only judged once its own load has SETTLED, and only a
+     *    settled landing back on the starting page is treated as a bounce.
      */
-    suspend fun back(): BrowserState {
-        track("back", "history")
-        awaitPendingLoad()
-        val canGo = withContext(Dispatchers.Main) { getOrCreateWebView().canGoBack() }
-        if (!canGo) throw IllegalStateException("No previous page in history.")
-
-        val startUrl = committedPageUrl().orEmpty()
-        var attempts = 0
-        while (attempts < MAX_HISTORY_STEPS) {
-            attempts++
-            withContext(Dispatchers.Main) { getOrCreateWebView().goBack() }
-            val outcome = awaitNavigation(startUrl, detectMs = 3_000, finishMs = 8_000)
-            val after = committedPageUrl().orEmpty()
-            if (after != startUrl && !isSamePage(after, startUrl)) {
-                awaitScrollSettle()
-                return extractState().withLoadNote(outcome)
-            }
-            // The step committed onto the page we came from: a redirect bounced
-            // us forward. Anything else is the retry this loop is for.
-            val canStillGo = withContext(Dispatchers.Main) { getOrCreateWebView().canGoBack() }
-            if (!canStillGo) break
-        }
-        // Exhausted retries or can't go further: return whatever we landed on.
-        awaitScrollSettle()
-        return extractState()
-    }
+    suspend fun back(): BrowserState = historyStep(
+        action = "back",
+        canStep = { it.canGoBack() },
+        step = { it.goBack() },
+    )
 
     /**
-     * Go forward in WebView history. Same redirect-aware retry as back().
+     * Go forward in WebView history. Same rules as [back].
      */
-    suspend fun forward(): BrowserState {
-        track("forward", "history")
+    suspend fun forward(): BrowserState = historyStep(
+        action = "forward",
+        canStep = { it.canGoForward() },
+        step = { it.goForward() },
+    )
+
+    /** Shared body of [back] and [forward]; see [back] for why each guard exists. */
+    private suspend fun historyStep(
+        action: String,
+        canStep: (WebView) -> Boolean,
+        step: (WebView) -> Unit,
+    ): BrowserState {
+        track(action, "history")
         awaitPendingLoad()
-        val canGo = withContext(Dispatchers.Main) { getOrCreateWebView().canGoForward() }
-        if (!canGo) throw IllegalStateException("No next page in history.")
+        val canGo = withContext(Dispatchers.Main) { canStep(getOrCreateWebView()) }
+        if (!canGo) {
+            throw IllegalStateException(
+                if (action == "back") "No previous page in history." else "No next page in history.",
+            )
+        }
 
         val startUrl = committedPageUrl().orEmpty()
         var attempts = 0
-        while (attempts < MAX_HISTORY_STEPS) {
+        while (true) {
             attempts++
-            withContext(Dispatchers.Main) { getOrCreateWebView().goForward() }
-            val outcome = awaitNavigation(startUrl, detectMs = 3_000, finishMs = 8_000)
-            val after = committedPageUrl().orEmpty()
-            if (after != startUrl && !isSamePage(after, startUrl)) {
-                awaitScrollSettle()
-                return extractState().withLoadNote(outcome)
-            }
-            val canStillGo = withContext(Dispatchers.Main) { getOrCreateWebView().canGoForward() }
-            if (!canStillGo) break
-        }
-        awaitScrollSettle()
-        return extractState()
-    }
+            // Baseline BEFORE the step: onPageStarted can fire before the call
+            // returns, and a baseline taken afterwards would miss the very
+            // navigation the step caused.
+            val baseline = loadTracker.currentGeneration
+            withContext(Dispatchers.Main) { step(getOrCreateWebView()) }
+            val outcome = awaitNavigation(baseline, startUrl, detectMs = 3_000, finishMs = 8_000)
+            val landed = historyLandingUrl(readDocumentProbe()?.url, currentUrl())
 
-    private fun isSamePage(urlA: String, urlB: String): Boolean {
-        val cleanA = urlA.removeSuffix("/").substringBefore('?')
-        val cleanB = urlB.removeSuffix("/").substringBefore('?')
-        return cleanA.equals(cleanB, ignoreCase = true)
+            val canStepFurther = withContext(Dispatchers.Main) { canStep(getOrCreateWebView()) }
+            when (decideHistoryStep(
+                landedUrl = landed,
+                startUrl = startUrl,
+                settled = outcome.settled,
+                canStepFurther = canStepFurther,
+                attempts = attempts,
+                maxAttempts = MAX_HISTORY_STEPS,
+            )) {
+                HistoryStepDecision.DONE -> {
+                    awaitScrollSettle()
+                    return extractState().withLoadNote(outcome)
+                }
+                HistoryStepDecision.RETRY -> Unit // A bounce; step again.
+                HistoryStepDecision.GIVE_UP -> {
+                    awaitScrollSettle()
+                    // Still on the starting page after a step that did not
+                    // finish: say so rather than let the caller assume it moved.
+                    return if (sameDocument(landed.orEmpty(), startUrl)) {
+                        extractState().withLoadNote(
+                            outcome.copy(
+                                error = outcome.error
+                                    ?: "the history step did not move: the ${if (action == "back") "previous" else "next"} " +
+                                    "page was still loading or redirected back to '$startUrl'",
+                            ),
+                        )
+                    } else {
+                        extractState().withLoadNote(outcome)
+                    }
+                }
+            }
+        }
     }
 
     /**
@@ -836,8 +868,9 @@ class BrowserController(
     suspend fun refresh(): BrowserState {
         track("refresh", "reload")
         val before = committedPageUrl()
+        val generationBefore = loadTracker.currentGeneration
         withContext(Dispatchers.Main) { getOrCreateWebView().reload() }
-        val outcome = awaitSettle(before)
+        val outcome = awaitSettle(generationBefore, before)
         return extractState().withLoadNote(outcome)
     }
 
