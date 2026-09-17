@@ -243,6 +243,22 @@ class BrowserToolsTest {
     }
 
     @Test
+    fun `the staged promise probe tells a pending promise from a replaced document`() {
+        val probe = BrowserController.STAGED_PROMISE_PROBE_SCRIPT
+        // A settled value is returned as-is.
+        assertTrue(probe.contains("typeof window.__harnessAsync === 'string'"))
+        // Still pending in THIS document: keep polling.
+        assertTrue(probe.contains("window.__harnessAsyncActive !== true"))
+        assertTrue(probe.contains(BrowserController.PROMISE_SENTINEL))
+        // The staging marks the document, so "__harnessAsync is null" can no
+        // longer be read as "still pending" after a navigation replaced the page
+        // (which used to spin for the full 10s timeout on a click that worked).
+        val stage = BrowserController.buildEvalJs("return Promise.resolve(1)")
+        assertTrue(stage.contains("window.__harnessAsyncActive = true"))
+        assertTrue(stage.contains("window.__harnessAsyncActive = false"))
+    }
+
+    @Test
     fun `tool classes are loadable`() {
         assertTrue(BrowserNavigateTool::class.java != null)
         assertTrue(BrowserClickTool::class.java != null)

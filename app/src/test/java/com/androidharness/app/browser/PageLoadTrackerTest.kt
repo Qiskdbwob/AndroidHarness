@@ -160,6 +160,33 @@ class PageLoadTrackerTest {
         assertFalse(tracker.isLoading)
     }
 
+    /**
+     * WebView emits duplicate finishes for a single navigation. Each one used to
+     * advance the marker, so a duplicate could settle a navigation that had not
+     * happened yet and callers read the document being left behind.
+     *
+     * A late finish for an already-superseded navigation is NOT distinguished
+     * here: the URL it carries is also the URL a redirect legitimately ends on.
+     * That is why the history decision reads the WebView's own back/forward list
+     * instead of this flag.
+     */
+    @Test
+    fun `a duplicate finish does not settle the next navigation`() {
+        val tracker = PageLoadTracker()
+        tracker.onStarted()
+        tracker.onFinished(previousPage)
+        val generation = tracker.currentGeneration
+
+        // A duplicate finish for the load that just completed.
+        tracker.onFinished(previousPage)
+        tracker.onFinished(previousPage)
+        assertFalse(
+            "a duplicate finish must not settle a navigation that has not happened",
+            isSettled(tracker.snapshot(), generation, previousPage),
+        )
+        assertEquals(generation, tracker.snapshot().finishedGeneration)
+    }
+
     @Test
     fun `generations advance per navigation so a stale finish cannot settle a new one`() {
         val tracker = PageLoadTracker()

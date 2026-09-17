@@ -46,6 +46,10 @@ internal class PageLoadTracker {
     @Volatile
     private var committedUrl: String? = null
 
+    /** The URL the in-flight navigation was started for, from onPageStarted. */
+    @Volatile
+    private var startedUrl: String? = null
+
     @Volatile
     private var error: String? = null
 
@@ -73,8 +77,22 @@ internal class PageLoadTracker {
         download = null
     }
 
-    /** The main-frame document finished loading: onPageFinished. */
+/**
+     * The main-frame document finished loading: onPageFinished.
+     *
+     * Only counted while a load is in flight, so the duplicate finishes WebView
+     * emits for one navigation cannot each advance the marker and settle a
+     * navigation that has not happened.
+     *
+     * A finish belonging to an already-superseded navigation cannot be told
+     * apart from a real one here: the URL it carries is also the URL a redirect
+     * legitimately ends on, so matching on it would refuse to settle redirecting
+     * pages. Callers that must know where the browser really is therefore use
+     * the WebView's own back/forward list rather than this flag (see
+     * [HistoryStep]).
+     */
     fun onFinished(url: String?) {
+        if (!loading) return
         finishedGeneration = generation
         loading = false
         if (!url.isNullOrBlank()) committedUrl = url

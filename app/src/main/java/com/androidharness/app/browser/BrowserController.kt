@@ -807,58 +807,120 @@ class BrowserController(
         canStep: (WebView) -> Boolean,
         step: (WebView) -> Unit,
     ): BrowserState {
+        val back = action == "back"
         track(action, "history")
         awaitPendingLoad()
+
+        // The WebView's own back/forward list is the only reliable account of
+        // where a step landed: it is authoritative about the entry, whereas
+        // asking the page (or wv.url) while a navigation is still in flight
+        // reports the document being left behind. That stale read is what made
+        // every step look unmoved and retried until history ran out.
+        val start = historyPosition()
+            ?: throw IllegalStateException("The browser has no history to step through yet.")
         val canGo = withContext(Dispatchers.Main) { canStep(getOrCreateWebView()) }
         if (!canGo) {
             throw IllegalStateException(
-                if (action == "back") "No previous page in history." else "No next page in history.",
+                if (back) "No previous page in history." else "No next page in history.",
             )
         }
-
-        val startUrl = committedPageUrl().orEmpty()
+        val startUrl = start.url ?: committedPageUrl().orEmpty()
+        // A bounce steps to the entry behind the one we are on, so the target
+        // always advances by one from the CURRENT entry on each attempt.
+        var targetIndex = targetHistoryIndex(start.index, back)
         var attempts = 0
+
         while (true) {
             attempts++
+            val from = historyPosition() ?: start
+            targetIndex = targetHistoryIndex(from.index, back)
             // Baseline BEFORE the step: onPageStarted can fire before the call
             // returns, and a baseline taken afterwards would miss the very
             // navigation the step caused.
             val baseline = loadTracker.currentGeneration
             withContext(Dispatchers.Main) { step(getOrCreateWebView()) }
-            val outcome = awaitNavigation(baseline, startUrl, detectMs = 3_000, finishMs = 8_000)
-            val landed = historyLandingUrl(readDocumentProbe()?.url, currentUrl())
 
+            val reached = awaitHistoryIndex(targetIndex)
+            val position = historyPosition() ?: from
+            val outcome = awaitNavigation(baseline, startUrl, detectMs = 2_500, finishMs = 8_000)
             val canStepFurther = withContext(Dispatchers.Main) { canStep(getOrCreateWebView()) }
-            when (decideHistoryStep(
-                landedUrl = landed,
+
+            when (val decision = decideHistoryStep(
                 startUrl = startUrl,
-                settled = outcome.settled,
-                canStepFurther = canStepFurther,
+                targetIndex = targetIndex,
+                position = position,
+                reachedTarget = reached,
+                back = back,
                 attempts = attempts,
                 maxAttempts = MAX_HISTORY_STEPS,
+                canStepFurther = canStepFurther,
             )) {
-                HistoryStepDecision.DONE -> {
+                is HistoryStepOutcome.Landed -> {
                     awaitScrollSettle()
                     return extractState().withLoadNote(outcome)
                 }
-                HistoryStepDecision.RETRY -> Unit // A bounce; step again.
-                HistoryStepDecision.GIVE_UP -> {
+
+                is HistoryStepOutcome.Correct -> {
+                    // The step overshot the intended entry; walk it back so the
+                    // caller gets the page one step away, not two.
+                    awaitLandOnIndex(decision.index, back = !back)
                     awaitScrollSettle()
-                    // Still on the starting page after a step that did not
-                    // finish: say so rather than let the caller assume it moved.
-                    return if (sameDocument(landed.orEmpty(), startUrl)) {
-                        extractState().withLoadNote(
-                            outcome.copy(
-                                error = outcome.error
-                                    ?: "the history step did not move: the ${if (action == "back") "previous" else "next"} " +
-                                    "page was still loading or redirected back to '$startUrl'",
-                            ),
-                        )
-                    } else {
-                        extractState().withLoadNote(outcome)
-                    }
+                    return extractState().withLoadNote(outcome)
+                }
+
+                HistoryStepOutcome.Bounce -> Unit // Step again from the new position.
+
+                is HistoryStepOutcome.Stalled -> {
+                    awaitScrollSettle()
+                    return extractState().withLoadNote(outcome.copy(error = outcome.error ?: decision.reason))
                 }
             }
+        }
+    }
+
+    /** Where the WebView stands in its own back/forward list, or null if unavailable. */
+    private suspend fun historyPosition(): HistoryPosition? = withContext(Dispatchers.Main) {
+        runCatching {
+            val list = getOrCreateWebView().copyBackForwardList() ?: return@runCatching null
+            val index = list.currentIndex
+            HistoryPosition(
+                index = index,
+                size = list.size,
+                url = list.getItemAtIndex(index)?.url,
+            )
+        }.getOrNull()
+    }
+
+    /**
+     * Waits for the back/forward list to arrive at [index]. Returns true when
+     * the list was OBSERVED there, even if it has since moved off it: a
+     * redirecting entry is visited and then leaves again on its own, and that
+     * visit is what proves the entry was consumed. Bounded, so a step that
+     * never lands cannot hang the tool.
+     */
+    private suspend fun awaitHistoryIndex(index: Int, timeoutMs: Long = 5_000): Boolean {
+        var waited = 0L
+        var observed = false
+        while (waited < timeoutMs) {
+            if (historyPosition()?.index == index) observed = true
+            // Settled: nothing more will change within the remaining budget.
+            if (observed && !loadTracker.isLoading) return true
+            delay(POLL_MS)
+            waited += POLL_MS
+        }
+        return observed || historyPosition()?.index == index
+    }
+
+    /** Steps until [index] is the current entry, within the history-step budget. */
+    private suspend fun awaitLandOnIndex(index: Int, back: Boolean) {
+        var attempts = 0
+        while (attempts < MAX_HISTORY_STEPS && historyPosition()?.index != index) {
+            attempts++
+            withContext(Dispatchers.Main) {
+                val wv = getOrCreateWebView()
+                if (back) wv.goBack() else wv.goForward()
+            }
+            awaitHistoryIndex(index, timeoutMs = 3_000)
         }
     }
 
@@ -961,16 +1023,24 @@ class BrowserController(
         }
     }
 
+    /**
+     * Polls for the value a staged promise parked in the page.
+     *
+     * The page has to say whether the staging happened AT ALL: a promise that
+     * never settles and a page that navigated away mid-await both leave
+     * `__harnessAsync` null, and the old "null means still pending" test spun
+     * for the full timeout on the second case even though the navigation had
+     * already succeeded (on-device QA, 2026-09-17: a JS-dispatched click left
+     * browser_eval reporting "Promise did not settle within 10000ms" while
+     * browser_get_url showed the new page).
+     */
     private suspend fun awaitStagedPromise(timeoutMs: Long): BrowserEvalOutcome {
         val deadline = System.currentTimeMillis() + timeoutMs
         while (System.currentTimeMillis() < deadline) {
-            val raw = evalRaw(
-                "(function(){ try { return window.__harnessAsync == null " +
-                    "? JSON.stringify({ ok: true, value: \"$PROMISE_SENTINEL\" }) " +
-                    ": String(window.__harnessAsync); } catch (e) { return JSON.stringify({ ok: false, error: String(e) }); } })()"
-            )
+            val raw = evalRaw(STAGED_PROMISE_PROBE_SCRIPT)
             val staged = parseEvalOutcome(raw)
             if (staged.ok && staged.value != PROMISE_SENTINEL) return staged
+            if (!staged.ok) return staged
             delay(150)
         }
         return BrowserEvalOutcome(false, null, "Promise did not settle within ${timeoutMs}ms")
@@ -1435,19 +1505,43 @@ class BrowserController(
          * Page-side helper: when [v] is a thenable, park its settlement in
          * window.__harnessAsync and return the envelope string; otherwise
          * null. evaluateJavascript never awaits promises on its own.
+         *
+         * `__harnessAsyncActive` marks the parking as belonging to THIS
+         * document, so the poll can tell "the promise has not settled yet" from
+         * "the document that held it is gone".
          */
         private val STAGE_PROMISE_FN = """
             function __harnessStage(v) {
                 if (v !== undefined && v !== null && typeof v.then === 'function') {
                     window.__harnessAsync = null;
+                    window.__harnessAsyncActive = true;
                     Promise.resolve(v).then(
-                        function(pv) { window.__harnessAsync = JSON.stringify({ ok: true, value: pv === undefined ? null : pv }); },
-                        function(pe) { window.__harnessAsync = JSON.stringify({ ok: false, error: String(pe && pe.message || pe) }); }
+                        function(pv) { window.__harnessAsyncActive = false; window.__harnessAsync = JSON.stringify({ ok: true, value: pv === undefined ? null : pv }); },
+                        function(pe) { window.__harnessAsyncActive = false; window.__harnessAsync = JSON.stringify({ ok: false, error: String(pe && pe.message || pe) }); }
                     );
                     return { ok: true, value: "$PROMISE_SENTINEL" };
                 }
                 return null;
             }
+        """.trimIndent()
+
+        /**
+         * Poll script for [BrowserController.awaitStagedPromise]: the settled
+         * value once it exists, a still-pending marker while the staging is
+         * live in this document, and a clean failure when the document that
+         * started the promise is no longer the one running (README: a
+         * navigation away is not a pending promise).
+         */
+        internal val STAGED_PROMISE_PROBE_SCRIPT = """
+            (function(){
+                try {
+                    if (typeof window.__harnessAsync === 'string') return String(window.__harnessAsync);
+                    if (window.__harnessAsyncActive !== true) {
+                        return JSON.stringify({ ok: false, error: "the page navigated away before the promise settled" });
+                    }
+                    return JSON.stringify({ ok: true, value: "$PROMISE_SENTINEL" });
+                } catch (e) { return JSON.stringify({ ok: false, error: String(e) }); }
+            })();
         """.trimIndent()
 
         private val jsJson = Json { isLenient = true; ignoreUnknownKeys = true }
