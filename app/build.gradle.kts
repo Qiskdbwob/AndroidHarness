@@ -78,15 +78,21 @@ android {
     }
 }
 
-// AGP's instrumented-test tooling (the Unified Test Platform) drags in gRPC's
-// netty 4.1.93/4.1.110, both below the fixed 4.1.137. Those configurations only
-// exist to run tests on a device and never reach the APK, so lifting netty here
-// touches nothing the app ships. The whole group moves together on purpose:
-// mixing 4.1.x netty modules across a version boundary breaks at runtime.
+// AGP's own tooling drags in old copies of libraries we never ship. The Unified
+// Test Platform pulls gRPC's netty 4.1.93/4.1.110, and the lint tool carries
+// AGP's crypto, HTTP and XML jars. All of these configurations exist to run the
+// build or tests, never to build the APK, so lifting them here touches nothing
+// the app ships. Each group moves together on purpose: mixing 4.1.x netty
+// modules across a version boundary breaks at runtime.
 configurations.configureEach {
-    if (name.startsWith("unified-test-platform")) {
+    if (name.startsWith("unified-test-platform") || name == "androidLintTool") {
         resolutionStrategy.eachDependency {
-            if (requested.group == "io.netty") useVersion("4.1.137.Final")
+            when {
+                requested.group == "io.netty" -> useVersion("4.1.137.Final")
+                requested.group == "org.bouncycastle" -> useVersion("1.84")
+                requested.name == "httpclient" -> useVersion("4.5.14")
+                requested.name == "commons-lang3" -> useVersion("3.18.0")
+            }
         }
     }
 }

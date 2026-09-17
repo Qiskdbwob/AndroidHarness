@@ -1,11 +1,19 @@
 buildscript {
     dependencies {
         constraints {
-            // AGP uses these together for build-time crypto; keep them off the app classpath.
-            listOf("bcprov", "bcpkix", "bcutil").forEach { artifact ->
-                add("classpath", "org.bouncycastle:${artifact}-jdk18on:1.80.2") {
-                    because("CVE-2025-14813 security backport")
-                }
+            // Everything AGP pulls in for its own tooling: crypto for apksig,
+            // HTTP for the SDK loader, XML for proguard, and the rest. None of
+            // it reaches the app, so lifting these touches no shipped code.
+            listOf(
+                "org.bouncycastle:bcprov-jdk18on:1.84" to "CVE-2025-14813, CVE-2026-5588 and CVE-2026-5598",
+                "org.bouncycastle:bcpkix-jdk18on:1.84" to "CVE-2026-5588",
+                "org.bouncycastle:bcutil-jdk18on:1.84" to "CVE-2025-14813",
+                "org.jdom:jdom2:2.0.6.1" to "CVE-2021-33813",
+                "org.bitbucket.b_c:jose4j:0.9.6" to "CVE-2024-29371",
+                "org.apache.httpcomponents:httpclient:4.5.14" to "CVE-2020-13956",
+                "org.apache.commons:commons-lang3:3.18.0" to "CVE-2025-48924",
+            ).forEach { (gav, cve) ->
+                add("classpath", gav) { because(cve) }
             }
         }
     }
