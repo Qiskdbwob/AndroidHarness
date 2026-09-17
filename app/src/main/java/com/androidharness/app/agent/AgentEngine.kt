@@ -656,6 +656,15 @@ class AgentEngine(
         return result
     }
 
+    /**
+     * Every tool result crosses this before it can reach the model, the chat DB
+     * or the screen. The environment-repair path below re-runs a tool outside
+     * the normal flow, so it has to go through here too rather than handing the
+     * raw output back.
+     */
+    private fun ToolResult.redacted(): ToolResult =
+        copy(output = com.androidharness.app.tools.SecretRedactor.redact(output))
+
     private suspend fun performWithPermission(
         call: ToolCallData,
         mode: PermissionMode,
@@ -897,11 +906,11 @@ class AgentEngine(
         val startedAt = System.currentTimeMillis()
         val executed = try {
             val raw = tool.execute(args, ToolContext(workspace, mode == PermissionMode.FULL_ACCESS, sessionId))
-            raw.copy(output = com.androidharness.app.tools.SecretRedactor.redact(raw.output))
+            raw.redacted()
         } catch (ce: CancellationException) {
             throw ce
         } catch (e: Exception) {
-            ToolResult(false, e.message ?: "${call.name} failed")
+            ToolResult(false, e.message ?: "${call.name} failed").redacted()
         }
 
         // Broken-environment repair: a headline tool died with "not found"
@@ -931,10 +940,11 @@ class AgentEngine(
                     } catch (ce: CancellationException) {
                         throw ce
                     } catch (e: Exception) {
-                        ToolResult(false, e.message ?: "${call.name} failed again after repair")
+                        ToolResult(false, e.message ?: "${call.name} failed again after repair").redacted()
                     }
-                    return retry.copy(
-                        output = "[Linux environment repaired: $missingTool is now installed]\n" + retry.output,
+                    val scrubbed = retry.redacted()
+                    return scrubbed.copy(
+                        output = "[Linux environment repaired: $missingTool is now installed]\n" + scrubbed.output,
                     )
                 }
                 return executed.copy(
@@ -1269,11 +1279,11 @@ class AgentEngine(
                     val executed = try {
                         val args = json.parseToJsonElement(call.argumentsJson).jsonObject
                         val raw = tool.execute(args, ctx)
-                        raw.copy(output = com.androidharness.app.tools.SecretRedactor.redact(raw.output))
+                        raw.redacted()
                     } catch (ce: CancellationException) {
                         throw ce
                     } catch (e: Exception) {
-                        ToolResult(false, e.message ?: "${call.name} failed")
+                        ToolResult(false, e.message ?: "${call.name} failed").redacted()
                     }
                     val elapsedMs = System.currentTimeMillis() - subStartedAt
                     if (executed.output.length < 100_000) {
