@@ -19,6 +19,28 @@ class WebFetchHtmlTest {
         assertFalse("Markup must be gone, got: $text", text.contains("<"))
         assertTrue(text.contains("NEXT_731"))
         assertTrue(text.contains("Next 731"))
+        // Block boundaries keep their own lines instead of running the page
+        // together ("Next 731HomeNEXT_731"). Inline <a> stays in the flow.
+        assertEquals("Next 731\nHome\nNEXT_731", text)
+    }
+
+    @Test
+    fun `block elements break lines while inline elements do not`() {
+        val body = "<div>one</div><div>two</div><span>inline</span><b>bold</b>"
+        assertEquals("one\ntwo\ninlinebold", htmlToText(body, "html"))
+
+        // List and table structure survives as lines, attributes are dropped.
+        val list = """<ul><li>alpha</li><li class="x">beta</li></ul>"""
+        assertEquals("alpha\nbeta", htmlToText(list, "html"))
+
+        val row = "<table><tr><td>a</td><td>b</td></tr></table>"
+        assertEquals("a\nb", htmlToText(row, "html"))
+
+        // Runs of spaces and tabs collapse, and a blank line between elements
+        // collapses to one newline rather than padding the output.
+        val loose = "<p>  spaced   out  </p>\n\n\n<p></p><p></p><p>next</p>"
+        val looseText = htmlToText(loose, "html")
+        assertEquals("spaced out\nnext", looseText)
     }
 
     @Test

@@ -267,15 +267,38 @@ internal fun htmlToText(raw: String, contentTypeSubtype: String? = null): String
         .replace(Regex("(?s)<style.*?</style>"), " ")
         .replace(Regex("(?s)<!--.*?-->"), " ")
         .replace(Regex("<br\\s*/?>"), "\n")
-        .replace(Regex("</(p|div|h[1-6]|li|tr)>"), "\n")
+        // Block-level boundaries become line breaks, on BOTH sides of the tag.
+        // Dropping tags with no separator ran the whole page together, so a
+        // doctype-less fixture came back as "Next 731HomeNEXT_731" (retest,
+        // 2026-09-17). Inline elements (a, span, b, code, img…) still vanish
+        // without breaking the run of text, which is what a browser does.
+        .replace(BLOCK_BOUNDARY, "\n")
         .replace(Regex("<[^>]+>"), "")
         .replace(Regex("&nbsp;"), " ")
         .replace(Regex("&amp;"), "&")
         .replace(Regex("&lt;"), "<")
         .replace(Regex("&gt;"), ">")
-        .replace(Regex("\\n{3,}"), "\n\n")
+        .replace(Regex("[ \\t\\u00a0]+"), " ")
+        .replace(Regex(" ?\\n ?"), "\n")
+        // Adjacent boundaries (</div><div>) and any blank line the source had
+        // collapse to ONE newline: the point is that terms stop running
+        // together, not to reproduce the page's vertical spacing, and blank
+        // lines between every element would just cost tokens.
+        .replace(Regex("\\n+"), "\n")
         .trim()
 }
+
+/**
+ * Elements that render as their own block, so a line break belongs on each
+ * side of them. This is what `innerText` would show; the list covers the
+ * structural, list, table, heading and text-block elements.
+ */
+private const val BLOCK_TAGS =
+    "address|article|aside|blockquote|dd|div|dl|dt|fieldset|figcaption|figure|footer|form|" +
+        "h[1-6]|header|hr|li|main|nav|ol|p|pre|section|table|tbody|td|tfoot|th|thead|title|tr|ul"
+
+/** Opening or closing tag of any [BLOCK_TAGS] element, with its attributes. */
+private val BLOCK_BOUNDARY = Regex("(?i)</?(?:$BLOCK_TAGS)\\b[^>]*>")
 
 /** Whether [raw] is HTML, by response media subtype first and body shape second. */
 internal fun looksLikeHtml(raw: String, contentTypeSubtype: String? = null): Boolean {

@@ -25,7 +25,7 @@ import java.io.File
 internal object CodeGraphBundlePatches {
 
     /** Bumped whenever [patches] changes, so an install can tell old from new. */
-    const val VERSION = 11
+    const val VERSION = 12
 
     /** Paths (relative to `lib/dist`) that [patches] may rewrite. */
     internal val patchedFiles = listOf(
@@ -503,6 +503,148 @@ internal object CodeGraphBundlePatches {
         "            continue;",
         "        let modulePath;",
         "        if (imp.isNamespace || imp.isDefault || imp.source === ref.referenceName) {",
+    )
+
+    // ------------------------------------------------------------------
+    // resolution/import-resolver.js: CommonJS callers
+    //
+    // `const b = require('./b'); b.wobble(x)` produced NO caller edge at all,
+    // so impact for `wobble` listed only its own file and an agent asking "what
+    // breaks if I change this" got an empty answer for every CommonJS module
+    // (on-device QA, 2026-09-17). Two upstream gaps stack up:
+    //
+    //  1. extractJSImports maps a `require` binding as the module's DEFAULT
+    //     export, so resolveViaImport asks for a symbol named `default` and
+    //     never treats `b` as a namespace to take a member from. `require()`
+    //     returns the module object, so the binding is a namespace.
+    //  2. Even as a namespace, the member lookup searches
+    //     getFileExportIndex().byName, which only holds isExported symbols.
+    //     This extractor does not translate `module.exports = { wobble }` into
+    //     isExported, so every symbol in a CommonJS file is invisible to it.
+    //
+    // The second gap is fixed by indexing the property names the module
+    // ACTUALLY exports. Indexing every symbol in the file also resolves the
+    // reported case, but it invents a caller for a local helper that was never
+    // exported (verified: `b.internal(x)` linked to an unexported `internal`),
+    // and a wrong caller is worse than a missing one.
+    // ------------------------------------------------------------------
+
+    private val cjsRequireNamespaceAnchor = lines(
+        "        if (defaultName) {",
+        "            mappings.push({",
+        "                localName: defaultName,",
+        "                exportedName: 'default',",
+        "                source: source,",
+        "                isDefault: true,",
+        "                isNamespace: false,",
+        "            });",
+        "        }",
+    )
+
+    private val cjsRequireNamespaceReplacement = lines(
+        "        if (defaultName) {",
+        "            mappings.push({",
+        "                localName: defaultName,",
+        "                exportedName: 'default',",
+        "                source: source,",
+        "                isDefault: true,",
+        "                isNamespace: false,",
+        "            });",
+        "            // Harness patch: `require()` returns the MODULE OBJECT, so the",
+        "            // binding is also a namespace. With only the default mapping",
+        "            // above, `b.wobble()` asked for a symbol named `default` and",
+        "            // went unresolved, which is why every CommonJS caller was",
+        "            // missing from impact.",
+        "            mappings.push({",
+        "                localName: defaultName,",
+        "                exportedName: '*',",
+        "                source: source,",
+        "                isDefault: false,",
+        "                isNamespace: true,",
+        "            });",
+        "        }",
+    )
+
+    private val cjsExportIndexAnchor = lines(
+        "        idx = { byName: new Map(), defaultComponent: undefined, defaultFnClass: undefined };",
+        "        for (const n of context.getNodesInFile(filePath)) {",
+        "            if (!n.isExported)",
+        "                continue;",
+        "            if (!idx.byName.has(n.name))",
+        "                idx.byName.set(n.name, n);",
+        "            if (idx.defaultComponent === undefined && n.kind === 'component')",
+        "                idx.defaultComponent = n;",
+        "            if (idx.defaultFnClass === undefined && (n.kind === 'function' || n.kind === 'class'))",
+        "                idx.defaultFnClass = n;",
+        "        }",
+        "        perFile.set(filePath, idx);",
+    )
+
+    private val cjsExportIndexReplacement = lines(
+        "        idx = { byName: new Map(), defaultComponent: undefined, defaultFnClass: undefined, cjsByName: null };",
+        "        for (const n of context.getNodesInFile(filePath)) {",
+        "            if (!n.isExported)",
+        "                continue;",
+        "            if (!idx.byName.has(n.name))",
+        "                idx.byName.set(n.name, n);",
+        "            if (idx.defaultComponent === undefined && n.kind === 'component')",
+        "                idx.defaultComponent = n;",
+        "            if (idx.defaultFnClass === undefined && (n.kind === 'function' || n.kind === 'class'))",
+        "                idx.defaultFnClass = n;",
+        "        }",
+        "        // Harness patch: CommonJS declares its exports in code and this",
+        "        // extractor does not turn `module.exports = { x }` into isExported,",
+        "        // so a namespace member lookup found nothing. Index only the",
+        "        // property names the module actually exports: indexing every symbol",
+        "        // in the file also finds the caller, but invents one for a local",
+        "        // helper that was never exported, and a wrong caller is worse than",
+        "        // a missing one.",
+        "        const cjsSource = context.readFile?.(filePath);",
+        "        if (cjsSource && /\\bmodule\\.exports\\b|\\bexports\\.[A-Za-z_\$]/.test(cjsSource)) {",
+        "            const localNodes = new Map();",
+        "            for (const n of context.getNodesInFile(filePath)) {",
+        "                if (!localNodes.has(n.name))",
+        "                    localNodes.set(n.name, n);",
+        "            }",
+        "            const exported = new Map();",
+        "            const objectExport = cjsSource.match(/module\\.exports\\s*=\\s*\\{([^}]*)\\}/);",
+        "            if (objectExport) {",
+        "                for (const part of objectExport[1].split(',')) {",
+        "                    const m = part.trim().match(/^([A-Za-z_\$][\\w\$]*)\\s*(?::\\s*([A-Za-z_\$][\\w\$]*))?\$/);",
+        "                    if (m)",
+        "                        exported.set(m[1], m[2] ?? m[1]);",
+        "                }",
+        "            }",
+        "            for (const m of cjsSource.matchAll(/(?:^|[;\\n])\\s*(?:module\\.)?exports\\.([A-Za-z_\$][\\w\$]*)\\s*=/g)) {",
+        "                exported.set(m[1], m[1]);",
+        "            }",
+        "            idx.cjsByName = new Map();",
+        "            for (const [property, symbol] of exported) {",
+        "                const node = localNodes.get(symbol);",
+        "                if (node)",
+        "                    idx.cjsByName.set(property, node);",
+        "            }",
+        "        }",
+        "        perFile.set(filePath, idx);",
+    )
+
+    private val cjsNamespaceLookupAnchor = lines(
+        "    else if (want.isNamespace && want.memberName) {",
+        "        const direct = exportIndex.byName.get(want.memberName);",
+        "        if (direct)",
+        "            return direct;",
+        "    }",
+    )
+
+    private val cjsNamespaceLookupReplacement = lines(
+        "    else if (want.isNamespace && want.memberName) {",
+        "        // Harness patch: a CommonJS member lives in cjsByName (its exports",
+        "        // are declared in code, not as isExported symbols).",
+        "        const direct = exportIndex.byName.get(want.memberName) ??",
+        "            exportIndex.cjsByName?.get(want.memberName);",
+        "        if (direct)",
+        "            return direct;",
+        "    }",
     )
 
     private val pythonModuleImportAnchor = lines(
@@ -1372,6 +1514,9 @@ internal object CodeGraphBundlePatches {
         createEdgesRepair,
         createEdgesWrapper,
         Patch("resolution/import-resolver.js", resolveModuleImportAnchor, resolveModuleImportReplacement),
+        Patch("resolution/import-resolver.js", cjsRequireNamespaceAnchor, cjsRequireNamespaceReplacement),
+        Patch("resolution/import-resolver.js", cjsExportIndexAnchor, cjsExportIndexReplacement),
+        Patch("resolution/import-resolver.js", cjsNamespaceLookupAnchor, cjsNamespaceLookupReplacement),
         Patch("resolution/import-resolver.js", pythonModuleImportAnchor, pythonModuleImportReplacement),
         Patch(
             "extraction/tree-sitter.js", importHookNodeAnchor, importHookNodeReplacement,
