@@ -253,6 +253,30 @@ internal fun gitSystemConfigEnvOf(
 }
 
 /**
+ * git's system GITATTRIBUTES scope, the sibling of [gitSystemConfigEnvOf] and
+ * the same re-rooting problem: the bundled Termux-built git resolves the
+ * attributes file next to the system config, and an unreadable one costs three
+ * to five stderr lines on EVERY git tool call:
+ *   warning: unable to access '…/etc/gitattributes': Permission denied
+ * (on-device QA, 2026-09-17; the system config's fatal twin was fixed earlier
+ * by naming a readable file explicitly).
+ *
+ * git has no equivalent of GIT_CONFIG_SYSTEM for attributes, so a file that
+ * cannot be read is switched off instead with GIT_ATTR_NOSYSTEM, the attributes
+ * twin of GIT_CONFIG_NOSYSTEM (git_attr_system_is_enabled() in git's attr.c).
+ * Nothing in the harness reads system attributes, and a readable file is left
+ * exactly as it is.
+ */
+internal fun gitSystemAttributesEnvOf(
+    termuxSystemAttributes: File,
+    systemAttributes: File,
+): Map<String, String> {
+    val candidate = if (termuxSystemAttributes.isFile) termuxSystemAttributes else systemAttributes
+    return if (candidate.isFile && candidate.canRead()) emptyMap()
+    else mapOf("GIT_ATTR_NOSYSTEM" to "1")
+}
+
+/**
  * Installs a self-contained Linux userspace (bash, coreutils, git, python,
  * node…) into the app's private storage, sourced from the public Termux
  * package repository. No root, no external app required.
@@ -789,6 +813,9 @@ class LinuxEnvironmentManager(
         // Bug fix: the Termux-built git also reads a SYSTEM config from its old
         // prefix, where reading is denied and git exits 128 before running.
         putAll(gitSystemConfigEnv())
+        // Same re-rooting, non-fatal version: an unreadable system
+        // gitattributes file only prints a warning on every git call.
+        putAll(gitSystemAttributesEnv())
         // bash sources this for `bash -c`: shims make every toolchain binary
         // runnable despite the W^X exec restriction on app-private files.
         if (shimFile.exists()) put("BASH_ENV", shimFile.absolutePath)
@@ -915,6 +942,12 @@ class LinuxEnvironmentManager(
     fun gitSystemConfigEnv(): Map<String, String> = gitSystemConfigEnvOf(
         termuxSystemConfig = File(TERMUX_SYSTEM_GITCONFIG),
         systemConfig = File(SYSTEM_GITCONFIG),
+    )
+
+    /** System gitattributes scope; see [gitSystemAttributesEnvOf]. */
+    fun gitSystemAttributesEnv(): Map<String, String> = gitSystemAttributesEnvOf(
+        termuxSystemAttributes = File(TERMUX_SYSTEM_GITATTRIBUTES),
+        systemAttributes = File(SYSTEM_GITATTRIBUTES),
     )
 
     /** Re-writes the toolchain copies of the GitHub auth state. Idempotent. */
@@ -1118,6 +1151,8 @@ class LinuxEnvironmentManager(
         // same way (the deployed copy is staged from this tree), and the
         // app uid cannot stat inside the 0700 deployed prefix to re-probe.
         putAll(gitSystemConfigEnv())
+        // Same warning-only fix for the system gitattributes scope.
+        putAll(gitSystemAttributesEnv())
         // Bug 1 fix: the deployed copy carries its own CA bundle; export the
         // standard TLS vars so curl/python/git/node verify certificates.
         // Same derivation rule: stageForShell ships the staged bundle (from
@@ -1653,6 +1688,11 @@ class LinuxEnvironmentManager(
 
         /** Standard system config location, for a git that is not Termux-built. */
         internal const val SYSTEM_GITCONFIG = "/etc/gitconfig"
+
+        /** git's system-wide attributes file, next to the system config. */
+        internal const val TERMUX_SYSTEM_GITATTRIBUTES = "/data/data/com.termux/files/usr/etc/gitattributes"
+
+        internal const val SYSTEM_GITATTRIBUTES = "/etc/gitattributes"
 
         /** Parent directory of the shell-tier copies, one per installed build. */
         const val TMP_ROOT = "/data/local/tmp/androidharness"

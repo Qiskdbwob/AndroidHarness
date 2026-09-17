@@ -81,4 +81,51 @@ class GitConfigEnvTest {
         )
         assertEquals("1", env["GIT_CONFIG_NOSYSTEM"])
     }
+
+    /**
+     * The same re-rooting, non-fatal version: an unreadable system gitattributes
+     * file does not stop git, it just prints
+     *   warning: unable to access '…/etc/gitattributes': Permission denied
+     * on every single invocation (3-5 stderr lines per git tool call, on-device
+     * QA 2026-09-17). git has no GIT_ATTR_SYSTEM to name a readable file with,
+     * so the scope is switched off by GIT_ATTR_NOSYSTEM instead.
+     */
+    @Test
+    fun `an unreadable system gitattributes turns the attributes scope off`() {
+        val attrs = tmp.newFile("termux-gitattributes")
+        attrs.writeText("*.png binary\n")
+        assertTrue(attrs.setReadable(false, false))
+        assumeTrue(!attrs.canRead())
+
+        val env = gitSystemAttributesEnvOf(
+            termuxSystemAttributes = attrs,
+            systemAttributes = tmp.newFile("etc-gitattributes"),
+        )
+        assertEquals("1", env["GIT_ATTR_NOSYSTEM"])
+    }
+
+    @Test
+    fun `a readable system gitattributes is left in place`() {
+        val attrs = tmp.newFile("termux-gitattributes")
+        attrs.writeText("*.png binary\n")
+
+        val env = gitSystemAttributesEnvOf(
+            termuxSystemAttributes = attrs,
+            systemAttributes = tmp.newFile("etc-gitattributes"),
+        )
+        // No GIT_ATTR_NOSYSTEM: git reads the file it was built to read.
+        assertFalse(env.containsKey("GIT_ATTR_NOSYSTEM"))
+    }
+
+    @Test
+    fun `a missing system gitattributes turns the attributes scope off`() {
+        // Nothing to read either way, and no way for git to know that: the
+        // scope is closed so a Termux-built git cannot walk into the old
+        // prefix and warn about it.
+        val env = gitSystemAttributesEnvOf(
+            termuxSystemAttributes = tmp.root.resolve("absent-termux-attributes"),
+            systemAttributes = tmp.root.resolve("absent-etc-attributes"),
+        )
+        assertEquals("1", env["GIT_ATTR_NOSYSTEM"])
+    }
 }

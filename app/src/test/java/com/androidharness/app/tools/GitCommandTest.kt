@@ -17,15 +17,19 @@ class GitCommandTest {
     @get:org.junit.Rule
     val tmp = org.junit.rules.TemporaryFolder()
 
-    private fun shell(command: String): Pair<Int, String> {
-        val process = ProcessBuilder("bash", "-c", command).directory(tmp.root)
+    private fun shell(command: String): Pair<Int, String> = shellIn(tmp.root, command)
+
+    private fun shellIn(dir: java.io.File, command: String): Pair<Int, String> {
+        val process = ProcessBuilder("bash", "-c", command).directory(dir)
             .redirectErrorStream(true).start()
         val output = process.inputStream.bufferedReader().readText()
         return process.waitFor() to output
     }
 
-    private fun success(command: String): String {
-        val (code, output) = shell(command)
+    private fun success(command: String): String = successIn(tmp.root, command)
+
+    private fun successIn(dir: java.io.File, command: String): String {
+        val (code, output) = shellIn(dir, command)
         assertEquals(output, 0, code)
         return output
     }
@@ -52,6 +56,62 @@ class GitCommandTest {
         tmp.root.resolve(".harness/private.txt").writeText("private")
         success(gitCommitCmd("initial"))
         assertEquals("file.txt", success(gitCmd("ls-files")).trim())
+    }
+
+    /**
+     * The workspace is not always the repository root. `.harness/` lives in the
+     * WORKSPACE, and the old `:(top).harness` pattern was anchored at the repo
+     * root, so a workspace one level down staged every runtime artifact anyway:
+     * on-device QA (2026-09-17) committed 16 screenshots and background logs in
+     * one git_commit while the tool promised it never would.
+     */
+    @Test
+    fun `runtime artifacts stay out when the workspace is a subdirectory of the repo`() {
+        success(gitCmd("init", "config user.name Test", "config user.email test@example.com"))
+        val workspace = tmp.root.resolve("ws").apply { mkdirs() }
+        workspace.resolve("file.txt").writeText("first")
+        val artifacts = listOf(
+            workspace.resolve(".harness/screenshots/20260917_120000.jpg"),
+            workspace.resolve(".harness/background/build.log"),
+            workspace.resolve("nested/deep/.harness/scratch.jpg"),
+        )
+        for (artifact in artifacts) {
+            artifact.parentFile?.mkdirs()
+            artifact.writeText("runtime")
+        }
+        successIn(workspace, gitCommitCmd("first"))
+
+        // ls-files reports paths relative to the directory git ran in, which is
+        // the workspace, not the repository root.
+        val tracked = successIn(workspace, gitCmd("ls-files"))
+        assertTrue(tracked, tracked.contains("file.txt"))
+        assertFalse(tracked, tracked.contains(".harness"))
+        // Deleted from the index, never from disk: these are live artifacts.
+        assertTrue(artifacts.all { it.exists() })
+    }
+
+    /**
+     * An artifact an older build already tracked has to leave the index too, or
+     * the next commit silently carries it forward.
+     */
+    @Test
+    fun `a previously tracked artifact is dropped from the index`() {
+        success(gitCmd("init", "config user.name Test", "config user.email test@example.com"))
+        val workspace = tmp.root.resolve("ws").apply { mkdirs() }
+        workspace.resolve("keep.txt").writeText("keep")
+        val artifact = workspace.resolve(".harness/screenshots/old.jpg").apply {
+            parentFile?.mkdirs()
+            writeText("runtime")
+        }
+        // Commit it the way the old recipe would have: staged anyway.
+        successIn(workspace, gitCmd("add -A -- '.harness'"))
+        successIn(workspace, gitCmd("commit -m 'stale runtime commit'"))
+        assertTrue(successIn(workspace, gitCmd("ls-files")).contains(".harness/screenshots/old.jpg"))
+
+        successIn(workspace, gitCommitCmd("drop runtime artifacts"))
+
+        assertFalse(successIn(workspace, gitCmd("ls-files")).contains(".harness"))
+        assertTrue(artifact.exists())
     }
 
     @Test
@@ -103,6 +163,29 @@ class GitCommandTest {
         val parts = cmd.split(" && ")
         assertEquals(2, parts.size)
         assertTrue(parts.all { it.startsWith("$base ") })
+    }
+
+    /**
+     * The exclusion is anchored to the WORKSPACE, not to the repository root,
+     * and it survives an older git letting an all-exclude pathspec through: the
+     * runtime paths are dropped from the index again right before the commit.
+     */
+    @Test
+    fun `gitCommitCmd excludes runtime artifacts at any depth and re-checks the index`() {
+        val cmd = gitCommitCmd("msg")
+        val steps = cmd.split(" && ")
+        assertEquals(4, steps.size)
+        assertTrue(steps.all { it.startsWith("$base ") })
+        assertEquals(2, steps.count { it.contains("rm -r --cached --ignore-unmatch") })
+        assertTrue(cmd.contains("':(exclude,glob)**/.harness'"))
+        assertTrue(cmd.contains("':(exclude,glob)**/.harness/**'"))
+        // No :(top) anywhere: that anchored the pattern at the repo root and let
+        // a workspace one level down stage everything.
+        assertFalse(cmd.contains(":(top"))
+        // The unstage step runs AFTER the add, not only before it.
+        assertTrue(steps[1].contains("add -A"))
+        assertTrue(steps[2].contains("rm -r --cached"))
+        assertTrue(steps[3].contains("commit -m"))
     }
 
     @Test

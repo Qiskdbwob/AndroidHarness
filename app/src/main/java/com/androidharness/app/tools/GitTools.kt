@@ -32,12 +32,35 @@ private const val GIT_BASE_ARGS = "-c 'safe.directory=*' -c gc.auto=0 -c mainten
 internal fun gitCmd(vararg steps: String): String =
     steps.joinToString(" && ") { "git $GIT_BASE_ARGS ${it.trim()}" }
 
-/** Runtime directory whose artifacts must never be swept into a commit. */
+/**
+ * Runtime directory whose artifacts must never be swept into a commit.
+ *
+ * Matched at ANY depth on purpose. The artifacts live in the WORKSPACE, and the
+ * workspace is not always the repository root: the old `:(top).harness` pattern
+ * is anchored at the repo root, so a workspace one level down kept every
+ * screenshot and background log out of the exclusion and into the commit
+ * (on-device QA, 2026-09-17: 16 runtime files committed in one `git_commit`,
+ * despite the tool promising they never are).
+ */
 private const val HARNESS_DIR = ".harness"
 
+/** `:(glob)**` magic, because a plain pathspec's `*` stops at a path separator. */
+private const val HARNESS_DIR_GLOB = ":(glob)**/$HARNESS_DIR"
+private const val HARNESS_TREE_GLOB = ":(glob)**/$HARNESS_DIR/**"
+
+/** Exclusions for `add`: the same two paths, with the exclude magic added. */
+private const val HARNESS_DIR_EXCLUDE = ":(exclude,glob)**/$HARNESS_DIR"
+private const val HARNESS_TREE_EXCLUDE = ":(exclude,glob)**/$HARNESS_DIR/**"
+
 internal fun gitCommitCmd(message: String): String = gitCmd(
-    "rm -r --cached --ignore-unmatch ${":(top)$HARNESS_DIR".shellQuote()}",
-    "add -A -- ${":(top,exclude)$HARNESS_DIR".shellQuote()} ${":(top,exclude)$HARNESS_DIR/**".shellQuote()}",
+    "rm -r --cached --ignore-unmatch ${HARNESS_DIR_GLOB.shellQuote()} ${HARNESS_TREE_GLOB.shellQuote()}",
+    "add -A -- ${HARNESS_DIR_EXCLUDE.shellQuote()} ${HARNESS_TREE_EXCLUDE.shellQuote()}",
+    // Belt and braces: whatever an older git's all-exclude pathspec lets through
+    // is dropped from the index again before the commit, so the guarantee does
+    // not rest on pathspec semantics alone. Artifacts tracked by an earlier
+    // build are staged as deletions here, which is the self-heal the first step
+    // is for.
+    "rm -r --cached --ignore-unmatch ${HARNESS_DIR_GLOB.shellQuote()} ${HARNESS_TREE_GLOB.shellQuote()}",
     "commit -m ${message.shellQuote()}",
 )
 

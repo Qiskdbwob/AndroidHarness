@@ -65,7 +65,10 @@ class BrowserNavigateTool(
         "or a workspace-relative local file (e.g. 'index.html', 'docs/about.html'). Local files are served under " +
         "https://harness.workspace/ws/... via request interception, so relative links, form submits, assets, and " +
         "back/forward history behave like a real site. Returns page title, URL, scroll position, text excerpt, " +
-        "and an indexed catalog of interactive elements ([id]) for clicking and typing."
+        "and an indexed catalog of interactive elements ([id]) for clicking and typing. The call fails, rather " +
+        "than reporting the previous page, when the target produces no page at all (a download or attachment " +
+        "response, or a scheme the WebView refuses to render), and says so when a slow page has not finished " +
+        "loading yet."
     override val parametersSchema = Schema.obj(
         mapOf(
             "url" to Schema.string("The target URL (e.g. 'https://example.com', 'http://localhost:5173', or 'index.html')."),
