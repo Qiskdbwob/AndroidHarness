@@ -174,11 +174,16 @@ class DoctorTool(
             return
         }
         val script = buildString {
-            append("sp=\"\$(git var GIT_SHELL_PATH 2>/dev/null)\"; ")
-            append("case \"\$sp\" in ")
-            append("\"\") echo 'shell-path=FAIL (git var GIT_SHELL_PATH empty; git >= 2.30 required)' ;; ")
-            append("*) if [ -x \"\$sp\" ]; then echo \"shell-path=OK \$sp\"; ")
-            append("else echo \"shell-path=DEAD \$sp is not executable\"; fi ;; esac; ")
+            // stderr is captured rather than discarded: git dies on an
+            // unreadable config file BEFORE producing any output, and
+            // `2>/dev/null` turned that fatal into an empty string, so the
+            // probe reported a healthy-looking "did not run" while every
+            // git command was failing (on-device QA, 2026-09-17).
+            append("o=\"\$(git var GIT_SHELL_PATH 2>&1)\"; ec=\$?; ")
+            append("o=\"\$(printf '%s' \"\$o\" | head -n 1)\"; ")
+            append("if [ \"\$ec\" -ne 0 ]; then echo \"config-err=\$o\"; ")
+            append("elif [ -x \"\$o\" ]; then echo \"shell-path=OK \$o\"; ")
+            append("else echo \"shell-path=DEAD \$o is not executable\"; fi; ")
             append("io=\"\$(git config --global --get-regexp '^url\\..*insteadof\$' 2>/dev/null)\"; ")
             append("if [ -n \"\$io\" ]; then echo 'instead-of=OK'; else echo 'instead-of=ABSENT'; fi")
         }
@@ -186,7 +191,18 @@ class DoctorTool(
         val out = res?.rawOutput.orEmpty()
         val shellLine = out.lineSequence().firstOrNull { it.startsWith("shell-path=") }
         val insteadLine = out.lineSequence().firstOrNull { it.startsWith("instead-of=") }
+        val configErrLine = out.lineSequence().firstOrNull { it.startsWith("config-err=") }
         when {
+            // git itself cannot start: config, or a broken binary. This is the
+            // only state in which NO git command in this tier can work, so it
+            // must never be reported as a warning next to healthy ones.
+            configErrLine != null -> {
+                val detail = configErrLine.removePrefix("config-err=").ifBlank { "(no output; git may be misinstalled)" }
+                lines += "[fail] git config: git cannot run in this tier: " + detail +
+                    " (an inaccessible config file aborts git before any subcommand runs)"
+                lines += "[warn] git transport: not probed, git does not start"
+                return
+            }
             shellLine == null ->
                 lines += "[warn] git transport: probe did not run (exit " +
                     "${res?.exitCode ?: -1})${res?.rawStderr?.takeIf { it.isNotBlank() }?.let { ": $it" } ?: ""}"

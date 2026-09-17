@@ -240,31 +240,60 @@ class WebFetchTool(
                         return@withContext ToolResult(true, "[binary content: application/octet-stream, ${bytes.size} bytes]")
                     }
                     val raw = bytes.toString(mediaType?.charset() ?: Charsets.UTF_8)
-                    ToolResult(true, htmlToText(raw).take(20_000))
+                    ToolResult(true, htmlToText(raw, mediaType?.subtype).take(20_000))
                 }
             } catch (e: Exception) {
                 ToolResult(false, "Fetch failed: ${e.message}")
             }
         }
+}
 
-    private fun htmlToText(raw: String): String {
-        if (!raw.contains("<html", ignoreCase = true) && !raw.contains("<body", ignoreCase = true)) {
-            return raw
-        }
-        return raw
-            .replace(Regex("(?s)<script.*?</script>"), " ")
-            .replace(Regex("(?s)<style.*?</style>"), " ")
-            .replace(Regex("(?s)<!--.*?-->"), " ")
-            .replace(Regex("<br\\s*/?>"), "\n")
-            .replace(Regex("</(p|div|h[1-6]|li|tr)>"), "\n")
-            .replace(Regex("<[^>]+>"), "")
-            .replace(Regex("&nbsp;"), " ")
-            .replace(Regex("&amp;"), "&")
-            .replace(Regex("&lt;"), "<")
-            .replace(Regex("&gt;"), ">")
-            .replace(Regex("\\n{3,}"), "\n\n")
-            .trim()
+/**
+ * Strips HTML into readable text.
+ *
+ * The trigger used to be "does the body contain <html or <body", which every
+ * fragment-only document slips past: the served fixture
+ * `<!doctype html><title>Next 731</title><a href="/">Home</a><p>NEXT_731</p>`
+ * came back as raw markup even though the response was text/html (on-device
+ * QA, 2026-09-17). Detection now also accepts the response's own content type,
+ * an HTML doctype, and — when the response carries no content type at all — a
+ * body that opens with an opening tag. Text that merely mentions HTML stays
+ * untouched, and so do JSON, plain text and XML documents such as SVG.
+ */
+internal fun htmlToText(raw: String, contentTypeSubtype: String? = null): String {
+    if (!looksLikeHtml(raw, contentTypeSubtype)) return raw
+    return raw
+        .replace(Regex("(?s)<script.*?</script>"), " ")
+        .replace(Regex("(?s)<style.*?</style>"), " ")
+        .replace(Regex("(?s)<!--.*?-->"), " ")
+        .replace(Regex("<br\\s*/?>"), "\n")
+        .replace(Regex("</(p|div|h[1-6]|li|tr)>"), "\n")
+        .replace(Regex("<[^>]+>"), "")
+        .replace(Regex("&nbsp;"), " ")
+        .replace(Regex("&amp;"), "&")
+        .replace(Regex("&lt;"), "<")
+        .replace(Regex("&gt;"), ">")
+        .replace(Regex("\\n{3,}"), "\n\n")
+        .trim()
+}
+
+/** Whether [raw] is HTML, by response media subtype first and body shape second. */
+internal fun looksLikeHtml(raw: String, contentTypeSubtype: String? = null): Boolean {
+    if (raw.contains("<html", ignoreCase = true) || raw.contains("<body", ignoreCase = true)) {
+        return true
     }
+    // An HTML doctype is unambiguous whatever the server labelled the response:
+    // a mislabelled text/plain or application/xml page still is HTML.
+    if (raw.trimStart().startsWith("<!doctype html", ignoreCase = true)) return true
+    // Otherwise trust a content type that says HTML, even for a fragment with
+    // no <html>/<body> wrapper. `xml`, `svg+xml` and friends are deliberately
+    // NOT included: those are documents, not pages, and stripping their tags
+    // would destroy them.
+    val sub = contentTypeSubtype?.lowercase().orEmpty()
+    if (sub.isNotEmpty()) return sub == "html" || sub.endsWith("+html") || sub == "xhtml"
+    // No content type at all: fall back to body shape. A body that opens with
+    // an opening tag is a fragment; `<` followed by a space (`1 < 2`) is not.
+    return Regex("^<[A-Za-z][A-Za-z0-9]*[\\s/>]").containsMatchIn(raw.trimStart())
 }
 
 class TodoWriteTool(

@@ -4,8 +4,10 @@ import com.androidharness.app.browser.BrowserController
 import com.androidharness.app.browser.BrowserConsoleLog
 import com.androidharness.app.browser.BrowserElement
 import com.androidharness.app.browser.BrowserState
+import com.androidharness.app.browser.ElementTarget
 import com.androidharness.app.browser.WorkspacePathHandler
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -253,5 +255,78 @@ class BrowserToolsTest {
         assertTrue(BrowserForwardTool::class.java != null)
         assertTrue(BrowserRefreshTool::class.java != null)
         assertTrue(BrowserGetUrlTool::class.java != null)
+    }
+
+    @Test
+    fun `a supplied selector wins over a supplied id`() {
+        // browser_click(id = 0, selector = "#later") used to fail with
+        // "Element with id 0 not found" while the selector was silently
+        // ignored. An id is only valid for the page state it came from, so the
+        // selector is the one to trust.
+        assertEquals(ElementTarget(null, "#later"), BrowserController.resolveElementTarget(0, "#later"))
+        assertEquals(ElementTarget(null, "#later"), BrowserController.resolveElementTarget(3, "#later"))
+        // A blank selector is not a selector.
+        assertEquals(ElementTarget(3, null), BrowserController.resolveElementTarget(3, "   "))
+        assertEquals(ElementTarget(3, null), BrowserController.resolveElementTarget(3, null))
+        assertEquals(ElementTarget(null, "#x"), BrowserController.resolveElementTarget(null, "#x"))
+        assertNull(BrowserController.resolveElementTarget(null, null))
+        assertNull(BrowserController.resolveElementTarget(null, ""))
+    }
+
+    @Test
+    fun `click and type scripts report a disabled element`() {
+        val bySelector = ElementTarget(elementId = null, selector = "#go")
+        val byId = ElementTarget(elementId = 4, selector = null)
+        for (js in listOf(
+            BrowserController.buildClickJs(bySelector),
+            BrowserController.buildClickJs(byId),
+            BrowserController.buildTypeJs(bySelector, "hi", clearFirst = true),
+            BrowserController.buildTypeJs(byId, "hi", clearFirst = false),
+        )) {
+            // The action still dispatches (a real click on a disabled control
+            // just does nothing) and the envelope says so.
+            assertTrue(js.contains("el.click();") || js.contains("el.value ="))
+            // The warning belongs INSIDE the returned envelope: `return { ok: true
+            // , warning: … }`. Appending it after the closing brace parses as the
+            // comma operator and is a SyntaxError, which the raw `warning:` check
+            // below would not have caught.
+            assertTrue("Warning must sit inside the envelope: $js", js.contains("return { ok: true, warning:"))
+            assertTrue("Missing disabled guard: $js", js.contains("el.disabled === true"))
+            assertTrue(js.contains("aria-disabled"))
+        }
+    }
+
+    @Test
+    fun `action scripts look the target up the way the target says`() {
+        val bySelector = ElementTarget(elementId = null, selector = "#go")
+        val byId = ElementTarget(elementId = 4, selector = null)
+
+        val selectorJs = BrowserController.buildClickJs(bySelector)
+        assertTrue(selectorJs.contains("\"#go\""))
+        assertFalse(selectorJs.contains("data-harness-id"))
+
+        val idJs = BrowserController.buildClickJs(byId)
+        assertTrue(idJs.contains("data-harness-id=\"4\""))
+        assertFalse(idJs.contains("querySelector(\""))
+
+        // A selector containing a quote must be escaped, not injected raw.
+        val quoted = BrowserController.buildClickJs(ElementTarget(null, "#a\"b"))
+        assertTrue(quoted.contains("\\\"#a\\\"b\\\"") || quoted.contains("#a\\\"b"))
+    }
+
+    @Test
+    fun `action warning is parsed separately from the error`() {
+        assertEquals(
+            "element is disabled, so this action most likely did nothing",
+            BrowserController.parseActionWarning(
+                """{"ok":true,"warning":"element is disabled, so this action most likely did nothing"}""",
+            ),
+        )
+        // A plain success and a failure both have no warning.
+        assertNull(BrowserController.parseActionWarning("""{"ok":true}"""))
+        assertNull(BrowserController.parseActionWarning("""{"ok":true,"warning":null}"""))
+        assertNull(BrowserController.parseActionWarning("""{"ok":false,"error":"nope"}"""))
+        // The error parser must not start seeing warnings as failures.
+        assertNull(BrowserController.parseActionError("""{"ok":true,"warning":"disabled"}"""))
     }
 }

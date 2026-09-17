@@ -106,6 +106,16 @@ data class BrowserEvalOutcome(
     val error: String?,
 )
 
+/**
+ * Which element an action targets. Exactly one of the two is set, chosen by
+ * [BrowserController.resolveElementTarget].
+ */
+data class ElementTarget(val elementId: Int?, val selector: String?) {
+    /** How this target is named in an error message. */
+    val errorSubject: String
+        get() = if (selector != null) "Element matching '$selector'" else "Element $elementId"
+}
+
 /** Saved screenshot outcome containing workspace relative path, cache file, and size. */
 data class BrowserScreenshotResult(
     val filename: String,
@@ -463,42 +473,24 @@ class BrowserController(
     /**
      * Click an interactive element by its assigned index or CSS selector.
      * Throws when the element is missing so the agent knows nothing happened.
+     * A supplied selector wins over a supplied id (see [resolveElementTarget]).
      */
     suspend fun click(elementId: Int? = null, selector: String? = null): BrowserState {
-        val detail = elementId?.let { "#$it" } ?: selector.orEmpty().take(80)
+        val target = resolveElementTarget(elementId, selector)
+            ?: throw IllegalArgumentException("Either elementId or selector must be provided.")
+        val detail = target.selector?.take(80) ?: "#${target.elementId}"
         track("click", detail)
-        val js = when {
-            elementId != null -> """
-                (function() {
-                    const el = document.querySelector('[data-harness-id="$elementId"]');
-                    if (!el) return { ok: false, error: "Element with id $elementId not found. The page re-rendered; re-run browser_get_dom for fresh ids." };
-                    el.scrollIntoView({ behavior: 'instant', block: 'center' });
-                    el.focus();
-                    el.click();
-                    return { ok: true };
-                })();
-            """.trimIndent()
-            !selector.isNullOrBlank() -> """
-                (function() {
-                    const el = document.querySelector(${json.encodeToString(selector)});
-                    if (!el) return { ok: false, error: "No element matches selector '$selector'. Re-run browser_get_dom for fresh ids." };
-                    el.scrollIntoView({ behavior: 'instant', block: 'center' });
-                    el.focus();
-                    el.click();
-                    return { ok: true };
-                })();
-            """.trimIndent()
-            else -> throw IllegalArgumentException("Either elementId or selector must be provided.")
-        }
+        val js = buildClickJs(target)
 
         try {
-            val error = parseActionError(evalRaw(js))
+            val raw = evalRaw(js)
+            val error = parseActionError(raw)
             if (error != null) {
                 track("click", detail, ok = false)
                 throw IllegalStateException(error)
             }
             awaitSettle(currentUrl())
-            return extractState()
+            return withActionNote(extractState(), raw, elementId, target)
         } catch (e: IllegalStateException) {
             throw e
         } catch (e: Exception) {
@@ -512,64 +504,51 @@ class BrowserController(
      * missing or not an input-like element.
      */
     suspend fun type(text: String, elementId: Int? = null, selector: String? = null, clearFirst: Boolean = false): BrowserState {
+        val target = resolveElementTarget(elementId, selector)
+            ?: throw IllegalArgumentException("Either elementId or selector must be provided.")
         val detail = buildString {
-            append(elementId?.let { "#$it" } ?: selector.orEmpty().take(40))
+            append(target.selector?.take(40) ?: "#${target.elementId}")
             append(" \"").append(text.take(40)).append('"')
         }
         track("type", detail)
-        val encodedText = json.encodeToString(text)
-        val js = when {
-            elementId != null -> """
-                (function() {
-                    const el = document.querySelector('[data-harness-id="$elementId"]');
-                    if (!el) return { ok: false, error: "Element with id $elementId not found. The page re-rendered; re-run browser_get_dom for fresh ids." };
-                    const tag = (el.tagName || '').toLowerCase();
-                    if (tag !== 'input' && tag !== 'textarea' && tag !== 'select' && el.isContentEditable !== true) {
-                        return { ok: false, error: "Element $elementId is a <" + tag + ">, not a text field." };
-                    }
-                    el.scrollIntoView({ behavior: 'instant', block: 'center' });
-                    el.focus();
-                    ${if (clearFirst) "el.value = '';" else ""}
-                    el.value = (el.value || '') + $encodedText;
-                    el.dispatchEvent(new Event('input', { bubbles: true }));
-                    el.dispatchEvent(new Event('change', { bubbles: true }));
-                    return { ok: true };
-                })();
-            """.trimIndent()
-            !selector.isNullOrBlank() -> """
-                (function() {
-                    const el = document.querySelector(${json.encodeToString(selector)});
-                    if (!el) return { ok: false, error: "No element matches selector '$selector'." };
-                    const tag = (el.tagName || '').toLowerCase();
-                    if (tag !== 'input' && tag !== 'textarea' && tag !== 'select' && el.isContentEditable !== true) {
-                        return { ok: false, error: "Element matching '$selector' is a <" + tag + ">, not a text field." };
-                    }
-                    el.scrollIntoView({ behavior: 'instant', block: 'center' });
-                    el.focus();
-                    ${if (clearFirst) "el.value = '';" else ""}
-                    el.value = (el.value || '') + $encodedText;
-                    el.dispatchEvent(new Event('input', { bubbles: true }));
-                    el.dispatchEvent(new Event('change', { bubbles: true }));
-                    return { ok: true };
-                })();
-            """.trimIndent()
-            else -> throw IllegalArgumentException("Either elementId or selector must be provided.")
-        }
+        val js = buildTypeJs(target, text, clearFirst)
 
         try {
-            val error = parseActionError(evalRaw(js))
+            val raw = evalRaw(js)
+            val error = parseActionError(raw)
             if (error != null) {
                 track("type", detail, ok = false)
                 throw IllegalStateException(error)
             }
             awaitSettle(currentUrl())
-            return extractState()
+            return withActionNote(extractState(), raw, elementId, target)
         } catch (e: IllegalStateException) {
             throw e
         } catch (e: Exception) {
             track("type", detail, ok = false)
             throw e
         }
+    }
+
+    /**
+     * Carries the page's own warning (a disabled control) and the
+     * selector-over-id note into the returned state, which is already rendered
+     * with them.
+     */
+    private fun withActionNote(
+        state: BrowserState,
+        raw: String,
+        elementId: Int?,
+        target: ElementTarget,
+    ): BrowserState {
+        val override = if (target.selector != null && elementId != null) {
+            "selector used; id $elementId ignored"
+        } else {
+            null
+        }
+        val note = listOfNotNull(parseActionWarning(raw), override).joinToString("; ")
+        if (note.isEmpty()) return state
+        return state.copy(error = listOfNotNull(state.error, note).joinToString("; "))
     }
 
     /**
@@ -1011,6 +990,99 @@ class BrowserController(
         }
 
         /**
+         * Picks the target for an element action when both an id and a selector
+         * were supplied: the SELECTOR wins.
+         *
+         * An id only means anything for the page state it was indexed from, and
+         * ids are reassigned on every DOM read. Passing a stale id together
+         * with a selector used to be decided silently in favour of the id,
+         * which turned a correct selector call into "Element with id 0 not
+         * found" with no way to tell the selector had been ignored (on-device
+         * QA, 2026-09-17). A selector is re-resolved in the page, so it is the
+         * one to trust; the action result says the id was ignored. Null means
+         * neither was supplied and the caller must reject the call.
+         */
+        fun resolveElementTarget(elementId: Int?, selector: String?): ElementTarget? {
+            val sel = selector?.takeIf { it.isNotBlank() }
+            return when {
+                sel != null -> ElementTarget(elementId = null, selector = sel)
+                elementId != null -> ElementTarget(elementId = elementId, selector = null)
+                else -> null
+            }
+        }
+
+        /**
+         * Page script for one click. Pure, so the action contract (which
+         * lookup is used, and how a disabled control is reported) is testable
+         * without a WebView.
+         */
+        fun buildClickJs(target: ElementTarget): String = """
+            (function() {
+                ${elementLookupJs(target)}
+                el.scrollIntoView({ behavior: 'instant', block: 'center' });
+                el.focus();
+                el.click();
+                return { ok: true$DISABLED_WARNING_JS };
+            })();
+        """.trimIndent()
+
+        /**
+         * Page script that types [text] into the target. Pure for the same
+         * reason as [buildClickJs].
+         */
+        fun buildTypeJs(target: ElementTarget, text: String, clearFirst: Boolean): String {
+            val encodedText = jsJson.encodeToString(text)
+            // JSON-encoded so a selector with quotes/backslashes cannot break
+            // the generated script.
+            val notTextField = jsJson.encodeToString("${target.errorSubject} is a <")
+            return """
+                (function() {
+                    ${elementLookupJs(target)}
+                    const tag = (el.tagName || '').toLowerCase();
+                    if (tag !== 'input' && tag !== 'textarea' && tag !== 'select' && el.isContentEditable !== true) {
+                        return { ok: false, error: $notTextField + tag + ", not a text field." };
+                    }
+                    el.scrollIntoView({ behavior: 'instant', block: 'center' });
+                    el.focus();
+                    ${if (clearFirst) "el.value = '';" else ""}
+                    el.value = (el.value || '') + $encodedText;
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    return { ok: true$DISABLED_WARNING_JS };
+                })();
+            """.trimIndent()
+        }
+
+        /** Lookup prologue: by id only when no selector was supplied. */
+        private fun elementLookupJs(target: ElementTarget): String {
+            val selector = target.selector
+            if (selector != null) {
+                val missing = jsJson.encodeToString(
+                    "No element matches selector '$selector'. Re-run browser_get_dom for fresh ids.",
+                )
+                return "const el = document.querySelector(${jsJson.encodeToString(selector)});\n" +
+                    "if (!el) return { ok: false, error: $missing };"
+            }
+            val missing = jsJson.encodeToString(
+                "Element with id ${target.elementId} not found. The page re-rendered; " +
+                    "re-run browser_get_dom for fresh ids.",
+            )
+            return "const el = document.querySelector('[data-harness-id=\"${target.elementId}\"]');\n" +
+                "if (!el) return { ok: false, error: $missing };"
+        }
+
+        /**
+         * Page-script fragment appended to an action's success envelope. A
+         * disabled control swallows the interaction by design, so the action
+         * used to come back as an ordinary-looking success with nothing
+         * changed and the agent retried blind (on-device QA, 2026-09-17). The
+         * action is still dispatched normally; only the reporting changes.
+         */
+        private const val DISABLED_WARNING_JS =
+            ", warning: (el.disabled === true || el.getAttribute('aria-disabled') === 'true')" +
+                " ? 'element is disabled, so this action most likely did nothing' : null"
+
+        /**
          * Builds the stable URL for a workspace-relative HTML file. Used by
          * both the agent's navigate() and the preview sheet's own load path so
          * both share one origin and one, clean history stack.
@@ -1176,6 +1248,22 @@ class BrowserController(
                 if (ok) null
                 else obj["error"]?.let { (it as? JsonPrimitive)?.contentOrNull } ?: "Unknown page script failure."
             }.getOrElse { null } // non-envelope result (shouldn't happen) = treat as success
+        }
+
+        /**
+         * Extracts the warning from a {ok:true,warning} action envelope, or
+         * null when the action had nothing to report. Separate from
+         * [parseActionError] because the action DID happen: it just most
+         * likely had no effect.
+         */
+        fun parseActionWarning(raw: String): String? {
+            val decoded = decodeJsJson(raw) ?: return null
+            return runCatching {
+                val obj = jsJson.parseToJsonElement(decoded).jsonObject
+                val ok = obj["ok"]?.let { (it as? JsonPrimitive)?.booleanOrNull } ?: false
+                if (!ok) null
+                else obj["warning"]?.let { (it as? JsonPrimitive)?.contentOrNull?.takeIf { w -> w.isNotBlank() } }
+            }.getOrNull()
         }
 
         /**

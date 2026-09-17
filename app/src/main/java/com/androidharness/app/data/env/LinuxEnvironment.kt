@@ -226,6 +226,33 @@ sealed interface EnvState {
 }
 
 /**
+ * Git environment that keeps the bundled (Termux-built) git out of an
+ * unreadable system config. See [LinuxEnvironmentManager.gitSystemConfigEnv]
+ * for why this exists; the decision is pure so it can be tested without a
+ * device.
+ *
+ * - A readable system config is named explicitly (GIT_CONFIG_SYSTEM), so git
+ *   cannot fall back to the path compiled into the binary.
+ * - Otherwise the system scope is switched off entirely (GIT_CONFIG_NOSYSTEM),
+ *   which is what git does by itself when there is no /etc/gitconfig.
+ *
+ * The Termux prefix is preferred when that file exists: it is the copy this
+ * build's git was actually compiled to read, so honouring it keeps behaviour
+ * identical to a normal Termux install whenever it is readable.
+ */
+internal fun gitSystemConfigEnvOf(
+    termuxSystemConfig: File,
+    systemConfig: File,
+): Map<String, String> {
+    val candidate = if (termuxSystemConfig.isFile) termuxSystemConfig else systemConfig
+    return if (candidate.isFile && candidate.canRead()) {
+        mapOf("GIT_CONFIG_NOSYSTEM" to "0", "GIT_CONFIG_SYSTEM" to candidate.absolutePath)
+    } else {
+        mapOf("GIT_CONFIG_NOSYSTEM" to "1")
+    }
+}
+
+/**
  * Installs a self-contained Linux userspace (bash, coreutils, git, python,
  * node…) into the app's private storage, sourced from the public Termux
  * package repository. No root, no external app required.
@@ -759,6 +786,9 @@ class LinuxEnvironmentManager(
         // identity + GitHub token rewrite (see gitGlobalConfig).
         put("GIT_CONFIG_GLOBAL", gitGlobalConfig().absolutePath)
         put("HARNESS_GIT_CONFIG", gitGlobalConfig().absolutePath)
+        // Bug fix: the Termux-built git also reads a SYSTEM config from its old
+        // prefix, where reading is denied and git exits 128 before running.
+        putAll(gitSystemConfigEnv())
         // bash sources this for `bash -c`: shims make every toolchain binary
         // runnable despite the W^X exec restriction on app-private files.
         if (shimFile.exists()) put("BASH_ENV", shimFile.absolutePath)
@@ -861,6 +891,31 @@ class LinuxEnvironmentManager(
         }
         return f
     }
+
+    /**
+     * git's SYSTEM config scope for every process the harness spawns.
+     *
+     * The bundled git is Termux-built, so it resolves its system config to
+     * /data/data/com.termux/files/usr/etc/gitconfig. When the Termux app is
+     * installed that file EXISTS and is mode 600 inside another app's private
+     * data, so the shizuku shell uid reads EACCES rather than ENOENT and git
+     * dies before doing any work:
+     *   fatal: unable to access '…/etc/gitconfig': Permission denied
+     * exit 128, on every subcommand that reads config (on-device QA, 2026-09-17).
+     * Same re-rooting family as GIT_TEMPLATE_DIR / GIT_EXEC_PATH / OPENSSL_CONF
+     * above, and the same remedy: never let git wander into the old prefix.
+     *
+     * Nothing in the harness relies on system-level git settings (safe.directory,
+     * the commit identity and the token insteadOf rewrite all live in
+     * GIT_CONFIG_GLOBAL), so an unreadable system config is simply skipped via
+     * GIT_CONFIG_NOSYSTEM, git's own switch for "there is no system config".
+     * A readable one is named explicitly so a differently-rooted binary cannot
+     * pick a path the probe never checked.
+     */
+    fun gitSystemConfigEnv(): Map<String, String> = gitSystemConfigEnvOf(
+        termuxSystemConfig = File(TERMUX_SYSTEM_GITCONFIG),
+        systemConfig = File(SYSTEM_GITCONFIG),
+    )
 
     /** Re-writes the toolchain copies of the GitHub auth state. Idempotent. */
     fun materializeGitHub() {
@@ -1059,6 +1114,10 @@ class LinuxEnvironmentManager(
         // tier, written under the deployed prefix.
         put("GIT_CONFIG_GLOBAL", "$tmpPrefix/etc/gitconfig")
         put("HARNESS_GIT_CONFIG", "$tmpPrefix/etc/gitconfig")
+        // Same unreadable-system-config fix as the app-side env: derived the
+        // same way (the deployed copy is staged from this tree), and the
+        // app uid cannot stat inside the 0700 deployed prefix to re-probe.
+        putAll(gitSystemConfigEnv())
         // Bug 1 fix: the deployed copy carries its own CA bundle; export the
         // standard TLS vars so curl/python/git/node verify certificates.
         // Same derivation rule: stageForShell ships the staged bundle (from
@@ -1583,6 +1642,17 @@ class LinuxEnvironmentManager(
         private const val DEPLOY_REVERIFY_INTERVAL_MS = 5 * 60 * 1000L
 
         private const val BASE_URL = "https://packages.termux.dev/apt/termux-main"
+
+        /**
+         * Where the bundled, Termux-built git looks for its SYSTEM config. The
+         * binary carries /data/data/com.termux/files/usr as its prefix, and git
+         * derives the system config path from that prefix rather than from
+         * anything this app sets.
+         */
+        internal const val TERMUX_SYSTEM_GITCONFIG = "/data/data/com.termux/files/usr/etc/gitconfig"
+
+        /** Standard system config location, for a git that is not Termux-built. */
+        internal const val SYSTEM_GITCONFIG = "/etc/gitconfig"
 
         /** Parent directory of the shell-tier copies, one per installed build. */
         const val TMP_ROOT = "/data/local/tmp/androidharness"

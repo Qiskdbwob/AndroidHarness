@@ -465,4 +465,61 @@ class FileToolsTest {
         val msg = runExpectingFailure(GrepTool(), "path" to "foo.kt", "pattern" to "val", "include" to "*.txt")
         assertTrue("Expected contradiction error, got: $msg", msg.contains("excludes it"))
     }
+
+    @Test
+    fun `grep shows the match text deep inside a long line`() = runBlocking {
+        // The QA fixture: the token sits past column 100,000 of a 210,022-byte line.
+        val token = "UNIQUE_LONG_731"
+        file("long.txt").writeText("x".repeat(100_003) + token + "y".repeat(109_000) + "\n")
+        val r = run(GrepTool(), "pattern" to token, "include" to "long.txt")
+        assertTrue(r.ok)
+        assertTrue("Match token must be visible, got: ${r.output}", r.output.contains(token))
+        assertTrue("Clipped side must be marked, got: ${r.output}", r.output.contains("..."))
+        val hit = r.output.lineSequence().first { it.contains(token) }
+        assertTrue(
+            "Excerpt must stay bounded, was ${hit.length} chars: $hit",
+            hit.length < GREP_EXCERPT_WINDOW + 40,
+        )
+    }
+
+    @Test
+    fun `grep excerpt centers on the match and marks both clipped sides`() {
+        val line = "a".repeat(1_000) + "NEEDLE" + "b".repeat(1_000)
+        val excerpt = grepExcerpt(line, 1_000)
+        assertTrue(excerpt.contains("NEEDLE"))
+        assertTrue(excerpt.startsWith("..."))
+        assertTrue(excerpt.endsWith("..."))
+        assertTrue("Excerpt must stay bounded", excerpt.length <= GREP_EXCERPT_WINDOW + 6)
+
+        // A short line is reported whole, with no truncation marker.
+        assertEquals("short NEEDLE line", grepExcerpt("short NEEDLE line", 6))
+
+        // A match at the very start has nothing to clip on the left.
+        val atStart = grepExcerpt("NEEDLE" + "b".repeat(1_000), 0)
+        assertTrue(atStart.startsWith("NEEDLE"))
+        assertFalse(atStart.startsWith("..."))
+        assertTrue(atStart.endsWith("..."))
+    }
+
+    @Test
+    fun `grep does not report skips for files outside the include filter`() = runBlocking {
+        // >2MB, so it would otherwise land in the skip list, and outside the filter.
+        java.io.RandomAccessFile(file("large.bin"), "rw").use { it.setLength(2_500_000) }
+        file("small.txt").writeText("needle here\n")
+        val r = run(GrepTool(), "pattern" to "needle", "include" to "small.txt")
+        assertTrue(r.ok)
+        assertTrue(r.output.contains("small.txt"))
+        assertFalse("A filtered-out file must not be named as skipped: ${r.output}", r.output.contains("Skipped"))
+        assertFalse(r.output.contains("large.bin"))
+    }
+
+    @Test
+    fun `grep still reports skips for oversized files inside the filter`() = runBlocking {
+        java.io.RandomAccessFile(file("large.txt"), "rw").use { it.setLength(2_500_000) }
+        file("small.txt").writeText("needle here\n")
+        val r = run(GrepTool(), "pattern" to "needle", "include" to "*.txt")
+        assertTrue(r.ok)
+        assertTrue("In-scope oversized files must still be reported: ${r.output}", r.output.contains("large.txt"))
+        assertTrue(r.output.contains("Skipped"))
+    }
 }
