@@ -25,7 +25,7 @@ import java.io.File
 internal object CodeGraphBundlePatches {
 
     /** Bumped whenever [patches] changes, so an install can tell old from new. */
-    const val VERSION = 9
+    const val VERSION = 11
 
     /** Paths (relative to `lib/dist`) that [patches] may rewrite. */
     internal val patchedFiles = listOf(
@@ -40,6 +40,7 @@ internal object CodeGraphBundlePatches {
         "db/migrations.js",
         "db/queries.js",
         "index.js",
+        "context/index.js",
     )
 
     internal data class Patch(
@@ -360,45 +361,117 @@ internal object CodeGraphBundlePatches {
     )
 
     /**
-     * The pristine release keeps upstream's single-expression `createEdges`.
-     * Rather than rewriting the whole body (a partial conversion is exactly
-     * what stranded devices on a broken hybrid), the original body is renamed
-     * to `createEdgesBase` and a wrapper adds the two invariants upstream
-     * lacks: no edge whose source is its own target, and every import that
-     * resolves from an import node is mirrored by an edge from the importing
-     * file, so the module graph traverses from either end. One atomic replace,
-     * so the file is never left between two shapes.
+     * One shape for `imports` edges, and the only place upstream's several
+     * shapes are folded together.
+     *
+     * Upstream emits an import edge from whichever node held the reference
+     * (the importing file, or the `import` node it also created) and for
+     * `from x import y` it points at the imported SYMBOL rather than the
+     * module. One `from zzmod import zalpha` therefore showed up three
+     * different ways at once (file → symbol, file → module, import → module),
+     * and `from . import x` produced an edge to an `import` node named `.`
+     * that means nothing. Every end is folded onto the file that owns it here,
+     * so an `imports` edge always reads file → file, which is the form
+     * explore, impact and affected walk, and duplicate rows (upstream emits
+     * the same import twice) collapse to one.
+     *
+     * The pristine body is renamed to `createEdgesBase` rather than rewritten:
+     * a partial conversion is exactly what stranded devices on a broken hybrid
+     * before, so the rename and the wrapper land in one atomic replace.
      */
+    private val createEdgesCanonical = lines(
+        "    createEdges(resolved) {",
+        "        const out = [];",
+        "        const seenImports = new Set();",
+        "        for (const edge of this.createEdgesBase(resolved)) {",
+        "            if (!edge || edge.source === edge.target) continue;",
+        "            if (edge.kind !== 'imports') {",
+        "                out.push(edge);",
+        "                continue;",
+        "            }",
+        "            const src = this.queries.getNodeById(edge.source);",
+        "            const dst = this.queries.getNodeById(edge.target);",
+        "            if (!src || !dst) continue;",
+        "            const from = src.kind === 'file' ? src : this.fileNodeOf(src.filePath);",
+        "            const to = dst.kind === 'file' ? dst : this.fileNodeOf(dst.filePath);",
+        "            if (!from || !to || from.id === to.id) continue;",
+        "            const key = from.id + '|' + to.id;",
+        "            if (seenImports.has(key)) continue;",
+        "            seenImports.add(key);",
+        "            out.push({ ...edge, source: from.id, target: to.id });",
+        "        }",
+        "        return out;",
+        "    }",
+        "    /** The `file` node of a path, or null when the path has none. */",
+        "    fileNodeOf(filePath) {",
+        "        if (!filePath) return null;",
+        "        const nodes = this.context.getNodesInFile(filePath);",
+        "        return nodes ? nodes.find((n) => n.kind === 'file') : null;",
+        "    }",
+    )
+
+    private val createEdgesPristineAnchor = lines(
+        "    createEdges(resolved) {",
+        "        return resolved.map((ref) => {",
+    )
+
+    private val createEdgesBasePristine = lines(
+        "    createEdgesBase(resolved) {",
+        "        return resolved.map((ref) => {",
+    )
+
+    /** Generation 7..9 state: the loop conversion landed, so the base is a loop. */
+    private val createEdgesBaseFromLoop = lines(
+        "    createEdgesBase(resolved) {",
+        "        const out = [];",
+        "        for (const ref of resolved) {",
+    )
+
+    /**
+     * Generation 9 state: the base exists and is correct, but the wrapper
+     * above it emits the old model — an import node's edge mirrored onto the
+     * file, which is where the duplicate and symbol-targeted `imports` rows
+     * came from. Only the wrapper is replaced here; the base is left alone.
+     */
+    private val createEdgesV9Anchor = lines(
+        "    createEdges(resolved) {",
+        "        const mapped = this.createEdgesBase(resolved);",
+        "        const out = [];",
+        "        for (const edge of mapped) {",
+        "            if (!edge || edge.source === edge.target) continue;",
+        "            out.push(edge);",
+        "            if (edge.kind === 'imports') {",
+        "                const srcNode = this.queries.getNodeById(edge.source);",
+        "                if (srcNode && srcNode.kind === 'import') {",
+        "                    const fileNodes = this.context.getNodesInFile(srcNode.filePath);",
+        "                    const fileNode = fileNodes ? fileNodes.find((n) => n.kind === 'file') : null;",
+        "                    if (fileNode && fileNode.id !== edge.target) {",
+        "                        out.push({ ...edge, source: fileNode.id });",
+        "                    }",
+        "                }",
+        "            }",
+        "        }",
+        "        return out;",
+        "    }",
+    )
+
     private val createEdgesWrapper = Patch(
         "resolution/index.js",
-        lines(
-            "    createEdges(resolved) {",
-            "        return resolved.map((ref) => {",
+        createEdgesPristineAnchor,
+        createEdgesCanonical + "\n" + createEdgesBasePristine,
+        fallbackAnchors = listOf(
+            lines(
+                "    createEdges(resolved) {",
+                "        const out = [];",
+                "        for (const ref of resolved) {",
+            ),
+            createEdgesV9Anchor,
         ),
-        lines(
-            "    createEdges(resolved) {",
-            "        const mapped = this.createEdgesBase(resolved);",
-            "        const out = [];",
-            "        for (const edge of mapped) {",
-            "            if (!edge || edge.source === edge.target) continue;",
-            "            out.push(edge);",
-            "            if (edge.kind === 'imports') {",
-            "                const srcNode = this.queries.getNodeById(edge.source);",
-            "                if (srcNode && srcNode.kind === 'import') {",
-            "                    const fileNodes = this.context.getNodesInFile(srcNode.filePath);",
-            "                    const fileNode = fileNodes ? fileNodes.find((n) => n.kind === 'file') : null;",
-            "                    if (fileNode && fileNode.id !== edge.target) {",
-            "                        out.push({ ...edge, source: fileNode.id });",
-            "                    }",
-            "                }",
-            "            }",
-            "        }",
-            "        return out;",
-            "    }",
-            "    createEdgesBase(resolved) {",
-            "        return resolved.map((ref) => {",
-        ),
-        satisfiedMarkers = listOf("createEdgesBase(resolved) {", "out.push(edge);"),
+        fallbackReplacements = listOf(createEdgesCanonical + "\n" + createEdgesBaseFromLoop, createEdgesCanonical),
+        // Not `createEdgesBase`, which every generation since 9 has: the
+        // marker has to be something only this model emits, or a device that
+        // already has the old wrapper would be left with it.
+        satisfiedMarkers = listOf("fileNodeOf(filePath)"),
     )
 
     // ------------------------------------------------------------------
@@ -582,6 +655,24 @@ internal object CodeGraphBundlePatches {
         "                        });",
         "                    }",
         "                }",
+    )
+
+    // Generation 7 state: this block emitted the reference from the import node
+    // ONLY, no file ref, and routed it through a local `fromId`. It sits on the
+    // device beside a hook block from a later generation, which is what an
+    // installation that lived through several patch generations looks like.
+    private val pythonImportStmtFallback1 = lines(
+        "                    const fromId = impNode ? impNode.id : importParentId;",
+        "                    if (fromId) {",
+        "                        this.unresolvedReferences.push({",
+        "                            fromNodeId: fromId,",
+    )
+
+    private val pythonImportStmtFallback1Replacement = lines(
+        "                    pushModuleRef(child);",
+        "                    if (impNode) {",
+        "                        this.unresolvedReferences.push({",
+        "                            fromNodeId: impNode.id,",
     )
 
     // Junk AST tokens must not become queryable symbols.
@@ -785,6 +876,81 @@ internal object CodeGraphBundlePatches {
         "        ['PRAGMA analysis_limit=1000', 'PRAGMA optimize', 'ANALYZE']);",
     )
 
+    // New databases get incremental auto-vacuum from the start, so the pages a
+    // later delete frees are given back to the filesystem by the next
+    // `PRAGMA incremental_vacuum` instead of sitting on the freelist forever.
+    // It has to be set before anything writes to the file, including the WAL
+    // journal mode set below it: set any later the pragma is silently deferred
+    // to the next VACUUM, and a fresh index would pay that full rewrite on its
+    // first query instead of never.
+    private val autoVacuumAnchor =
+        "    db.pragma('busy_timeout = 5000'); // MUST be first — see above"
+
+    private val autoVacuumReplacement = lines(
+        "    db.pragma('busy_timeout = 5000'); // MUST be first — see above",
+        "    // Harness patch: incremental auto-vacuum, so a prune gives its pages back.",
+        "    db.pragma('auto_vacuum = INCREMENTAL');",
+    )
+
+    // An index created before this fix has auto_vacuum = NONE, and only a
+    // VACUUM rewrites the header to change that. The migration that prunes
+    // cannot do it: VACUUM is refused inside a transaction ("cannot VACUUM from
+    // within a transaction") and migrations run in one, so it would fail every
+    // sync on the device. It runs here instead, after `runMigrations` has
+    // committed, which is the first point where the connection is between
+    // transactions.
+    private val reclaimSpaceAnchor = lines(
+        "        if (currentVersion < migrations_1.CURRENT_SCHEMA_VERSION) {",
+        "            (0, migrations_1.runMigrations)(db, currentVersion);",
+        "        }",
+    )
+
+    private val reclaimSpaceReplacement = lines(
+        "        if (currentVersion < migrations_1.CURRENT_SCHEMA_VERSION) {",
+        "            (0, migrations_1.runMigrations)(db, currentVersion);",
+        "        }",
+        "        conn.reclaimSpace();",
+    )
+
+    private val reclaimSpaceMethodAnchor = lines(
+        "    close() {",
+        "        this.db.close();",
+        "    }",
+    )
+
+    private val reclaimSpaceMethodReplacement = lines(
+        "    /**",
+        "     * Give back the pages deletes and migrations left on the freelist.",
+        "     *",
+        "     * SQLite keeps a freed page for reuse rather than shrinking the file, so",
+        "     * a prune that removes half the edges leaves the index at its old size.",
+        "     * The first pass on an existing file switches it to incremental",
+        "     * auto-vacuum, which needs one VACUUM to rewrite the header; after that",
+        "     * `PRAGMA incremental_vacuum` truncates whatever the last prune freed,",
+        "     * and there is nothing to rewrite.",
+        "     *",
+        "     * VACUUM is illegal inside a transaction, so this MUST stay outside one:",
+        "     * it is called from open() after runMigrations has committed. Failures",
+        "     * (another connection holding a read lock) are ignored, and the next",
+        "     * open retries.",
+        "     */",
+        "    reclaimSpace() {",
+        "        try {",
+        "            if (Number(this.db.pragma('auto_vacuum', { simple: true })) !== 2) {",
+        "                this.db.exec('PRAGMA auto_vacuum = INCREMENTAL');",
+        "                this.db.exec('VACUUM');",
+        "            }",
+        "            else if (Number(this.db.pragma('freelist_count', { simple: true })) > 0) {",
+        "                this.db.exec('PRAGMA incremental_vacuum');",
+        "            }",
+        "        }",
+        "        catch { /* best effort, never load-bearing for correctness */ }",
+        "    }",
+        "    close() {",
+        "        this.db.close();",
+        "    }",
+    )
+
     // ------------------------------------------------------------------
     // db/migrations.js
     // ------------------------------------------------------------------
@@ -799,6 +965,87 @@ internal object CodeGraphBundlePatches {
         "];",
     )
 
+    /** Drops edges that join nodes of two languages that never share a graph. */
+    private val crossLanguagePrune = lines(
+        "        DELETE FROM edges WHERE id IN (",
+        "          SELECT e.id FROM edges e",
+        "          JOIN nodes s ON e.source = s.id",
+        "          JOIN nodes t ON e.target = t.id",
+        "          WHERE s.language != t.language",
+        "          AND NOT (",
+        "            (s.language IN ('kotlin','java','scala','clojure','groovy') AND t.language IN ('kotlin','java','scala','clojure','groovy')) OR",
+        "            (s.language IN ('swift','objc','objcpp') AND t.language IN ('swift','objc','objcpp')) OR",
+        "            (s.language IN ('typescript','tsx','javascript','jsx','arkts','vue','svelte','astro') AND t.language IN ('typescript','tsx','javascript','jsx','arkts','vue','svelte','astro')) OR",
+        "            (s.language IN ('c','cpp') AND t.language IN ('c','cpp')) OR",
+        "            (s.language IN ('csharp','razor') AND t.language IN ('csharp','razor'))",
+        "          )",
+        "        );",
+    )
+
+    /**
+     * The retroactive half of the edge fix: an index that was resolved before
+     * it keeps its old rows forever, because resolution only runs for files a
+     * sync has touched, and a migration is the one thing that does run for
+     * everything. Each end of an `imports` edge is folded onto the file that
+     * owns it, which is the only shape the resolver emits now, so an edge from
+     * an import node or to an imported symbol becomes the file-to-file edge it
+     * should always have been instead of being thrown away.
+     *
+     * `OR IGNORE` is load-bearing: idx_edges_identity is unique, so a row that
+     * folds onto one already present is skipped rather than aborting the whole
+     * migration, and the cleanup below then removes it.
+     */
+    private val importFold = lines(
+        "        UPDATE OR IGNORE edges SET target = (",
+        "          SELECT f.id FROM nodes f",
+        "          WHERE f.kind = 'file'",
+        "            AND f.file_path = (SELECT n.file_path FROM nodes n WHERE n.id = edges.target)",
+        "        )",
+        "        WHERE kind = 'imports'",
+        "          AND target IN (SELECT id FROM nodes WHERE kind <> 'file')",
+        "          AND EXISTS (",
+        "            SELECT 1 FROM nodes f",
+        "            WHERE f.kind = 'file'",
+        "              AND f.file_path = (SELECT n.file_path FROM nodes n WHERE n.id = edges.target)",
+        "          );",
+        "        UPDATE OR IGNORE edges SET source = (",
+        "          SELECT f.id FROM nodes f",
+        "          WHERE f.kind = 'file'",
+        "            AND f.file_path = (SELECT n.file_path FROM nodes n WHERE n.id = edges.source)",
+        "        )",
+        "        WHERE kind = 'imports'",
+        "          AND source IN (SELECT id FROM nodes WHERE kind <> 'file')",
+        "          AND EXISTS (",
+        "            SELECT 1 FROM nodes f",
+        "            WHERE f.kind = 'file'",
+        "              AND f.file_path = (SELECT n.file_path FROM nodes n WHERE n.id = edges.source)",
+        "          );",
+        "        DELETE FROM edges WHERE kind = 'imports'",
+        "          AND (source IN (SELECT id FROM nodes WHERE kind <> 'file')",
+        "            OR target IN (SELECT id FROM nodes WHERE kind <> 'file')",
+        "            OR source = target);",
+        "        DELETE FROM edges WHERE kind = 'imports'",
+        "          AND id NOT IN (SELECT MIN(id) FROM edges WHERE kind = 'imports' GROUP BY source, target);",
+    )
+
+    private val migrationSqlTail = lines(
+        "        DELETE FROM name_segment_vocab WHERE name NOT IN (SELECT name FROM nodes);",
+        "        UPDATE project_metadata SET value = '26' WHERE key = 'indexed_with_extraction_version';",
+    )
+
+    /** The whole of migration 11, built once and reused by every shape it lands on. */
+    private val migrationEleven = lines(
+        "    {",
+        "        version: 11,",
+        "        description: 'Fold imports edges onto files, prune cross-language and junk edges, refresh the extraction version',",
+        "        up: (db) => {",
+        "            db.exec(`",
+    ) + "\n" + crossLanguagePrune + "\n" + importFold + "\n" + migrationSqlTail + "\n" + lines(
+        "      `);",
+        "        },",
+        "    },",
+    )
+
     private val migrationListReplacement = lines(
         "            db.exec('CREATE INDEX IF NOT EXISTS idx_files_generated ON files(path) WHERE generated = 1');",
         "        },",
@@ -808,59 +1055,20 @@ internal object CodeGraphBundlePatches {
         "        description: 'Prune cross-language edges, unique unresolved refs index, and prune vocab orphans',",
         "        up: (db) => {",
         "            db.exec(`",
-        "        DELETE FROM edges WHERE id IN (",
-        "          SELECT e.id FROM edges e",
-        "          JOIN nodes s ON e.source = s.id",
-        "          JOIN nodes t ON e.target = t.id",
-        "          WHERE s.language != t.language",
-        "          AND NOT (",
-        "            (s.language IN ('kotlin','java','scala','clojure','groovy') AND t.language IN ('kotlin','java','scala','clojure','groovy')) OR",
-        "            (s.language IN ('swift','objc','objcpp') AND t.language IN ('swift','objc','objcpp')) OR",
-        "            (s.language IN ('typescript','tsx','javascript','jsx','arkts','vue','svelte','astro') AND t.language IN ('typescript','tsx','javascript','jsx','arkts','vue','svelte','astro')) OR",
-        "            (s.language IN ('c','cpp') AND t.language IN ('c','cpp')) OR",
-        "            (s.language IN ('csharp','razor') AND t.language IN ('csharp','razor'))",
-        "          )",
-        "        );",
+    ) + "\n" + crossLanguagePrune + "\n" + lines(
         "        DELETE FROM unresolved_refs WHERE id NOT IN (",
         "          SELECT MIN(id) FROM unresolved_refs",
         "          GROUP BY from_node_id, reference_name, reference_kind, line, col",
         "        );",
         "        CREATE UNIQUE INDEX IF NOT EXISTS idx_unresolved_identity",
         "          ON unresolved_refs(from_node_id, reference_name, reference_kind, line, col);",
-        "        DELETE FROM name_segment_vocab WHERE name NOT IN (SELECT name FROM nodes);",
-        "        UPDATE project_metadata SET value = '26' WHERE key = 'indexed_with_extraction_version';",
+    ) + "\n" + migrationSqlTail + "\n" + lines(
         "      `);",
         "        },",
         "    },",
-        "    {",
-        "        version: 11,",
-        "        description: 'Compact the database freelist after the cross-language prune',",
-        "        up: (db) => {",
-        "            db.exec(`",
-        "        DELETE FROM edges WHERE id IN (",
-        "          SELECT e.id FROM edges e",
-        "          JOIN nodes s ON e.source = s.id",
-        "          JOIN nodes t ON e.target = t.id",
-        "          WHERE s.language != t.language",
-        "          AND NOT (",
-        "            (s.language IN ('kotlin','java','scala','clojure','groovy') AND t.language IN ('kotlin','java','scala','clojure','groovy')) OR",
-        "            (s.language IN ('swift','objc','objcpp') AND t.language IN ('swift','objc','objcpp')) OR",
-        "            (s.language IN ('typescript','tsx','javascript','jsx','arkts','vue','svelte','astro') AND t.language IN ('typescript','tsx','javascript','jsx','arkts','vue','svelte','astro')) OR",
-        "            (s.language IN ('c','cpp') AND t.language IN ('c','cpp')) OR",
-        "            (s.language IN ('csharp','razor') AND t.language IN ('csharp','razor'))",
-        "          )",
-        "        );",
-        "        DELETE FROM name_segment_vocab WHERE name NOT IN (SELECT name FROM nodes);",
-        "        UPDATE project_metadata SET value = '26' WHERE key = 'indexed_with_extraction_version';",
-        "        PRAGMA auto_vacuum = INCREMENTAL;",
-        "        VACUUM;",
-        "      `);",
-        "        },",
-        "    },",
-        "];",
-    )
+    ) + "\n" + migrationEleven + "\n];"
 
-    // Generation-4..8 devices already carry a migration 10 without the
+    // Generation 4..8 devices already carry a migration 10 without the
     // metadata update and without migration 11. Rewrite its tail and append 11.
     private val migrationListFallback1 = lines(
         "        DELETE FROM name_segment_vocab WHERE name NOT IN (SELECT name FROM nodes);",
@@ -870,39 +1078,28 @@ internal object CodeGraphBundlePatches {
         "];",
     )
 
-    private val migrationListFallback1Replacement = lines(
-        "        DELETE FROM name_segment_vocab WHERE name NOT IN (SELECT name FROM nodes);",
-        "        UPDATE project_metadata SET value = '26' WHERE key = 'indexed_with_extraction_version';",
-        "      `);",
-        "        },",
-        "    },",
-        "    {",
-        "        version: 11,",
-        "        description: 'Compact the database freelist after the cross-language prune',",
-        "        up: (db) => {",
-        "            db.exec(`",
-        "        DELETE FROM edges WHERE id IN (",
-        "          SELECT e.id FROM edges e",
-        "          JOIN nodes s ON e.source = s.id",
-        "          JOIN nodes t ON e.target = t.id",
-        "          WHERE s.language != t.language",
-        "          AND NOT (",
-        "            (s.language IN ('kotlin','java','scala','clojure','groovy') AND t.language IN ('kotlin','java','scala','clojure','groovy')) OR",
-        "            (s.language IN ('swift','objc','objcpp') AND t.language IN ('swift','objc','objcpp')) OR",
-        "            (s.language IN ('typescript','tsx','javascript','jsx','arkts','vue','svelte','astro') AND t.language IN ('typescript','tsx','javascript','jsx','arkts','vue','svelte','astro')) OR",
-        "            (s.language IN ('c','cpp') AND t.language IN ('c','cpp')) OR",
-        "            (s.language IN ('csharp','razor') AND t.language IN ('csharp','razor'))",
-        "          )",
-        "        );",
+    private val migrationListFallback1Replacement =
+        migrationSqlTail + "\n" + lines(
+            "      `);",
+            "        },",
+            "    },",
+        ) + "\n" + migrationEleven + "\n];"
+
+    // Generation 9 files already carry a migration 11, so nothing about the
+    // list changes here: what has to go is the VACUUM inside it, which is the
+    // one statement SQLite refuses inside the transaction migrations run in.
+    // Matched on the migration body itself, since `version: 11` alone would
+    // make the patch look already applied.
+    private val migrationListFallback2 = lines(
         "        DELETE FROM name_segment_vocab WHERE name NOT IN (SELECT name FROM nodes);",
         "        UPDATE project_metadata SET value = '26' WHERE key = 'indexed_with_extraction_version';",
         "        PRAGMA auto_vacuum = INCREMENTAL;",
         "        VACUUM;",
         "      `);",
-        "        },",
-        "    },",
-        "];",
     )
+
+    private val migrationListFallback2Replacement =
+        importFold + "\n" + migrationSqlTail + "\n" + "      `);"
 
     // ------------------------------------------------------------------
     // db/queries.js
@@ -1005,6 +1202,146 @@ internal object CodeGraphBundlePatches {
         "        const instance = new CodeGraph(db, queries, resolvedRoot);",
     )
 
+    /*
+     * The segment-vocab supplement hands `explore` names whose NAME SEGMENTS
+     * overlap the query, which is what lets a prose question reach a camelCase
+     * symbol ("auto-scroll to bottom" -> `pinFeedIfNearBottom`). Its single-word
+     * tier accepts one rare word, and for prose that is reasonable evidence.
+     *
+     * For a query with no whitespace it is not: `nonexistent_thing_xyz` is
+     * someone naming a symbol, and the only thing `thing` proves is that the
+     * repo has other names containing that word. Feeding those seeds back made
+     * explore answer a name that does not exist with an unrelated file, under
+     * "Found 1 symbol across 1 file" and the verbatim-source banner that tells
+     * the caller to trust it as a Read. So a name-shaped query has to be
+     * reached by the whole token, or by several of its segments at once; one
+     * fragment of the name is a coincidence, and the honest answer is that
+     * nothing matched.
+     */
+    private val segmentSeedAnchor = lines(
+        "        let seedNames = options?.seedNames;",
+        "        if (seedNames === undefined) {",
+        "            try {",
+        "                seedNames = this.getSegmentMatches((0, identifier_segments_1.extractSegmentSearchWords)(query), 8)",
+        "                    .map((m) => m.name);",
+        "            }",
+    )
+
+    private val segmentSeedReplacement = lines(
+        "        let seedNames = options?.seedNames;",
+        "        if (seedNames === undefined) {",
+        "            try {",
+        "                const rawQuery = query.trim();",
+        "                const nameLikeQuery = !/\\s/.test(rawQuery);",
+        "                const wholeQuery = rawQuery.toLowerCase();",
+        "                seedNames = this.getSegmentMatches((0, identifier_segments_1.extractSegmentSearchWords)(query), 8)",
+        "                    .filter((m) => !nameLikeQuery || m.matchedWords.length >= 2 || m.matchedWords.includes(wholeQuery))",
+        "                    .map((m) => m.name);",
+        "            }",
+    )
+
+    // ------------------------------------------------------------------
+    // context/index.js
+    // ------------------------------------------------------------------
+
+    /*
+     * Explore answers a name that does not exist with an unrelated file.
+     *
+     * Two of findRelevantContext's steps break a query into pieces and accept
+     * any ONE piece matching: the definition-prefix pass tries each extracted
+     * symbol on its own, and the text pass FTS-searches each term on its own
+     * ("broader coverage", so that a prose question reaches every word). For a
+     * query with no whitespace that is wrong, because the pieces are not words
+     * the caller wrote: `nonexistent_thing_xyz` is a name, and `thing` is a
+     * fragment of it, so `thingFactory` coming back is not a near miss. It was
+     * reported as "Found 1 symbol across 1 file" under the banner that tells the
+     * caller to trust the source as a Read, which is how a wrong file gets read
+     * as the right one.
+     *
+     * A name-shaped query therefore needs the whole token, or at least two of
+     * its fragments agreeing on one symbol, which is the same rule the segment
+     * seeds use. Prose keeps the per-word behaviour it was designed for.
+     */
+    private val definitionFragmentAnchor = lines(
+        "            for (const sym of expandedSymbols) {",
+        "                // Title-case the symbol: \"REST\" → \"Rest\", \"bulk\" → \"Bulk\", \"allocation\" → \"Allocation\"",
+        "                const titleCased = sym.charAt(0).toUpperCase() + sym.slice(1).toLowerCase();",
+        "                if (titleCased === sym)",
+    )
+
+    private val definitionFragmentReplacement = lines(
+        "            const wholeNameQuery = query.trim().toLowerCase();",
+        "            const nameShapedQuery = !/\\s/.test(query.trim());",
+        "            for (const sym of expandedSymbols) {",
+        "                // A fragment of a name-shaped query is not the name: skip it,",
+        "                // so `ThingFactory` cannot answer `nonexistent_thing_xyz` just",
+        "                // by starting with \"thing\". The whole token still matches.",
+        "                if (nameShapedQuery && sym.toLowerCase() !== wholeNameQuery && wholeNameQuery.includes(sym.toLowerCase()))",
+        "                    continue;",
+        "                // Title-case the symbol: \"REST\" → \"Rest\", \"bulk\" → \"Bulk\", \"allocation\" → \"Allocation\"",
+        "                const titleCased = sym.charAt(0).toUpperCase() + sym.slice(1).toLowerCase();",
+        "                if (titleCased === sym)",
+    )
+
+    private val termSearchAnchor = lines(
+        "                for (const term of searchTerms) {",
+        "                    const termResults = this.queries.searchNodes(term, {",
+        "                        limit: opts.searchLimit * 2,",
+        "                        kinds: searchKinds,",
+        "                    });",
+        "                    for (const r of termResults) {",
+        "                        const existing = termResultsMap.get(r.node.id);",
+        "                        if (existing) {",
+        "                            existing.termHits++;",
+        "                            existing.result.score = Math.max(existing.result.score, r.score);",
+        "                        }",
+        "                        else {",
+        "                            termResultsMap.set(r.node.id, { result: r, termHits: 1 });",
+        "                        }",
+        "                    }",
+        "                }",
+    )
+
+    private val termSearchReplacement = lines(
+        "                const wholeNameQuery = query.trim().toLowerCase();",
+        "                const nameShapedQuery = !/\\s/.test(query.trim());",
+        "                for (const term of searchTerms) {",
+        "                    const termIsWholeName = term.trim().toLowerCase() === wholeNameQuery;",
+        "                    const termResults = this.queries.searchNodes(term, {",
+        "                        limit: opts.searchLimit * 2,",
+        "                        kinds: searchKinds,",
+        "                    });",
+        "                    for (const r of termResults) {",
+        "                        const existing = termResultsMap.get(r.node.id);",
+        "                        if (existing) {",
+        "                            existing.termHits++;",
+        "                            if (termIsWholeName)",
+        "                                existing.wholeNameHit = true;",
+        "                            existing.result.score = Math.max(existing.result.score, r.score);",
+        "                        }",
+        "                        else {",
+        "                            termResultsMap.set(r.node.id, { result: r, termHits: 1, wholeNameHit: termIsWholeName });",
+        "                        }",
+        "                    }",
+        "                }",
+    )
+
+    private val termResultsFilterAnchor = lines(
+        "                textResults = Array.from(termResultsMap.values())",
+        "                    .map(({ result, termHits }) => ({",
+    )
+
+    private val termResultsFilterReplacement = lines(
+        "                textResults = Array.from(termResultsMap.values())",
+        "                    // One fragment of a name-shaped query matching one symbol is a",
+        "                    // coincidence, so it needs the whole name or two of its",
+        "                    // fragments on the same symbol. Answering a name that does not",
+        "                    // exist with a plausible file is worse than answering nothing:",
+        "                    // the caller reads that source as authoritative.",
+        "                    .filter(({ termHits, wholeNameHit }) => !nameShapedQuery || wholeNameHit || termHits >= 2)",
+        "                    .map(({ result, termHits }) => ({",
+    )
+
     // ------------------------------------------------------------------
 
     private val patches = listOf(
@@ -1040,8 +1377,17 @@ internal object CodeGraphBundlePatches {
             "extraction/tree-sitter.js", importHookNodeAnchor, importHookNodeReplacement,
             fallbackAnchors = listOf(importHookNodeFallback1),
             fallbackReplacements = listOf(importHookNodeFallback1Replacement),
+            // Generation 9 already emits the reference from the import node as
+            // well as the file, which is all this patch is for, so a file that
+            // carries that line is done even though its head no longer matches
+            // the pristine shape.
+            satisfiedMarkers = listOf("importNode.id !== parentId"),
         ),
-        Patch("extraction/tree-sitter.js", pythonImportStmtAnchor, pythonImportStmtReplacement),
+        Patch(
+            "extraction/tree-sitter.js", pythonImportStmtAnchor, pythonImportStmtReplacement,
+            fallbackAnchors = listOf(pythonImportStmtFallback1),
+            fallbackReplacements = listOf(pythonImportStmtFallback1Replacement),
+        ),
         Patch("extraction/tree-sitter.js", treeSitterAnchor, treeSitterReplacement),
         Patch("extraction/extraction-version.js", extractionVersionAnchor, extractionVersionReplacement),
         Patch("mcp/tools.js", normalizeQueryAnchor, normalizeQueryReplacement),
@@ -1064,15 +1410,28 @@ internal object CodeGraphBundlePatches {
             fallbackAnchors = listOf(maintenanceFallback1),
             satisfiedMarkers = listOf("PRAGMA incremental_vacuum"),
         ),
+        Patch("db/index.js", autoVacuumAnchor, autoVacuumReplacement),
+        Patch(
+            "db/index.js", reclaimSpaceMethodAnchor, reclaimSpaceMethodReplacement,
+            satisfiedMarkers = listOf("reclaimSpace() {"),
+        ),
+        Patch(
+            "db/index.js", reclaimSpaceAnchor, reclaimSpaceReplacement,
+            satisfiedMarkers = listOf("conn.reclaimSpace();"),
+        ),
         Patch(
             "db/migrations.js", migrationVersionAnchor, migrationVersionReplacement,
             satisfiedMarkers = listOf("CURRENT_SCHEMA_VERSION = 11;"),
         ),
         Patch(
             "db/migrations.js", migrationListAnchor, migrationListReplacement,
-            fallbackAnchors = listOf(migrationListFallback1),
-            fallbackReplacements = listOf(migrationListFallback1Replacement),
-            satisfiedMarkers = listOf("version: 11,"),
+            fallbackAnchors = listOf(migrationListFallback1, migrationListFallback2),
+            fallbackReplacements = listOf(migrationListFallback1Replacement, migrationListFallback2Replacement),
+            // `version: 11` is NOT the marker: every generation since the
+            // freelist patch carries it, including the ones that vacuum inside
+            // the migration transaction. The fold is what only the fixed body
+            // has.
+            satisfiedMarkers = listOf("UPDATE OR IGNORE edges SET target"),
         ),
         Patch("db/queries.js", insertUnresolvedAnchor, insertUnresolvedReplacement),
         Patch(
@@ -1082,6 +1441,10 @@ internal object CodeGraphBundlePatches {
             satisfiedMarkers = listOf("pruneCrossLanguageEdges() {"),
         ),
         Patch("index.js", openPruneAnchor, openPruneReplacement),
+        Patch("index.js", segmentSeedAnchor, segmentSeedReplacement),
+        Patch("context/index.js", definitionFragmentAnchor, definitionFragmentReplacement),
+        Patch("context/index.js", termSearchAnchor, termSearchReplacement),
+        Patch("context/index.js", termResultsFilterAnchor, termResultsFilterReplacement),
     )
 
     /**

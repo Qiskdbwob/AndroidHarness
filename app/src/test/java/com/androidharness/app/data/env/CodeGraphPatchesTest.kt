@@ -206,10 +206,129 @@ class CodeGraphPatchesTest {
         "    }",
     )
 
+    /** Generation 9 tree-sitter: the dual reference is in, on a renamed const. */
+    private val treeSitterV9Source = lines(
+        "    createNode(kind, name, node, extra) {",
+        "        // Skip nodes with empty/missing names — they are not meaningful symbols",
+        "        // and would cause FK violations when edges reference them (see issue #42)",
+        "        if (!name) {",
+        "            return null;",
+        "        }",
+        "        // Harness patch: filter out junk AST tokens that pollute symbol queries",
+        "        if (name === '.' || name === '..' || name === '...' || name.startsWith('from ') || name.startsWith('import ')) {",
+        "            return null;",
+        "        }",
+        "    }",
+        "        if (this.extractor.extractImport) {",
+        "            const info = this.extractor.extractImport(node, this.source);",
+        "            if (info) {",
+        "                const importNode = this.createNode('import', info.moduleName, node, {",
+        "                    signature: info.signature,",
+        "                });",
+        "                if (!info.handledRefs && info.moduleName && this.nodeStack.length > 0) {",
+        "                    const parentId = this.nodeStack[this.nodeStack.length - 1];",
+        "                    if (parentId) {",
+        "                        this.unresolvedReferences.push({",
+        "                            fromNodeId: parentId,",
+        "                            referenceName: info.moduleName,",
+        "                            referenceKind: 'imports',",
+        "                            line: node.startPosition.row + 1,",
+        "                            column: node.startPosition.column,",
+        "                        });",
+        "                    }",
+        "                    if (importNode && importNode.id !== parentId) {",
+        "                        this.unresolvedReferences.push({",
+        "                            fromNodeId: importNode.id,",
+        "                            referenceName: info.moduleName,",
+        "                            referenceKind: 'imports',",
+        "                            line: node.startPosition.row + 1,",
+        "                            column: node.startPosition.column,",
+        "                        });",
+        "                    }",
+        "                }",
+        "                if (this.language === 'python' && node.type === 'import_statement') {",
+        "                if (child?.type === 'dotted_name') {",
+        "                    const impNode = this.createNode('import', (0, tree_sitter_helpers_1.getNodeText)(child, this.source), node, {",
+        "                        signature: importText,",
+        "                    });",
+        "                    pushModuleRef(child);",
+        "                    if (impNode) {",
+        "                        this.unresolvedReferences.push({",
+        "                            fromNodeId: impNode.id,",
+        "                            referenceName: (0, tree_sitter_helpers_1.getNodeText)(child, this.source),",
+        "                            referenceKind: 'imports',",
+        "                            line: child.startPosition.row + 1,",
+        "                            column: child.startPosition.column,",
+        "                        });",
+        "                    }",
+        "                }",
+        "            }",
+        "        }",
+    )
+
+    /** Generation 9: the base is right, the wrapper above it emits the old model. */
+    private val createEdgesV9Source = lines(
+        "    createEdges(resolved) {",
+        "        const mapped = this.createEdgesBase(resolved);",
+        "        const out = [];",
+        "        for (const edge of mapped) {",
+        "            if (!edge || edge.source === edge.target) continue;",
+        "            out.push(edge);",
+        "            if (edge.kind === 'imports') {",
+        "                const srcNode = this.queries.getNodeById(edge.source);",
+        "                if (srcNode && srcNode.kind === 'import') {",
+        "                    const fileNodes = this.context.getNodesInFile(srcNode.filePath);",
+        "                    const fileNode = fileNodes ? fileNodes.find((n) => n.kind === 'file') : null;",
+        "                    if (fileNode && fileNode.id !== edge.target) {",
+        "                        out.push({ ...edge, source: fileNode.id });",
+        "                    }",
+        "                }",
+        "            }",
+        "        }",
+        "        return out;",
+        "    }",
+        "    createEdgesBase(resolved) {",
+        "        return resolved.map((ref) => {",
+    )
+
+    private val contextSource = lines(
+        "            for (const sym of expandedSymbols) {",
+        "                // Title-case the symbol: \"REST\" \u2192 \"Rest\", \"bulk\" \u2192 \"Bulk\", \"allocation\" \u2192 \"Allocation\"",
+        "                const titleCased = sym.charAt(0).toUpperCase() + sym.slice(1).toLowerCase();",
+        "                if (titleCased === sym)",
+        "                    continue;",
+        "            }",
+        "                for (const term of searchTerms) {",
+        "                    const termResults = this.queries.searchNodes(term, {",
+        "                        limit: opts.searchLimit * 2,",
+        "                        kinds: searchKinds,",
+        "                    });",
+        "                    for (const r of termResults) {",
+        "                        const existing = termResultsMap.get(r.node.id);",
+        "                        if (existing) {",
+        "                            existing.termHits++;",
+        "                            existing.result.score = Math.max(existing.result.score, r.score);",
+        "                        }",
+        "                        else {",
+        "                            termResultsMap.set(r.node.id, { result: r, termHits: 1 });",
+        "                        }",
+        "                    }",
+        "                }",
+        "                textResults = Array.from(termResultsMap.values())",
+        "                    .map(({ result, termHits }) => ({",
+    )
+
     private val indexSource = lines(
         "        const db = db_1.DatabaseConnection.open(dbPath);",
         "        const queries = new queries_1.QueryBuilder(db.getDb());",
         "        const instance = new CodeGraph(db, queries, resolvedRoot);",
+        "        let seedNames = options?.seedNames;",
+        "        if (seedNames === undefined) {",
+        "            try {",
+        "                seedNames = this.getSegmentMatches((0, identifier_segments_1.extractSegmentSearchWords)(query), 8)",
+        "                    .map((m) => m.name);",
+        "            }",
+        "        }",
     )
 
     private val extractionVersionSource = "exports.EXTRACTION_VERSION = 25;"
@@ -274,6 +393,7 @@ class CodeGraphPatchesTest {
         "                        });",
         "                    }",
         "                }",
+        "                if (this.language === 'python' && node.type === 'import_statement') {",
         "                if (child?.type === 'dotted_name') {",
         "                    this.createNode('import', (0, tree_sitter_helpers_1.getNodeText)(child, this.source), node, {",
         "                        signature: importText,",
@@ -314,6 +434,7 @@ class CodeGraphPatchesTest {
         "                        });",
         "                    }",
         "                }",
+        "                if (this.language === 'python' && node.type === 'import_statement') {",
         "                if (child?.type === 'dotted_name') {",
         "                    const impNode = this.createNode('import', (0, tree_sitter_helpers_1.getNodeText)(child, this.source), node, {",
         "                        signature: importText,",
@@ -404,16 +525,32 @@ class CodeGraphPatchesTest {
     )
 
     private val dbSource = lines(
+        "    db.pragma('busy_timeout = 5000'); // MUST be first — see above",
+        "    db.pragma('synchronous = NORMAL'); // safe with WAL mode",
+        "        if (currentVersion < migrations_1.CURRENT_SCHEMA_VERSION) {",
+        "            (0, migrations_1.runMigrations)(db, currentVersion);",
+        "        }",
         "        await this.runPragmasOffThread(['PRAGMA analysis_limit=1000', 'PRAGMA optimize', 'PRAGMA wal_checkpoint(PASSIVE)'], ",
         "        // Worker threads unavailable — bounded in-line fallback, no checkpoint.",
         "        ['PRAGMA analysis_limit=1000', 'PRAGMA optimize']);",
+        "    close() {",
+        "        this.db.close();",
+        "    }",
     )
 
     /** Generation 4 hybrid maintenance as found on devices. */
     private val dbStaleSource = lines(
+        "    db.pragma('busy_timeout = 5000'); // MUST be first — see above",
+        "    db.pragma('synchronous = NORMAL'); // safe with WAL mode",
+        "        if (currentVersion < migrations_1.CURRENT_SCHEMA_VERSION) {",
+        "            (0, migrations_1.runMigrations)(db, currentVersion);",
+        "        }",
         "        await this.runPragmasOffThread(['PRAGMA analysis_limit=1000', 'PRAGMA optimize', 'ANALYZE', 'PRAGMA wal_checkpoint(PASSIVE)'], ",
         "        // Worker threads unavailable — bounded in-line fallback, no checkpoint.",
         "        ['PRAGMA analysis_limit=1000', 'PRAGMA optimize', 'ANALYZE']);",
+        "    close() {",
+        "        this.db.close();",
+        "    }",
     )
 
     private val migrationsSource = lines(
@@ -424,6 +561,39 @@ class CodeGraphPatchesTest {
         "        description: 'test',",
         "        up: (db) => {",
         "            db.exec('CREATE INDEX IF NOT EXISTS idx_files_generated ON files(path) WHERE generated = 1');",
+        "        },",
+        "    },",
+        "];",
+    )
+
+    /**
+     * Generation 9: the freelist patch is in, migration 11 and all, which is
+     * what makes it dangerous — the migration vacuums inside the transaction
+     * migrations run in, so every sync fails until the body is rewritten.
+     */
+    private val migrationsV9Source = lines(
+        "exports.CURRENT_SCHEMA_VERSION = 11;",
+        "const migrations = [",
+        "    {",
+        "        version: 10,",
+        "        description: 'Prune cross-language edges',",
+        "        up: (db) => {",
+        "            db.exec(`",
+        "        DELETE FROM name_segment_vocab WHERE name NOT IN (SELECT name FROM nodes);",
+        "        UPDATE project_metadata SET value = '26' WHERE key = 'indexed_with_extraction_version';",
+        "      `);",
+        "        },",
+        "    },",
+        "    {",
+        "        version: 11,",
+        "        description: 'Compact the database freelist after the cross-language prune',",
+        "        up: (db) => {",
+        "            db.exec(`",
+        "        DELETE FROM name_segment_vocab WHERE name NOT IN (SELECT name FROM nodes);",
+        "        UPDATE project_metadata SET value = '26' WHERE key = 'indexed_with_extraction_version';",
+        "        PRAGMA auto_vacuum = INCREMENTAL;",
+        "        VACUUM;",
+        "      `);",
         "        },",
         "    },",
         "];",
@@ -497,6 +667,7 @@ class CodeGraphPatchesTest {
         db: String = dbSource,
         migrations: String = migrationsSource,
         queries: String = queriesSource,
+        context: String = contextSource,
     ): File {
         val dist = tempDir()
         File(dist, "resolution").mkdirs()
@@ -504,7 +675,9 @@ class CodeGraphPatchesTest {
         File(dist, "mcp").mkdirs()
         File(dist, "bin").mkdirs()
         File(dist, "db").mkdirs()
+        File(dist, "context").mkdirs()
         File(dist, "index.js").writeText(indexSource)
+        File(dist, "context/index.js").writeText(context)
         File(dist, "resolution/name-matcher.js").writeText(matcher)
         File(dist, "resolution/index.js").writeText(resolver)
         File(dist, "resolution/import-resolver.js").writeText(importResolverSource)
@@ -545,7 +718,9 @@ class CodeGraphPatchesTest {
         assertTrue("name-matcher fuzzy guarded", matcher.contains("sameLanguageCandidates = ref.language"))
         assertTrue("resolver drops self-loops and falls back to node language", resolver.contains("const refLang = ref.language || this.getLanguageFromNodeId(ref.fromNodeId);"))
         assertTrue("framework gate rejects cross-language decorates", resolver.contains("ref.referenceKind === 'decorates'"))
-        assertTrue("createEdges wrapper adds self-loop drop and dual import edge", resolver.contains("createEdgesBase(resolved) {") && resolver.contains("edge.source === edge.target") && resolver.contains("out.push({ ...edge, source: fileNode.id });"))
+        assertTrue("createEdges wrapper folds imports onto files", resolver.contains("createEdgesBase(resolved) {") && resolver.contains("const from = src.kind === 'file' ? src : this.fileNodeOf(src.filePath);") && resolver.contains("out.push({ ...edge, source: from.id, target: to.id });"))
+        assertTrue("createEdges wrapper dedupes imports", resolver.contains("seenImports.has(key)"))
+        assertTrue("createEdges wrapper drops self-loops", resolver.contains("edge.source === edge.target"))
         assertTrue("index.js performs retroactive prune on open", index.contains("pruneCrossLanguageEdges()"))
         assertTrue("import resolver supports bare python module import", importResolver.contains("bare single module imports"))
         assertTrue("import resolver matches TS relative imports", importResolver.contains("imp.source === ref.referenceName"))
@@ -560,9 +735,15 @@ class CodeGraphPatchesTest {
         assertTrue("mcp explore raises hard ceiling", tools.contains("40000);"))
         assertTrue("bin impact shows multi-def note", bin.contains("definitions named"))
         assertTrue("db maintenance excludes virtual FTS table", db.contains("ANALYZE nodes"))
+        assertTrue("db enables incremental auto-vacuum", db.contains("db.pragma('auto_vacuum = INCREMENTAL');"))
+        assertTrue("db reclaims space outside any transaction", db.contains("reclaimSpace() {") && db.contains("this.db.exec('VACUUM');"))
+        assertTrue("db calls reclaimSpace after migrations commit", db.contains("conn.reclaimSpace();"))
         assertTrue("migrations bumps version to 11", migrations.contains("CURRENT_SCHEMA_VERSION = 11;"))
         assertTrue("migrations includes version 11", migrations.contains("version: 11,"))
-        assertTrue("migrations 11 vacuums freelist", migrations.contains("PRAGMA auto_vacuum = INCREMENTAL;"))
+        // The migration transaction is why the freelist is reclaimed from
+        // reclaimSpace instead: VACUUM inside it fails on every sync.
+        assertTrue("migration 11 never vacuums", !migrations.contains("VACUUM;"))
+        assertTrue("migration 11 folds legacy import edges onto files", migrations.contains("UPDATE OR IGNORE edges SET target"))
         assertTrue("queries uses INSERT OR IGNORE", queries.contains("INSERT OR IGNORE INTO unresolved_refs"))
         assertTrue("queries has pruneCrossLanguageEdges method", queries.contains("pruneCrossLanguageEdges()"))
         assertTrue("queries prunes vocab on file deletion", queries.contains("DELETE FROM name_segment_vocab WHERE name NOT IN"))
@@ -598,12 +779,56 @@ class CodeGraphPatchesTest {
         assertTrue("gateLanguage healed to self-loop + language fallback", resolver.contains("const refLang = ref.language || this.getLanguageFromNodeId(ref.fromNodeId);"))
         assertTrue("createEdges repair converted the stray return", resolver.contains("const edge = {") && resolver.contains("out.push(edge);") && !resolver.contains("            return {\n                source: ref.original.fromNodeId,"))
         assertTrue("createEdges repair keeps the loop returning the array", resolver.contains("return out;"))
+        assertTrue("createEdges wrapper folded the loop shape too", resolver.contains("const from = src.kind === 'file' ? src : this.fileNodeOf(src.filePath);"))
         assertTrue("tree-sitter healed to dual refs", treeSitter.contains("importNode.id !== parentId"))
         assertTrue("tools budget healed", tools.contains("maxOutputChars: 40000"))
         assertTrue("tools searchLimit healed", tools.contains("Math.max(30, maxFiles * 3)"))
         assertTrue("db maintenance healed", db.contains("ANALYZE nodes"))
-        assertTrue("migrations healed with migration 11", migrations.contains("version: 11,") && migrations.contains("PRAGMA auto_vacuum = INCREMENTAL;"))
+        assertTrue("db healed to reclaim space on open", db.contains("reclaimSpace() {") && db.contains("conn.reclaimSpace();"))
+        assertTrue("migrations healed with migration 11", migrations.contains("version: 11,") && migrations.contains("UPDATE OR IGNORE edges SET target"))
+        assertTrue("healed migration 11 does not vacuum", !migrations.contains("VACUUM;"))
         assertTrue("queries healed with prune method", queries.contains("pruneCrossLanguageEdges() {"))
+    }
+
+    /**
+     * The state a device reaches by installing one build after another: the
+     * freelist patch is in with its migration 11, which is what has to come
+     * out, and the dual import reference is in under a shape the pristine
+     * anchor no longer matches. Both have to be recognised, not re-applied and
+     * not reported as unresolved.
+     */
+    @Test
+    fun `heals a generation 9 device without leaving the vacuum in place`() {
+        val dist = bundle(
+            resolver = gateStaleSource + "\n" + createEdgesV9Source,
+            treeSitter = treeSitterV9Source,
+            migrations = migrationsV9Source,
+        )
+
+        val result = CodeGraphBundlePatches.apply(dist)
+
+        assertTrue("generation 9 must heal cleanly: ${result.unresolved}", result.unresolved.isEmpty())
+        assertTrue(
+            "the migration and the edge model are what change: ${result.applied}",
+            result.applied.contains("db/migrations.js") &&
+                result.applied.contains("resolution/index.js") &&
+                result.applied.contains("db/index.js"),
+        )
+        assertTrue(
+            "a tree-sitter file that already emits the dual reference is done",
+            !result.applied.contains("extraction/tree-sitter.js"),
+        )
+
+        val resolver = File(dist, "resolution/index.js").readText()
+        assertTrue("the old import model must be replaced", resolver.contains("fileNodeOf(filePath)"))
+        assertTrue("the mirrored import edge must be gone", !resolver.contains("out.push({ ...edge, source: fileNode.id });"))
+        assertTrue("the base must not be wrapped by itself", resolver.split("createEdgesBase(resolved) {").size - 1 == 1)
+        assertTrue("the base must still be there", resolver.contains("return resolved.map((ref) => {"))
+
+        val migrations = File(dist, "db/migrations.js").readText()
+        assertTrue("the vacuum must be gone from the migration", !migrations.contains("VACUUM;"))
+        assertTrue("legacy import edges must be folded onto files", migrations.contains("UPDATE OR IGNORE edges SET target"))
+        assertTrue("migration 11 must survive", migrations.contains("version: 11,"))
     }
 
     @Test
@@ -615,7 +840,7 @@ class CodeGraphPatchesTest {
         val second = CodeGraphBundlePatches.apply(dist)
 
         assertTrue("a patched file must not be patched again", second.applied.isEmpty())
-        assertEquals("nothing should be unresolved either", 0, second.unresolved.size)
+        assertTrue("nothing may be unresolved either: ${second.unresolved}", second.unresolved.isEmpty())
         assertEquals("the file must be byte for byte the same", afterFirst, File(dist, "resolution/index.js").readText())
     }
 
@@ -632,5 +857,29 @@ class CodeGraphPatchesTest {
         assertTrue("nothing should be applied", result.applied.isEmpty())
         assertTrue("unresolved list must contain name-matcher", result.unresolved.contains("resolution/name-matcher.js"))
         assertEquals("an unmatched file must be untouched", other, matcher.readText())
+    }
+
+    /**
+     * The fixtures above pin the shapes we have seen on devices. This one asks
+     * the opposite question: do the anchors still match the release they are
+     * written against? Set `CODEGRAPH_RELEASE_DIST` to the unpacked `lib/dist`
+     * of a release archive to run it; the patched copy is left in the temp dir
+     * so the result can be run, not just counted.
+     */
+    @Test
+    fun `applies to a real release bundle when one is provided`() {
+        val source = System.getenv("CODEGRAPH_RELEASE_DIST")?.takeIf { it.isNotBlank() }?.let(::File) ?: return
+        val dist = File(System.getProperty("java.io.tmpdir"), "codegraph-patched-dist")
+        dist.deleteRecursively()
+        source.copyRecursively(dist, overwrite = true)
+
+        val result = CodeGraphBundlePatches.apply(dist)
+
+        assertTrue("every anchor must still match the bundle: ${result.unresolved}", result.unresolved.isEmpty())
+        // Not every file changes on a bundle a previous generation already
+        // patched, so the count is asserted only for a pristine release, which
+        // the fixture test above covers. What has to hold anywhere is that
+        // nothing is left unrecognised and a second pass does nothing.
+        assertTrue("a second pass must be a no-op", CodeGraphBundlePatches.apply(dist).applied.isEmpty())
     }
 }
