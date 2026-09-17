@@ -677,6 +677,47 @@ internal object RegexSafety {
     }
 }
 
+/** Characters of line text shown around a match before the excerpt is clipped. */
+internal const val GREP_EXCERPT_WINDOW = 300
+
+/**
+ * Renders the part of [line] around the match at [matchStart] so the matched
+ * text is actually visible.
+ *
+ * A plain `line.take(300)` hid the match completely whenever it sat deep in a
+ * long line: a 210,022-byte line holding the token at column 100,003 reported
+ * one matching line and showed only its first 300 characters, with no hint
+ * that anything had been cut, so an agent reading the result could not see
+ * what matched (on-device QA, 2026-09-17). Clipped sides are marked with "...".
+ */
+internal fun grepExcerpt(line: String, matchStart: Int, window: Int = GREP_EXCERPT_WINDOW): String {
+    if (line.length <= window) return line
+    val start = (matchStart - window / 2).coerceIn(0, (line.length - window).coerceAtLeast(0))
+    val end = (start + window).coerceAtMost(line.length)
+    val head = if (start > 0) "..." else ""
+    val tail = if (end < line.length) "..." else ""
+    return head + line.substring(start, end) + tail
+}
+
+/**
+ * Finds a match in a line too long to scan in one piece, returning the
+ * absolute character offset of the match (or null). Overlapping windows, so a
+ * match straddling a chunk boundary is still found.
+ */
+internal fun findInLongLine(regex: Regex, line: String, budget: RegexStepBudget): Int? {
+    val chunkSize = 60_000
+    val overlap = 2_000
+    var start = 0
+    while (start < line.length) {
+        val end = (start + chunkSize).coerceAtMost(line.length)
+        val match = regex.find(BudgetedCharSequence(line.substring(start, end), budget))
+        if (match != null) return start + match.range.first
+        if (end >= line.length) break
+        start += (chunkSize - overlap)
+    }
+    return null
+}
+
 class GrepTool(
     private val regexStepBudget: Long = DEFAULT_REGEX_STEP_BUDGET,
     private val regexTimeoutMs: Long = DEFAULT_REGEX_TIMEOUT_MS,
@@ -736,14 +777,19 @@ class GrepTool(
                 for (node in ctx.workspace.walk(path)) {
                     if (matches.size >= MAX_GREP_MATCHES) break
                     if (!node.isFile) continue
+                    // The include filter runs BEFORE the size/binary/skip
+                    // bookkeeping. A file the caller excluded is not part of
+                    // this search, so naming it in "[Skipped: …]" only made the
+                    // result look like the filter had been ignored (on-device
+                    // QA, 2026-09-17).
+                    if (includeMatcher != null &&
+                        !includeMatcher.matches(java.nio.file.Path.of(node.name))
+                    ) continue
                     if (node.length > 2_000_000) {
                         skipped += "${node.relPath} (>2MB)"
                         continue
                     }
                     if (node.isBinary()) continue
-                    if (includeMatcher != null &&
-                        !includeMatcher.matches(java.nio.file.Path.of(node.name))
-                    ) continue
                     val text = runCatching { node.readText() }.getOrNull()
                     if (text == null) {
                         skipped += "${node.relPath} (read failed)"
@@ -753,27 +799,13 @@ class GrepTool(
                     try {
                         lines.forEachIndexed { idx, line ->
                             if (matches.size >= MAX_GREP_MATCHES) return@forEachIndexed
-                            val matched = if (line.length <= 65_536) {
-                                regex.containsMatchIn(BudgetedCharSequence(line, budget))
+                            val matchStart = if (line.length <= 65_536) {
+                                regex.find(BudgetedCharSequence(line, budget))?.range?.first
                             } else {
-                                var found = false
-                                val chunkSize = 60_000
-                                val overlap = 2_000
-                                var start = 0
-                                while (start < line.length) {
-                                    val end = (start + chunkSize).coerceAtMost(line.length)
-                                    val sub = line.substring(start, end)
-                                    if (regex.containsMatchIn(BudgetedCharSequence(sub, budget))) {
-                                        found = true
-                                        break
-                                    }
-                                    if (end >= line.length) break
-                                    start += (chunkSize - overlap)
-                                }
-                                found
+                                findInLongLine(regex, line, budget)
                             }
-                            if (matched) {
-                                matches += "${node.relPath}:${idx + 1}: ${line.take(300)}"
+                            if (matchStart != null) {
+                                matches += "${node.relPath}:${idx + 1}: " + grepExcerpt(line, matchStart)
                             }
                         }
                     } catch (e: RegexBudgetExceeded) {

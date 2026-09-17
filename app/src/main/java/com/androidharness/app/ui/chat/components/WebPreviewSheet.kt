@@ -990,6 +990,11 @@ private fun WebPageView(
 
                             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                                 isLoading = true
+                                // The agent waits on these for the navigation it
+                                // triggered; this client is not the controller's,
+                                // so without forwarding, an action driven against
+                                // the visible WebView has no load signal at all.
+                                browserController?.notePageStarted()
                                 url?.let {
                                     if (!it.startsWith("data:") && !it.startsWith("https://localhost/")) {
                                         currentUrl = it
@@ -1001,6 +1006,7 @@ private fun WebPageView(
 
                             override fun onPageFinished(view: WebView?, url: String?) {
                                 isLoading = false
+                                browserController?.notePageFinished(url)
                                 canGoBack = canGoBack()
                                 canGoForward = canGoForward()
                                 pageTitle = view?.title ?: currentUrl.substringAfterLast('/')
@@ -1014,6 +1020,7 @@ private fun WebPageView(
                                 if (request?.isForMainFrame == true) {
                                     isLoading = false
                                     errorMessage = error?.description?.toString() ?: "Failed to connect to $target"
+                                    browserController?.notePageError(errorMessage)
                                 }
                             }
 

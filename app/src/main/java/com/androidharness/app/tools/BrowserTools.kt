@@ -65,7 +65,10 @@ class BrowserNavigateTool(
         "or a workspace-relative local file (e.g. 'index.html', 'docs/about.html'). Local files are served under " +
         "https://harness.workspace/ws/... via request interception, so relative links, form submits, assets, and " +
         "back/forward history behave like a real site. Returns page title, URL, scroll position, text excerpt, " +
-        "and an indexed catalog of interactive elements ([id]) for clicking and typing."
+        "and an indexed catalog of interactive elements ([id]) for clicking and typing. The call fails, rather " +
+        "than reporting the previous page, when the target produces no page at all (a download or attachment " +
+        "response, or a scheme the WebView refuses to render), and says so when a slow page has not finished " +
+        "loading yet."
     override val parametersSchema = Schema.obj(
         mapOf(
             "url" to Schema.string("The target URL (e.g. 'https://example.com', 'http://localhost:5173', or 'index.html')."),
@@ -96,11 +99,14 @@ class BrowserClickTool(
     override val name = "browser_click"
     override val description =
         "Click an interactive element on the current browser page by its numeric id (from browser_navigate or " +
-        "browser_get_dom) or a CSS selector. Automatically scrolls the element into view and returns the updated page state."
+            "browser_get_dom) or a CSS selector. Supply only one: when both are given the selector is used and " +
+            "the result says so, because an id is only valid for the page state it was indexed from. " +
+            "Automatically scrolls the element into view and returns the updated page state. Clicking a disabled " +
+            "element still dispatches the click (as a real user click would) but the result warns that nothing happened."
     override val parametersSchema = Schema.obj(
         mapOf(
-            "id" to Schema.integer("The numeric element id from previous DOM indexing (e.g. 3)."),
-            "selector" to Schema.string("Optional CSS selector (e.g. '#submit-btn', 'button.primary')."),
+            "id" to Schema.integer("The numeric element id from previous DOM indexing (e.g. 3). Ignored when 'selector' is supplied."),
+            "selector" to Schema.string("Optional CSS selector (e.g. '#submit-btn', 'button.primary'). Takes precedence over 'id'."),
         ),
     )
     override val isReadOnly = false
@@ -131,12 +137,14 @@ class BrowserTypeTool(
     override val name = "browser_type"
     override val description =
         "Type text into an input, textarea, or contenteditable element by its numeric id or CSS selector. " +
-        "Dispatches standard input and change events so JavaScript reactive forms update properly."
+            "Supply only one: when both are given the selector is used and the result says so. " +
+            "Dispatches standard input and change events so JavaScript reactive forms update properly. Typing into " +
+            "a disabled field still dispatches the events but the result warns that nothing happened."
     override val parametersSchema = Schema.obj(
         mapOf(
             "text" to Schema.string("The text to type into the element."),
-            "id" to Schema.integer("The numeric element id from previous DOM indexing."),
-            "selector" to Schema.string("Optional CSS selector targeting the input element."),
+            "id" to Schema.integer("The numeric element id from previous DOM indexing. Ignored when 'selector' is supplied."),
+            "selector" to Schema.string("Optional CSS selector targeting the input element. Takes precedence over 'id'."),
             "clear_first" to Schema.boolean("Whether to clear existing text before typing (default false)."),
         ),
         required = listOf("text"),

@@ -7,6 +7,7 @@ import android.os.Handler
 import android.os.Looper
 import android.view.View
 import android.webkit.ConsoleMessage
+import android.webkit.DownloadListener
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -46,7 +47,6 @@ import java.util.Date
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.CopyOnWriteArrayList
-import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.roundToInt
 
 @Serializable
@@ -105,6 +105,16 @@ data class BrowserEvalOutcome(
     val value: String?,
     val error: String?,
 )
+
+/**
+ * Which element an action targets. Exactly one of the two is set, chosen by
+ * [BrowserController.resolveElementTarget].
+ */
+data class ElementTarget(val elementId: Int?, val selector: String?) {
+    /** How this target is named in an error message. */
+    val errorSubject: String
+        get() = if (selector != null) "Element matching '$selector'" else "Element $elementId"
+}
 
 /** Saved screenshot outcome containing workspace relative path, cache file, and size. */
 data class BrowserScreenshotResult(
@@ -215,11 +225,12 @@ class BrowserController(
         }
     }
 
-    private val isPageLoading = AtomicBoolean(false)
-
-    /** Completed by onPageFinished of the HEADLESS client; mirrored WebViews signal via URL polling. */
-    @Volatile
-    private var loadDeferred: CompletableDeferred<Unit>? = null
+    /**
+     * Navigation lifecycle of the active view. Fed by the headless client's
+     * callbacks and by the preview sheet forwarding its own, so actions can
+     * wait for a real document instead of guessing from `WebView.url`.
+     */
+    private val loadTracker = PageLoadTracker()
 
     // Agent activity trail, newest last, capped; drives the WebPreviewSheet banner.
     private val trackScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
@@ -254,6 +265,10 @@ class BrowserController(
      */
     fun bindActiveWebView(webView: WebView) {
         activeWebViewRef = WeakReference(webView)
+        // The preview sheet has its own WebViewClient, so a main-frame download
+        // there is invisible to us unless we set the listener ourselves; without
+        // it an attachment navigation looks like a successful, unchanged page.
+        runCatching { webView.setDownloadListener(downloadListener) }
     }
 
     fun unbindActiveWebView(webView: WebView) {
@@ -311,16 +326,26 @@ class BrowserController(
 
                 override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                     super.onPageStarted(view, url, favicon)
-                    // A fresh deferred per navigation, so action methods can await
-                    // click-triggered loads and not just the navigate() one.
-                    loadDeferred = CompletableDeferred()
-                    isPageLoading.set(true)
+                    notePageStarted()
                 }
 
                 override fun onPageFinished(view: WebView?, url: String?) {
                     super.onPageFinished(view, url)
-                    isPageLoading.set(false)
-                    loadDeferred?.complete(Unit)
+                    notePageFinished(url)
+                }
+
+                override fun onReceivedError(
+                    view: WebView?,
+                    request: WebResourceRequest?,
+                    error: android.webkit.WebResourceError?,
+                ) {
+                    super.onReceivedError(view, request, error)
+                    // A main-frame failure still replaces the page with an error
+                    // document, so the wait must end here; the reason is worth
+                    // reporting instead of a silent error page.
+                    if (request?.isForMainFrame == true) {
+                        notePageError(error?.description?.toString())
+                    }
                 }
 
                 override fun shouldInterceptRequest(
@@ -331,6 +356,8 @@ class BrowserController(
                         ?: super.shouldInterceptRequest(view, request)
                 }
             }
+
+            setDownloadListener(downloadListener)
         }
         headlessWebView = wv
         wv.loadUrl("about:blank")
@@ -338,37 +365,182 @@ class BrowserController(
     }
 
     /**
-     * Waits until a new navigation starts (fresh load deferred on the headless
-     * client, or the URL changed on a mirrored one), then waits for it to
-     * finish. Returns true when a navigation was observed.
+     * Navigation lifecycle hooks. The headless client calls them directly; the
+     * preview sheet forwards its own client's callbacks, so an action driven
+     * against the visible WebView gets the same honest load signals as one
+     * against the headless view.
      */
-    private suspend fun awaitNavigation(urlBefore: String?, detectMs: Long = 1_500, finishMs: Long = 10_000): Boolean {
-        val before = loadDeferred
-        val started = withTimeoutOrNull(detectMs) {
-            while (isActive) {
-                if (loadDeferred !== before) return@withTimeoutOrNull true
-                val u = currentUrl()
-                if (urlBefore != null && u != null && u != urlBefore) return@withTimeoutOrNull true
-                delay(80)
+    fun notePageStarted() {
+        loadTracker.onStarted()
+    }
+
+    fun notePageFinished(url: String?) {
+        loadTracker.onFinished(url)
+    }
+
+    fun notePageError(description: String?) {
+        loadTracker.onError(description)
+    }
+
+    /** Drops the previous action's download report before a new navigation. */
+    private fun clearDownloadReport() {
+        loadTracker.clearDownload()
+    }
+
+    /**
+     * Main-frame responses the WebView refuses to render as a page (an
+     * attachment download, for instance) produce no document at all, and the
+     * navigation used to be reported as a success showing the previous page.
+     * Recording the reason lets navigate() say what actually happened.
+     */
+    private val downloadListener = DownloadListener { url, _, contentDisposition, mimeType, _ ->
+        loadTracker.onDownload(
+            buildString {
+                append(mimeType.ifBlank { "unknown content type" })
+                val name = contentDisposition
+                    ?.substringAfter("filename=", "")
+                    ?.trim()
+                    ?.trim('"')
+                    .orEmpty()
+                if (name.isNotEmpty()) append(" named \"").append(name).append('"')
+                append(" from ").append(url.take(120))
+            },
+        )
+    }
+
+    /** Reads the URL of the document actually on screen, not the provisional one. */
+    private suspend fun committedPageUrl(): String? =
+        readDocumentProbe()?.url ?: currentUrl()
+
+    /**
+     * Asks the page itself where it is and whether it is done loading.
+     * `WebView.url` reports a navigation's TARGET as soon as it starts, so it
+     * cannot tell a still-loading page from a displayed one; `location.href`
+     * only moves when the new document commits.
+     */
+    private suspend fun readDocumentProbe(): PageLoadTracker.DocumentProbe? {
+        // Timeout around the JS round trip only: a page that answers slowly must
+        // not stall the poll loop, and the callbacks decide instead when the
+        // page says nothing at all.
+        val raw = withTimeoutOrNull(PROBE_TIMEOUT_MS) {
+            runCatching { evalRaw(DOCUMENT_PROBE_SCRIPT) }.getOrNull()
+        } ?: return null
+        return runCatching {
+            val decoded = decodeJsJson(raw) ?: return@runCatching null
+            val obj = jsJson.parseToJsonElement(decoded).jsonObject
+            PageLoadTracker.DocumentProbe(
+                url = obj["href"]?.let { (it as? JsonPrimitive)?.contentOrNull },
+                ready = obj["ready"]?.let { (it as? JsonPrimitive)?.booleanOrNull } == true,
+            )
+        }.getOrNull()
+    }
+
+    /** Outcome of waiting for the navigation an action triggered. */
+    private data class NavigationOutcome(
+        val started: Boolean,
+        val settled: Boolean,
+        val error: String? = null,
+        val download: String? = null,
+    )
+
+    /**
+     * Waits for the navigation triggered by the last action: first for it to
+     * begin, then for its document to commit and finish loading. The page probe
+     * is only spent when the client callbacks have nothing to report (a WebView
+     * whose client is not ours), because it costs a JS round trip per poll.
+     *
+     * [generationBefore] is passed in rather than read here: a caller that
+     * triggers a navigation has to capture the baseline BEFORE its own call,
+     * since onPageStarted can fire before that call returns.
+     */
+    private suspend fun awaitNavigation(
+        generationBefore: Int,
+        urlBefore: String?,
+        detectMs: Long = 2_500,
+        finishMs: Long = 15_000,
+    ): NavigationOutcome {
+        var probe: PageLoadTracker.DocumentProbe? = null
+
+        var started = PageLoadTracker.didStart(loadTracker.snapshot(probe), generationBefore, urlBefore)
+        var detectWaited = 0L
+        while (!started && detectWaited < detectMs && !loadTracker.hasDownload) {
+            delay(POLL_MS)
+            detectWaited += POLL_MS
+            if (loadTracker.currentGeneration > generationBefore) {
+                started = true
+                break
             }
-            false
-        } ?: false
-        if (!started) return false
-        withTimeoutOrNull(finishMs) { loadDeferred?.takeIf { it !== before }?.await() }
-        // Mirrored WebView has no deferred; fall back to URL stability.
-        if (loadDeferred === before) {
-            var stable = 0
-            var last = currentUrl()
-            withTimeoutOrNull(finishMs) {
-                while (isActive && stable < 3) {
-                    delay(200)
-                    val now = currentUrl()
-                    stable = if (now != null && now == last) stable + 1 else 0
-                    last = now
-                }
-            }
+            probe = readDocumentProbe() ?: probe
+            started = PageLoadTracker.didStart(loadTracker.snapshot(probe), generationBefore, urlBefore)
         }
-        return true
+        // A download explains itself and no document is coming, started or not.
+        if (loadTracker.hasDownload) {
+            return NavigationOutcome(
+                started = started,
+                settled = false,
+                error = loadTracker.snapshot().error,
+                download = loadTracker.takeDownload(),
+            )
+        }
+        if (!started) {
+            return NavigationOutcome(started = false, settled = false, error = loadTracker.snapshot().error, download = null)
+        }
+
+        var settled = PageLoadTracker.isSettled(loadTracker.snapshot(probe), generationBefore, urlBefore)
+        var finishWaited = 0L
+        while (!settled && finishWaited < finishMs && !loadTracker.hasDownload) {
+            delay(POLL_MS)
+            finishWaited += POLL_MS
+            if (loadTracker.snapshot().let { PageLoadTracker.isSettled(it, generationBefore, urlBefore) }) {
+                settled = true
+                break
+            }
+            probe = readDocumentProbe() ?: probe
+            settled = PageLoadTracker.isSettled(loadTracker.snapshot(probe), generationBefore, urlBefore)
+        }
+        val snapshot = loadTracker.snapshot(probe)
+        return NavigationOutcome(
+            started = true,
+            settled = settled,
+            error = snapshot.error,
+            download = loadTracker.takeDownload(),
+        )
+    }
+
+    /**
+     * Waits for a navigation that is still in flight to finish, so an action
+     * does not act on a page whose history entry does not exist yet (see
+     * [back]). Bounded: a wedged load must not hang the tool.
+     */
+    private suspend fun awaitPendingLoad(maxMs: Long = 8_000) {
+        var waited = 0L
+        while (loadTracker.isLoading && waited < maxMs) {
+            delay(POLL_MS)
+            waited += POLL_MS
+        }
+    }
+
+    /**
+     * Carries what the wait learned into the reported state: a load error the
+     * page hit, a download where a page should have been, and an honest "this
+     * may not be the page you asked for" when the navigation never finished
+     * settling.
+     */
+    private fun BrowserState.withLoadNote(outcome: NavigationOutcome): BrowserState {
+        val notes = listOfNotNull(
+            outcome.download?.let {
+                "the browser received a download ($it) instead of a page, so the page did not change"
+            },
+            outcome.error?.let { "the page reported a load error: $it" },
+            if (outcome.started && !outcome.settled && outcome.download == null) {
+                "the page was still loading when this state was read, so it may be incomplete " +
+                    "or still show the previous document"
+            } else {
+                null
+            },
+        )
+        if (notes.isEmpty()) return this
+        return copy(error = listOfNotNull(error, notes.joinToString("; ")).joinToString("; "))
     }
 
     /**
@@ -387,11 +559,16 @@ class BrowserController(
         }
     }
 
-    /** Settle sequence after a mutating action: catch navigation, then scroll. */
-    private suspend fun awaitSettle(urlBefore: String?) {
-        val navigated = awaitNavigation(urlBefore)
-        if (!navigated) delay(350) // brief settle for SPA re-renders
+    /**
+     * Settle sequence after a mutating action: catch navigation, then scroll.
+     * The baseline is captured here, before the caller's action could have
+     * started one.
+     */
+    private suspend fun awaitSettle(generationBefore: Int, urlBefore: String?): NavigationOutcome {
+        val outcome = awaitNavigation(generationBefore, urlBefore)
+        if (!outcome.started) delay(350) // brief settle for SPA re-renders
         awaitScrollSettle()
+        return outcome
     }
 
     /**
@@ -430,22 +607,56 @@ class BrowserController(
                 BrowserController.localFileUrl(rel) + suffix
             } else null
 
+            // The document on screen BEFORE the load, read from the page: a
+            // provisional wv.url can already be the target, which would make
+            // the new document look like the one we started on.
+            val before = committedPageUrl()
+            clearDownloadReport()
+            val generationBefore = loadTracker.currentGeneration
             withContext(Dispatchers.Main) {
                 val wv = getOrCreateWebView()
-                val before = wv.url
                 if (localUrl != null) {
                     wv.loadUrl(localUrl)
                 } else {
                     baseUrlPath = null
                     wv.loadUrl(LocalPortProbe.normalizeLocalUrl(target))
                 }
-                withTimeoutOrNull(15_000) { awaitNavigation(before, detectMs = 2_000) }
+            }
+            val outcome = awaitNavigation(generationBefore, before, detectMs = 2_500, finishMs = NAVIGATE_TIMEOUT_MS)
+            // A download is a failure whether or not a navigation was observed:
+            // either way no document is coming and the browser still shows the
+            // previous page. Reporting that as a successful navigate is the bug
+            // this check exists for.
+            if (outcome.download != null || !outcome.started) {
+                track("navigate", detail, ok = false)
+                throw IllegalStateException(describeFailedNavigation(target, outcome))
             }
             awaitScrollSettle()
-            return extractState()
+            return extractState().withLoadNote(outcome)
         } catch (e: Exception) {
             track("navigate", detail, ok = false)
             throw e
+        }
+    }
+
+    /**
+     * Why nothing loaded. A URL the WebView hands to a download, a scheme it
+     * refuses to render, or a request that never left the device all end the
+     * same way: no document, so reporting the previous page as the result is a
+     * lie (on-device QA: an octet-stream with Content-Disposition: attachment
+     * "navigated" successfully twice, with the old page in the result and no
+     * request in the server log).
+     */
+    private fun describeFailedNavigation(target: String, outcome: NavigationOutcome): String {
+        val download = outcome.download
+        return if (download != null) {
+            "The browser did not open '$target': the response was a download ($download), " +
+                "which WebView does not display. The page did not change."
+        } else {
+            "The browser never started loading '$target', so nothing changed. WebView refuses " +
+                "some targets outright (downloads, mailto:/intent:/blob: schemes, unsupported " +
+                "content types) and reports no error for them. Check the URL and how the server " +
+                "answers it (an attachment or non-page content type will not open here)."
         }
     }
 
@@ -463,42 +674,28 @@ class BrowserController(
     /**
      * Click an interactive element by its assigned index or CSS selector.
      * Throws when the element is missing so the agent knows nothing happened.
+     * A supplied selector wins over a supplied id (see [resolveElementTarget]).
      */
     suspend fun click(elementId: Int? = null, selector: String? = null): BrowserState {
-        val detail = elementId?.let { "#$it" } ?: selector.orEmpty().take(80)
+        val target = resolveElementTarget(elementId, selector)
+            ?: throw IllegalArgumentException("Either elementId or selector must be provided.")
+        val detail = target.selector?.take(80) ?: "#${target.elementId}"
         track("click", detail)
-        val js = when {
-            elementId != null -> """
-                (function() {
-                    const el = document.querySelector('[data-harness-id="$elementId"]');
-                    if (!el) return { ok: false, error: "Element with id $elementId not found. The page re-rendered; re-run browser_get_dom for fresh ids." };
-                    el.scrollIntoView({ behavior: 'instant', block: 'center' });
-                    el.focus();
-                    el.click();
-                    return { ok: true };
-                })();
-            """.trimIndent()
-            !selector.isNullOrBlank() -> """
-                (function() {
-                    const el = document.querySelector(${json.encodeToString(selector)});
-                    if (!el) return { ok: false, error: "No element matches selector '$selector'. Re-run browser_get_dom for fresh ids." };
-                    el.scrollIntoView({ behavior: 'instant', block: 'center' });
-                    el.focus();
-                    el.click();
-                    return { ok: true };
-                })();
-            """.trimIndent()
-            else -> throw IllegalArgumentException("Either elementId or selector must be provided.")
-        }
+        val js = buildClickJs(target)
 
+        // Read where the page is BEFORE the click: a click that navigates must
+        // be waited out, and a click that does not must not be.
+        val before = committedPageUrl()
+        val generationBefore = loadTracker.currentGeneration
         try {
-            val error = parseActionError(evalRaw(js))
+            val raw = evalRaw(js)
+            val error = parseActionError(raw)
             if (error != null) {
                 track("click", detail, ok = false)
                 throw IllegalStateException(error)
             }
-            awaitSettle(currentUrl())
-            return extractState()
+            val outcome = awaitSettle(generationBefore, before)
+            return withActionNote(extractState(), raw, elementId, target).withLoadNote(outcome)
         } catch (e: IllegalStateException) {
             throw e
         } catch (e: Exception) {
@@ -512,64 +709,53 @@ class BrowserController(
      * missing or not an input-like element.
      */
     suspend fun type(text: String, elementId: Int? = null, selector: String? = null, clearFirst: Boolean = false): BrowserState {
+        val target = resolveElementTarget(elementId, selector)
+            ?: throw IllegalArgumentException("Either elementId or selector must be provided.")
         val detail = buildString {
-            append(elementId?.let { "#$it" } ?: selector.orEmpty().take(40))
+            append(target.selector?.take(40) ?: "#${target.elementId}")
             append(" \"").append(text.take(40)).append('"')
         }
         track("type", detail)
-        val encodedText = json.encodeToString(text)
-        val js = when {
-            elementId != null -> """
-                (function() {
-                    const el = document.querySelector('[data-harness-id="$elementId"]');
-                    if (!el) return { ok: false, error: "Element with id $elementId not found. The page re-rendered; re-run browser_get_dom for fresh ids." };
-                    const tag = (el.tagName || '').toLowerCase();
-                    if (tag !== 'input' && tag !== 'textarea' && tag !== 'select' && el.isContentEditable !== true) {
-                        return { ok: false, error: "Element $elementId is a <" + tag + ">, not a text field." };
-                    }
-                    el.scrollIntoView({ behavior: 'instant', block: 'center' });
-                    el.focus();
-                    ${if (clearFirst) "el.value = '';" else ""}
-                    el.value = (el.value || '') + $encodedText;
-                    el.dispatchEvent(new Event('input', { bubbles: true }));
-                    el.dispatchEvent(new Event('change', { bubbles: true }));
-                    return { ok: true };
-                })();
-            """.trimIndent()
-            !selector.isNullOrBlank() -> """
-                (function() {
-                    const el = document.querySelector(${json.encodeToString(selector)});
-                    if (!el) return { ok: false, error: "No element matches selector '$selector'." };
-                    const tag = (el.tagName || '').toLowerCase();
-                    if (tag !== 'input' && tag !== 'textarea' && tag !== 'select' && el.isContentEditable !== true) {
-                        return { ok: false, error: "Element matching '$selector' is a <" + tag + ">, not a text field." };
-                    }
-                    el.scrollIntoView({ behavior: 'instant', block: 'center' });
-                    el.focus();
-                    ${if (clearFirst) "el.value = '';" else ""}
-                    el.value = (el.value || '') + $encodedText;
-                    el.dispatchEvent(new Event('input', { bubbles: true }));
-                    el.dispatchEvent(new Event('change', { bubbles: true }));
-                    return { ok: true };
-                })();
-            """.trimIndent()
-            else -> throw IllegalArgumentException("Either elementId or selector must be provided.")
-        }
+        val js = buildTypeJs(target, text, clearFirst)
 
+        val before = committedPageUrl()
+        val generationBefore = loadTracker.currentGeneration
         try {
-            val error = parseActionError(evalRaw(js))
+            val raw = evalRaw(js)
+            val error = parseActionError(raw)
             if (error != null) {
                 track("type", detail, ok = false)
                 throw IllegalStateException(error)
             }
-            awaitSettle(currentUrl())
-            return extractState()
+            val outcome = awaitSettle(generationBefore, before)
+            return withActionNote(extractState(), raw, elementId, target).withLoadNote(outcome)
         } catch (e: IllegalStateException) {
             throw e
         } catch (e: Exception) {
             track("type", detail, ok = false)
             throw e
         }
+    }
+
+    /**
+     * Carries the page's own warning (a disabled control) and the
+     * selector-over-id note into the returned state, which is already rendered
+     * with them.
+     */
+    private fun withActionNote(
+        state: BrowserState,
+        raw: String,
+        elementId: Int?,
+        target: ElementTarget,
+    ): BrowserState {
+        val override = if (target.selector != null && elementId != null) {
+            "selector used; id $elementId ignored"
+        } else {
+            null
+        }
+        val note = listOfNotNull(parseActionWarning(raw), override).joinToString("; ")
+        if (note.isEmpty()) return state
+        return state.copy(error = listOfNotNull(state.error, note).joinToString("; "))
     }
 
     /**
@@ -587,73 +773,155 @@ class BrowserController(
 
     /**
      * Go back in WebView history. If a step lands on a 301/302 redirect that
-     * bounces back to the starting page, retries up to 5 times. Uses a short
-     * fixed delay instead of awaitSettle to avoid following redirects forward.
+     * bounces back to the starting page, retries up to [MAX_HISTORY_STEPS] times.
+     *
+     * Two things must hold before a step is judged, or the retry walks backwards
+     * through entries the caller never asked to skip (on-device QA, 2026-09-17:
+     * navigate → click a link → back landed on an entry older than the page just
+     * left, because the landing was read while the step was still loading and
+     * every `Apage.html?...` compared as the same document):
+     *
+     *  - the current navigation is finished first, so a page whose document has
+     *    not committed yet cannot make goBack() skip past it;
+     *  - the landing is only judged once its own load has SETTLED, and only a
+     *    settled landing back on the starting page is treated as a bounce.
      */
-    suspend fun back(): BrowserState {
-        track("back", "history")
-        val canGo = withContext(Dispatchers.Main) { getOrCreateWebView().canGoBack() }
-        if (!canGo) throw IllegalStateException("No previous page in history.")
+    suspend fun back(): BrowserState = historyStep(
+        action = "back",
+        canStep = { it.canGoBack() },
+        step = { it.goBack() },
+    )
 
-        val startUrl = currentUrl().orEmpty()
-        var attempts = 0
-        while (attempts < 5) {
-            attempts++
-            withContext(Dispatchers.Main) { getOrCreateWebView().goBack() }
-            // Short fixed wait: just enough for the back navigation to commit
-            // its URL, but NOT long enough for a 301 redirect to fire and
-            // bounce us forward again.
-            delay(300)
-            val after = currentUrl().orEmpty()
-            if (after != startUrl && !isSamePage(after, startUrl)) {
-                // Landed on a distinct page. Wait for it to finish loading.
-                withTimeoutOrNull(8_000) {
-                    while (isActive && isPageLoading.get()) delay(100)
-                }
-                awaitScrollSettle()
-                return extractState()
-            }
-            val canStillGo = withContext(Dispatchers.Main) { getOrCreateWebView().canGoBack() }
-            if (!canStillGo) break
+    /**
+     * Go forward in WebView history. Same rules as [back].
+     */
+    suspend fun forward(): BrowserState = historyStep(
+        action = "forward",
+        canStep = { it.canGoForward() },
+        step = { it.goForward() },
+    )
+
+    /** Shared body of [back] and [forward]; see [back] for why each guard exists. */
+    private suspend fun historyStep(
+        action: String,
+        canStep: (WebView) -> Boolean,
+        step: (WebView) -> Unit,
+    ): BrowserState {
+        val back = action == "back"
+        track(action, "history")
+        awaitPendingLoad()
+
+        // The WebView's own back/forward list is the only reliable account of
+        // where a step landed: it is authoritative about the entry, whereas
+        // asking the page (or wv.url) while a navigation is still in flight
+        // reports the document being left behind. That stale read is what made
+        // every step look unmoved and retried until history ran out.
+        val start = historyPosition()
+            ?: throw IllegalStateException("The browser has no history to step through yet.")
+        val canGo = withContext(Dispatchers.Main) { canStep(getOrCreateWebView()) }
+        if (!canGo) {
+            throw IllegalStateException(
+                if (back) "No previous page in history." else "No next page in history.",
+            )
         }
-        // Exhausted retries or can't go further: return whatever we landed on.
-        awaitScrollSettle()
-        return extractState()
+        val startUrl = start.url ?: committedPageUrl().orEmpty()
+        // A bounce steps to the entry behind the one we are on, so the target
+        // always advances by one from the CURRENT entry on each attempt.
+        var targetIndex = targetHistoryIndex(start.index, back)
+        var attempts = 0
+
+        while (true) {
+            attempts++
+            val from = historyPosition() ?: start
+            targetIndex = targetHistoryIndex(from.index, back)
+            // Baseline BEFORE the step: onPageStarted can fire before the call
+            // returns, and a baseline taken afterwards would miss the very
+            // navigation the step caused.
+            val baseline = loadTracker.currentGeneration
+            withContext(Dispatchers.Main) { step(getOrCreateWebView()) }
+
+            val reached = awaitHistoryIndex(targetIndex)
+            val position = historyPosition() ?: from
+            val outcome = awaitNavigation(baseline, startUrl, detectMs = 2_500, finishMs = 8_000)
+            val canStepFurther = withContext(Dispatchers.Main) { canStep(getOrCreateWebView()) }
+
+            when (val decision = decideHistoryStep(
+                startUrl = startUrl,
+                targetIndex = targetIndex,
+                position = position,
+                reachedTarget = reached,
+                back = back,
+                attempts = attempts,
+                maxAttempts = MAX_HISTORY_STEPS,
+                canStepFurther = canStepFurther,
+            )) {
+                is HistoryStepOutcome.Landed -> {
+                    awaitScrollSettle()
+                    return extractState().withLoadNote(outcome)
+                }
+
+                is HistoryStepOutcome.Correct -> {
+                    // The step overshot the intended entry; walk it back so the
+                    // caller gets the page one step away, not two.
+                    awaitLandOnIndex(decision.index, back = !back)
+                    awaitScrollSettle()
+                    return extractState().withLoadNote(outcome)
+                }
+
+                HistoryStepOutcome.Bounce -> Unit // Step again from the new position.
+
+                is HistoryStepOutcome.Stalled -> {
+                    awaitScrollSettle()
+                    return extractState().withLoadNote(outcome.copy(error = outcome.error ?: decision.reason))
+                }
+            }
+        }
+    }
+
+    /** Where the WebView stands in its own back/forward list, or null if unavailable. */
+    private suspend fun historyPosition(): HistoryPosition? = withContext(Dispatchers.Main) {
+        runCatching {
+            val list = getOrCreateWebView().copyBackForwardList() ?: return@runCatching null
+            val index = list.currentIndex
+            HistoryPosition(
+                index = index,
+                size = list.size,
+                url = list.getItemAtIndex(index)?.url,
+            )
+        }.getOrNull()
     }
 
     /**
-     * Go forward in WebView history. Same redirect-aware retry as back().
+     * Waits for the back/forward list to arrive at [index]. Returns true when
+     * the list was OBSERVED there, even if it has since moved off it: a
+     * redirecting entry is visited and then leaves again on its own, and that
+     * visit is what proves the entry was consumed. Bounded, so a step that
+     * never lands cannot hang the tool.
      */
-    suspend fun forward(): BrowserState {
-        track("forward", "history")
-        val canGo = withContext(Dispatchers.Main) { getOrCreateWebView().canGoForward() }
-        if (!canGo) throw IllegalStateException("No next page in history.")
-
-        val startUrl = currentUrl().orEmpty()
-        var attempts = 0
-        while (attempts < 5) {
-            attempts++
-            withContext(Dispatchers.Main) { getOrCreateWebView().goForward() }
-            delay(300)
-            val after = currentUrl().orEmpty()
-            if (after != startUrl && !isSamePage(after, startUrl)) {
-                withTimeoutOrNull(8_000) {
-                    while (isActive && isPageLoading.get()) delay(100)
-                }
-                awaitScrollSettle()
-                return extractState()
-            }
-            val canStillGo = withContext(Dispatchers.Main) { getOrCreateWebView().canGoForward() }
-            if (!canStillGo) break
+    private suspend fun awaitHistoryIndex(index: Int, timeoutMs: Long = 5_000): Boolean {
+        var waited = 0L
+        var observed = false
+        while (waited < timeoutMs) {
+            if (historyPosition()?.index == index) observed = true
+            // Settled: nothing more will change within the remaining budget.
+            if (observed && !loadTracker.isLoading) return true
+            delay(POLL_MS)
+            waited += POLL_MS
         }
-        awaitScrollSettle()
-        return extractState()
+        return observed || historyPosition()?.index == index
     }
 
-    private fun isSamePage(urlA: String, urlB: String): Boolean {
-        val cleanA = urlA.removeSuffix("/").substringBefore('?')
-        val cleanB = urlB.removeSuffix("/").substringBefore('?')
-        return cleanA.equals(cleanB, ignoreCase = true)
+    /** Steps until [index] is the current entry, within the history-step budget. */
+    private suspend fun awaitLandOnIndex(index: Int, back: Boolean) {
+        var attempts = 0
+        while (attempts < MAX_HISTORY_STEPS && historyPosition()?.index != index) {
+            attempts++
+            withContext(Dispatchers.Main) {
+                val wv = getOrCreateWebView()
+                if (back) wv.goBack() else wv.goForward()
+            }
+            awaitHistoryIndex(index, timeoutMs = 3_000)
+        }
     }
 
     /**
@@ -661,10 +929,11 @@ class BrowserController(
      */
     suspend fun refresh(): BrowserState {
         track("refresh", "reload")
-        val before = currentUrl()
+        val before = committedPageUrl()
+        val generationBefore = loadTracker.currentGeneration
         withContext(Dispatchers.Main) { getOrCreateWebView().reload() }
-        awaitSettle(before)
-        return extractState()
+        val outcome = awaitSettle(generationBefore, before)
+        return extractState().withLoadNote(outcome)
     }
 
     /**
@@ -754,16 +1023,24 @@ class BrowserController(
         }
     }
 
+    /**
+     * Polls for the value a staged promise parked in the page.
+     *
+     * The page has to say whether the staging happened AT ALL: a promise that
+     * never settles and a page that navigated away mid-await both leave
+     * `__harnessAsync` null, and the old "null means still pending" test spun
+     * for the full timeout on the second case even though the navigation had
+     * already succeeded (on-device QA, 2026-09-17: a JS-dispatched click left
+     * browser_eval reporting "Promise did not settle within 10000ms" while
+     * browser_get_url showed the new page).
+     */
     private suspend fun awaitStagedPromise(timeoutMs: Long): BrowserEvalOutcome {
         val deadline = System.currentTimeMillis() + timeoutMs
         while (System.currentTimeMillis() < deadline) {
-            val raw = evalRaw(
-                "(function(){ try { return window.__harnessAsync == null " +
-                    "? JSON.stringify({ ok: true, value: \"$PROMISE_SENTINEL\" }) " +
-                    ": String(window.__harnessAsync); } catch (e) { return JSON.stringify({ ok: false, error: String(e) }); } })()"
-            )
+            val raw = evalRaw(STAGED_PROMISE_PROBE_SCRIPT)
             val staged = parseEvalOutcome(raw)
             if (staged.ok && staged.value != PROMISE_SENTINEL) return staged
+            if (!staged.ok) return staged
             delay(150)
         }
         return BrowserEvalOutcome(false, null, "Promise did not settle within ${timeoutMs}ms")
@@ -999,6 +1276,28 @@ class BrowserController(
         /** Marker returned by eval when the result is a promise being awaited. */
         const val PROMISE_SENTINEL = "__harness_promise__"
 
+        /** How often an action re-checks whether the page has committed/finished. */
+        private const val POLL_MS = 100L
+
+        /**
+         * Cap on the in-page probe. It is a JS round trip, so a page that
+         * answers slowly must not make the poll loop wait on it indefinitely:
+         * a missing probe just means the client callbacks decide instead.
+         */
+        private const val PROBE_TIMEOUT_MS = 3_000L
+
+        /** How long a browser_navigate waits for its document to finish loading. */
+        private const val NAVIGATE_TIMEOUT_MS = 20_000L
+
+        /** Redirect-bounce retries in back()/forward() before giving up. */
+        private const val MAX_HISTORY_STEPS = 5
+
+        /** The in-page view of a document: where it is, and whether it is done. */
+        private val DOCUMENT_PROBE_SCRIPT =
+            "(function(){ try { return JSON.stringify({ " +
+                "href: String(window.location.href || ''), " +
+                "ready: document.readyState === 'complete' }); } catch (e) { return ''; } })()"
+
         fun computeScreenshotScrollPixels(
             domScrollX: Double,
             domScrollY: Double,
@@ -1009,6 +1308,99 @@ class BrowserController(
             val safeY = if (domScrollY.isFinite()) domScrollY else 0.0
             return Pair((safeX * safeDpr).roundToInt(), (safeY * safeDpr).roundToInt())
         }
+
+        /**
+         * Picks the target for an element action when both an id and a selector
+         * were supplied: the SELECTOR wins.
+         *
+         * An id only means anything for the page state it was indexed from, and
+         * ids are reassigned on every DOM read. Passing a stale id together
+         * with a selector used to be decided silently in favour of the id,
+         * which turned a correct selector call into "Element with id 0 not
+         * found" with no way to tell the selector had been ignored (on-device
+         * QA, 2026-09-17). A selector is re-resolved in the page, so it is the
+         * one to trust; the action result says the id was ignored. Null means
+         * neither was supplied and the caller must reject the call.
+         */
+        fun resolveElementTarget(elementId: Int?, selector: String?): ElementTarget? {
+            val sel = selector?.takeIf { it.isNotBlank() }
+            return when {
+                sel != null -> ElementTarget(elementId = null, selector = sel)
+                elementId != null -> ElementTarget(elementId = elementId, selector = null)
+                else -> null
+            }
+        }
+
+        /**
+         * Page script for one click. Pure, so the action contract (which
+         * lookup is used, and how a disabled control is reported) is testable
+         * without a WebView.
+         */
+        fun buildClickJs(target: ElementTarget): String = """
+            (function() {
+                ${elementLookupJs(target)}
+                el.scrollIntoView({ behavior: 'instant', block: 'center' });
+                el.focus();
+                el.click();
+                return { ok: true$DISABLED_WARNING_JS };
+            })();
+        """.trimIndent()
+
+        /**
+         * Page script that types [text] into the target. Pure for the same
+         * reason as [buildClickJs].
+         */
+        fun buildTypeJs(target: ElementTarget, text: String, clearFirst: Boolean): String {
+            val encodedText = jsJson.encodeToString(text)
+            // JSON-encoded so a selector with quotes/backslashes cannot break
+            // the generated script.
+            val notTextField = jsJson.encodeToString("${target.errorSubject} is a <")
+            return """
+                (function() {
+                    ${elementLookupJs(target)}
+                    const tag = (el.tagName || '').toLowerCase();
+                    if (tag !== 'input' && tag !== 'textarea' && tag !== 'select' && el.isContentEditable !== true) {
+                        return { ok: false, error: $notTextField + tag + ", not a text field." };
+                    }
+                    el.scrollIntoView({ behavior: 'instant', block: 'center' });
+                    el.focus();
+                    ${if (clearFirst) "el.value = '';" else ""}
+                    el.value = (el.value || '') + $encodedText;
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    return { ok: true$DISABLED_WARNING_JS };
+                })();
+            """.trimIndent()
+        }
+
+        /** Lookup prologue: by id only when no selector was supplied. */
+        private fun elementLookupJs(target: ElementTarget): String {
+            val selector = target.selector
+            if (selector != null) {
+                val missing = jsJson.encodeToString(
+                    "No element matches selector '$selector'. Re-run browser_get_dom for fresh ids.",
+                )
+                return "const el = document.querySelector(${jsJson.encodeToString(selector)});\n" +
+                    "if (!el) return { ok: false, error: $missing };"
+            }
+            val missing = jsJson.encodeToString(
+                "Element with id ${target.elementId} not found. The page re-rendered; " +
+                    "re-run browser_get_dom for fresh ids.",
+            )
+            return "const el = document.querySelector('[data-harness-id=\"${target.elementId}\"]');\n" +
+                "if (!el) return { ok: false, error: $missing };"
+        }
+
+        /**
+         * Page-script fragment appended to an action's success envelope. A
+         * disabled control swallows the interaction by design, so the action
+         * used to come back as an ordinary-looking success with nothing
+         * changed and the agent retried blind (on-device QA, 2026-09-17). The
+         * action is still dispatched normally; only the reporting changes.
+         */
+        private const val DISABLED_WARNING_JS =
+            ", warning: (el.disabled === true || el.getAttribute('aria-disabled') === 'true')" +
+                " ? 'element is disabled, so this action most likely did nothing' : null"
 
         /**
          * Builds the stable URL for a workspace-relative HTML file. Used by
@@ -1113,19 +1505,43 @@ class BrowserController(
          * Page-side helper: when [v] is a thenable, park its settlement in
          * window.__harnessAsync and return the envelope string; otherwise
          * null. evaluateJavascript never awaits promises on its own.
+         *
+         * `__harnessAsyncActive` marks the parking as belonging to THIS
+         * document, so the poll can tell "the promise has not settled yet" from
+         * "the document that held it is gone".
          */
         private val STAGE_PROMISE_FN = """
             function __harnessStage(v) {
                 if (v !== undefined && v !== null && typeof v.then === 'function') {
                     window.__harnessAsync = null;
+                    window.__harnessAsyncActive = true;
                     Promise.resolve(v).then(
-                        function(pv) { window.__harnessAsync = JSON.stringify({ ok: true, value: pv === undefined ? null : pv }); },
-                        function(pe) { window.__harnessAsync = JSON.stringify({ ok: false, error: String(pe && pe.message || pe) }); }
+                        function(pv) { window.__harnessAsyncActive = false; window.__harnessAsync = JSON.stringify({ ok: true, value: pv === undefined ? null : pv }); },
+                        function(pe) { window.__harnessAsyncActive = false; window.__harnessAsync = JSON.stringify({ ok: false, error: String(pe && pe.message || pe) }); }
                     );
                     return { ok: true, value: "$PROMISE_SENTINEL" };
                 }
                 return null;
             }
+        """.trimIndent()
+
+        /**
+         * Poll script for [BrowserController.awaitStagedPromise]: the settled
+         * value once it exists, a still-pending marker while the staging is
+         * live in this document, and a clean failure when the document that
+         * started the promise is no longer the one running (README: a
+         * navigation away is not a pending promise).
+         */
+        internal val STAGED_PROMISE_PROBE_SCRIPT = """
+            (function(){
+                try {
+                    if (typeof window.__harnessAsync === 'string') return String(window.__harnessAsync);
+                    if (window.__harnessAsyncActive !== true) {
+                        return JSON.stringify({ ok: false, error: "the page navigated away before the promise settled" });
+                    }
+                    return JSON.stringify({ ok: true, value: "$PROMISE_SENTINEL" });
+                } catch (e) { return JSON.stringify({ ok: false, error: String(e) }); }
+            })();
         """.trimIndent()
 
         private val jsJson = Json { isLenient = true; ignoreUnknownKeys = true }
@@ -1176,6 +1592,22 @@ class BrowserController(
                 if (ok) null
                 else obj["error"]?.let { (it as? JsonPrimitive)?.contentOrNull } ?: "Unknown page script failure."
             }.getOrElse { null } // non-envelope result (shouldn't happen) = treat as success
+        }
+
+        /**
+         * Extracts the warning from a {ok:true,warning} action envelope, or
+         * null when the action had nothing to report. Separate from
+         * [parseActionError] because the action DID happen: it just most
+         * likely had no effect.
+         */
+        fun parseActionWarning(raw: String): String? {
+            val decoded = decodeJsJson(raw) ?: return null
+            return runCatching {
+                val obj = jsJson.parseToJsonElement(decoded).jsonObject
+                val ok = obj["ok"]?.let { (it as? JsonPrimitive)?.booleanOrNull } ?: false
+                if (!ok) null
+                else obj["warning"]?.let { (it as? JsonPrimitive)?.contentOrNull?.takeIf { w -> w.isNotBlank() } }
+            }.getOrNull()
         }
 
         /**

@@ -334,6 +334,54 @@ class CodeGraphPatchesTest {
     private val extractionVersionSource = "exports.EXTRACTION_VERSION = 25;"
 
     private val importResolverSource = lines(
+        "function getFileExportIndex(filePath, context) {",
+        "    let idx = perFile.get(filePath);",
+        "    if (!idx) {",
+        "        idx = { byName: new Map(), defaultComponent: undefined, defaultFnClass: undefined };",
+        "        for (const n of context.getNodesInFile(filePath)) {",
+        "            if (!n.isExported)",
+        "                continue;",
+        "            if (!idx.byName.has(n.name))",
+        "                idx.byName.set(n.name, n);",
+        "            if (idx.defaultComponent === undefined && n.kind === 'component')",
+        "                idx.defaultComponent = n;",
+        "            if (idx.defaultFnClass === undefined && (n.kind === 'function' || n.kind === 'class'))",
+        "                idx.defaultFnClass = n;",
+        "        }",
+        "        perFile.set(filePath, idx);",
+        "    }",
+        "    return idx;",
+        "}",
+        "function findExportedSymbolWalk(filePath, want, language, context, visited, depth) {",
+        "    if (want.isDefault) {",
+        "        const direct = exportIndex.defaultComponent ?? exportIndex.defaultFnClass;",
+        "        if (direct)",
+        "            return direct;",
+        "    }",
+        "    else if (want.isNamespace && want.memberName) {",
+        "        const direct = exportIndex.byName.get(want.memberName);",
+        "        if (direct)",
+        "            return direct;",
+        "    }",
+        "    return undefined;",
+        "}",
+        "function extractJSImports(content) {",
+        "    const mappings = [];",
+        "    const requireRegex = /(?:const|let|var)\\s+(?:(\\w+)|{([^}]+)})\\s*=\\s*require\\(['\"]([^'\"]+)['\"]\\)/g;",
+        "    while ((match = requireRegex.exec(content)) !== null) {",
+        "        const [, defaultName, destructured, source] = match;",
+        "        if (defaultName) {",
+        "            mappings.push({",
+        "                localName: defaultName,",
+        "                exportedName: 'default',",
+        "                source: source,",
+        "                isDefault: true,",
+        "                isNamespace: false,",
+        "            });",
+        "        }",
+        "    }",
+        "    return mappings;",
+        "}",
         "function resolveModuleImportToFile(ref, imports, context) {",
         "    if (ref.referenceKind !== 'imports')",
         "        return null;",
@@ -724,6 +772,13 @@ class CodeGraphPatchesTest {
         assertTrue("index.js performs retroactive prune on open", index.contains("pruneCrossLanguageEdges()"))
         assertTrue("import resolver supports bare python module import", importResolver.contains("bare single module imports"))
         assertTrue("import resolver matches TS relative imports", importResolver.contains("imp.source === ref.referenceName"))
+        // CommonJS: a require binding must also be a namespace, the export index
+        // must carry the module's declared exports, and the member lookup must
+        // consult it. Each is useless without the others.
+        assertTrue("require binding maps as a namespace too", importResolver.contains("exportedName: '*',"))
+        assertTrue("export index carries declared CommonJS exports", importResolver.contains("cjsByName: null"))
+        assertTrue("export index records CommonJS property names", importResolver.contains("idx.cjsByName.set(property, node);"))
+        assertTrue("member lookup consults CommonJS exports", importResolver.contains("exportIndex.cjsByName?.get(want.memberName)"))
         assertTrue("tree-sitter rejects junk AST names", treeSitter.contains("name.startsWith('from ')"))
         assertTrue("tree-sitter emits refs from file AND import node", treeSitter.contains("importNode.id !== parentId"))
         assertTrue("extraction version bumped to 26", extractionVersion.contains("EXTRACTION_VERSION = 26;"))
