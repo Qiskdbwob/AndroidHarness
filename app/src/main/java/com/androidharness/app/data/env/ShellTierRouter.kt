@@ -24,7 +24,6 @@ object PathClassifier {
 
 /** Which engine actually runs the shell command. */
 enum class ExecutionTier {
-    TERMUX_SSH,
     /** Inside Shizuku's server process: shell/root uid, can reach system paths and any folder. */
     PRIVILEGED,
 
@@ -139,7 +138,6 @@ class ShellTierRouter(
                 ExecutionTier.PRIVILEGED -> runPrivileged(command, cwd, timeoutMs, maxOutput)
                 ExecutionTier.APP_LINUX -> runApp(command, cwd, timeoutMs, maxOutput, ExecutionTier.APP_LINUX)
                 ExecutionTier.TOYBOX -> runApp(command, cwd, timeoutMs, maxOutput, ExecutionTier.TOYBOX)
-                ExecutionTier.TERMUX_SSH -> runApp(command, cwd, timeoutMs, maxOutput, ExecutionTier.APP_LINUX)
             }
         }
 
