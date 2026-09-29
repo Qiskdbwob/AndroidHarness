@@ -6,6 +6,12 @@ plugins {
     alias(libs.plugins.ksp)
 }
 
+// Build switches used by CI (.github/workflows/release-apk.yml):
+//   -PunsignedRelease  leave the release APK unsigned (no keystore required)
+//   -PoptimizeRelease  run R8 shrinking/obfuscation + resource shrinking
+val unsignedRelease = providers.gradleProperty("unsignedRelease").isPresent
+val optimizeRelease = providers.gradleProperty("optimizeRelease").isPresent
+
 android {
     namespace = "com.androidharness.app"
     compileSdk = 36
@@ -22,25 +28,33 @@ android {
     }
 
     signingConfigs {
-        create("debugConfig") {
-            storeFile = file("${rootDir}/debug.keystore")
-            storePassword = "android"
-            keyAlias = "androiddebugkey"
-            keyPassword = "android"
+        // Keystores are gitignored, so this alpha key only exists on a machine
+        // that created it. Reference it when present and let AGP fall back to
+        // its own debug keystore otherwise, which is what keeps CI building.
+        val alphaDebugKey = rootProject.file("debug.keystore")
+        if (alphaDebugKey.exists()) {
+            create("debugConfig") {
+                storeFile = alphaDebugKey
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            }
         }
     }
 
     buildTypes {
         release {
-            // Local alpha distribution: signed with the debug keystore so the
-            // APK installs without a release keystore. Swap to a dedicated
+            // Local alpha distribution: signed with the debug keystore when it
+            // is present. -PunsignedRelease leaves the APK unsigned instead, so
+            // a release build needs no keystore at all. Swap to a dedicated
             // signing config before any public/Play distribution.
-            signingConfig = signingConfigs.getByName("debugConfig")
-            isMinifyEnabled = false
+            signingConfig = if (unsignedRelease) null else signingConfigs.findByName("debugConfig")
+            isMinifyEnabled = optimizeRelease
+            isShrinkResources = optimizeRelease
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
         debug {
-            signingConfig = signingConfigs.getByName("debugConfig")
+            signingConfig = signingConfigs.findByName("debugConfig")
             applicationIdSuffix = ".debug"
         }
     }

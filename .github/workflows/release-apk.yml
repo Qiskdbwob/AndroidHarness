@@ -1,0 +1,111 @@
+name: Release build
+
+# Builds the release APK unsigned (-PunsignedRelease, so no signing keystore is
+# needed) and optimized with R8 (-PoptimizeRelease). Runs on demand from the
+# Actions tab, or on every push to main that touches app/.
+#
+# The APK is uploaded as a workflow artifact (Actions tab, kept 30 days). It is
+# unsigned, so it must be zipalign'd and apksigner'd with your own keystore
+# before a device will install it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      optimize:
+        description: "Run R8 shrinking/obfuscation (smaller, optimized APK)"
+        type: boolean
+        default: true
+  push:
+    branches:
+      - main
+    paths:
+      - "app/**"
+      - ".github/workflows/release-apk.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle (caching)
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Run unit tests
+        # Informational here: a failing test should not cost you the APK.
+        continue-on-error: true
+        run: ./gradlew :app:testDebugUnitTest --no-daemon --stacktrace
+
+      - name: Upload test report (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-unit-test-report
+          path: app/build/reports/tests/testDebugUnitTest
+
+      - name: Build unsigned release APK
+        id: build
+        env:
+          # Push builds are always optimized; on-demand builds honor the input.
+          OPTIMIZE: ${{ github.event_name != 'workflow_dispatch' || inputs.optimize }}
+        run: |
+          OPT="false"
+          if [ "$OPTIMIZE" = "true" ]; then
+            if ./gradlew :app:assembleRelease -PunsignedRelease -PoptimizeRelease --no-daemon --stacktrace; then
+              OPT="true"
+            else
+              echo "::warning::Optimized (R8) build failed; retrying without shrinking/obfuscation."
+            fi
+          fi
+          if [ "$OPT" = "false" ]; then
+            ./gradlew :app:assembleRelease -PunsignedRelease --no-daemon --stacktrace
+          fi
+          echo "optimized=${OPT}" >> "$GITHUB_OUTPUT"
+
+      - name: Stamp APK with date + commit
+        id: apk
+        run: |
+          STAMP=$(date -u +%Y%m%d-%H%M)
+          SHA=$(git rev-parse --short HEAD)
+          NAME="AndroidHarness-${STAMP}-${SHA}-release-unsigned.apk"
+          mkdir dist && cp app/build/outputs/apk/release/app-release-unsigned.apk "dist/${NAME}"
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+          ls -l dist
+
+      - name: Summarize
+        run: |
+          {
+            echo "### Unsigned release APK"
+            echo ""
+            echo "Artifact: \`${{ steps.apk.outputs.name }}\`"
+            echo ""
+            echo "R8 shrinking/obfuscation applied: ${{ steps.build.outputs.optimized }}"
+            echo ""
+            echo "It is unsigned, so a device will not install it as-is. Sign it first:"
+            echo ""
+            echo "  zipalign -p -f 4 app-release-unsigned.apk app-aligned.apk"
+            echo "  apksigner sign --ks my-release-key.jks --out app-release.apk app-aligned.apk"
+            echo ""
+            echo "Then verify with: apksigner verify --print-certs app-release.apk"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifact (Actions tab, kept 30 days)
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.apk.outputs.name }}
+          path: dist/*.apk
+          retention-days: 30
