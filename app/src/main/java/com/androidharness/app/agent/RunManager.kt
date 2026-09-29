@@ -204,6 +204,7 @@ class RunManager(
         notifyOnFinish: Boolean = true,
         resume: Boolean = false,
         queuedPromptId: String? = null,
+        existingPromptId: String? = null,
     ): String = kotlinx.coroutines.withContext(Dispatchers.IO) { workspaceGuard.withLock {
         val sid = sessionId ?: sessions.createSession(
             text.take(48),
@@ -222,7 +223,7 @@ class RunManager(
             mode = mode.name, thinking = thinking.name, maxOutput = maxOutputTokens,
             maxContext = maxContextTokens, maxIterations = maxIterations, turnId = turnId,
             initialPrompt = if (resume) it.initialPrompt else text,
-            initialPromptId = if (resume) it.initialPromptId else queuedPromptId ?: "$turnId-user",
+            initialPromptId = if (resume) it.initialPromptId else existingPromptId ?: queuedPromptId ?: "$turnId-user",
             images = if (resume) it.images else imageRefs,
             usedTokens = if (resume) it.usedTokens else 0,
             usedCost = if (resume) it.usedCost else 0.0,
@@ -249,8 +250,13 @@ class RunManager(
                 images = record.images, turnId = turnId, id = initialId), turnId)
         }
         controls.update(sid) { it.copy(queue = it.queue.filterNot { q -> q.id == initialId }) }
-        if (resume) sessions.addMessage(sid, ChatMessage(role = Role.USER,
-            text = "Resume the interrupted task from saved progress. Completed tool results are authoritative. Inspect uncertain outcomes before further actions; do not repeat completed operations."), turnId)
+        if (resume) {
+            val resumePromptText = "Resume the interrupted task from saved progress. Completed tool results are authoritative. Inspect uncertain outcomes before further actions; do not repeat completed operations."
+            val lastMsg = sessions.messages(sid).lastOrNull()
+            if (lastMsg == null || lastMsg.text != resumePromptText) {
+                sessions.addMessage(sid, ChatMessage(role = Role.USER, text = resumePromptText), turnId)
+            }
+        }
         // A new run replaces any plan approval still pending on this session.
         runCatching { sessions.setPendingPlan(sid, null) }
         live.update {
@@ -762,13 +768,41 @@ class RunManager(
         val index = msgs.indexOfFirst { it.id == messageId }
         if (index < 0) return
         // distinct turns from the edited message onward, newest first
-        val turnIds = msgs.drop(index).mapNotNull { it.turnId }.distinct().reversed()
+        val toDelete = msgs.drop(index)
+        val turnIds = toDelete.mapNotNull { it.turnId }.distinct().reversed()
         val fs = workspace.currentOnce()
         for (tid in turnIds) {
             val result = checkpoints.rewind(sessionId, tid, fs)
             check(result.failed == 0) { "Some files could not be restored. History and failed checkpoints were kept; retry undo." }
         }
+        val ids = toDelete.mapNotNull { it.id }
+        if (ids.isNotEmpty()) {
+            sessions.deleteMessagesByIds(ids)
+        }
         sessions.truncateFrom(sessionId, messageId)
+    }
+
+    /**
+     * Rewinds workspace files to the state right after [messageId] and
+     * deletes everything strictly AFTER that message, keeping [messageId] intact.
+     * Used for in-place edit and retry without creating duplicate prompt rows.
+     */
+    suspend fun rewindAndTruncateAfter(sessionId: String, messageId: String) {
+        stopAndJoin(sessionId)
+        val msgs = sessions.messages(sessionId)
+        val index = msgs.indexOfFirst { it.id == messageId }
+        if (index < 0) return
+        val afterMsgs = msgs.drop(index + 1)
+        val turnIds = afterMsgs.mapNotNull { it.turnId }.distinct().reversed()
+        val fs = workspace.currentOnce()
+        for (tid in turnIds) {
+            val result = checkpoints.rewind(sessionId, tid, fs)
+            check(result.failed == 0) { "Some files could not be restored. History and failed checkpoints were kept; retry undo." }
+        }
+        val idsToDelete = afterMsgs.mapNotNull { it.id }
+        if (idsToDelete.isNotEmpty()) {
+            sessions.deleteMessagesByIds(idsToDelete)
+        }
     }
 
     /**

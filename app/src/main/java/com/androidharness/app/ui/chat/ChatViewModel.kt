@@ -699,18 +699,39 @@ class ChatViewModel(
     }
 
     /**
-     * Reruns a past user message as a fresh turn. Attachments are not
-     * re-attached: the message row already displays them, and the stored
-     * workspace copies are no longer in the pending-attachment queue.
-     * No-op while a run is active (the run would swallow it into a queue).
+     * Reruns a past user message. Rewinds any files touched after this message,
+     * deletes subsequent messages, and resends from this exact message without
+     * creating a duplicate user row.
      */
+    fun retryMessage(message: ChatMessage) {
+        val sid = sessionId ?: return
+        val mid = message.id ?: return
+        if (c.runManager.isRunning(sid)) {
+            _state.update { it.copy(error = "Wait for the current run to finish before retrying.") }
+            return
+        }
+        viewModelScope.launch {
+            runCatching { c.runManager.rewindAndTruncateAfter(sid, mid) }
+                .onFailure { e ->
+                    _state.update { st -> st.copy(error = "Could not rewind: ${e.message}") }
+                    return@launch
+                }
+            startRun(message.text, existingPromptId = mid)
+        }
+    }
+
     fun retryMessage(text: String) {
         val sid = sessionId ?: return
         if (c.runManager.isRunning(sid)) {
             _state.update { it.copy(error = "Wait for the current run to finish before retrying.") }
             return
         }
-        send(text)
+        val lastUserMsg = _state.value.messages.lastOrNull { it.role == Role.USER && it.text == text }
+        if (lastUserMsg != null) {
+            retryMessage(lastUserMsg)
+        } else {
+            send(text)
+        }
     }
 
     /**
@@ -994,7 +1015,12 @@ class ChatViewModel(
     // Run lifecycle (delegated to the app-scoped RunManager)
     // ------------------------------------------------------------------
 
-    private fun startRun(text: String, workspaceMcpGate: Boolean = true, queuedPromptId: String? = null) {
+    private fun startRun(
+        text: String,
+        workspaceMcpGate: Boolean = true,
+        queuedPromptId: String? = null,
+        existingPromptId: String? = null,
+    ) {
         val s0 = _state.value
         // Separate planning/execution models: plan-mode runs use the planning
         // slot, everything else the execution one. A slot without a provider
@@ -1080,6 +1106,7 @@ class ChatViewModel(
                 thinking = s0.thinkingLevel,
                 maxIterations = s0.maxIterations,
                 queuedPromptId = queuedPromptId,
+                existingPromptId = existingPromptId,
             )
             if (sessionId == null) {
                 sessionId = sid
@@ -1391,17 +1418,40 @@ class ChatViewModel(
      * message, truncates the conversation there, then resends the edited text
      * as a fresh run. The UI warns before calling this.
      */
+    /**
+     * In-place message edit without re-running.
+     */
+    fun editMessageOnly(message: ChatMessage, newText: String) {
+        val mid = message.id ?: return
+        if (newText.isBlank()) return
+        viewModelScope.launch {
+            c.sessions.updateMessageText(mid, newText)
+            _state.update { st ->
+                st.copy(messages = st.messages.map { if (it.id == mid) it.copy(text = newText) else it })
+            }
+        }
+    }
+
+    /**
+     * Editing a past user message: updates the message text in place, rewinds
+     * any files touched after that point and deletes any subsequent messages,
+     * then re-runs from the edited message without creating a duplicate row.
+     */
     fun editAndResend(message: ChatMessage, newText: String) {
         val sid = sessionId ?: return
         val mid = message.id ?: return
         if (newText.isBlank()) return
         viewModelScope.launch {
-            runCatching { c.runManager.rewindAndTruncate(sid, mid) }
+            c.sessions.updateMessageText(mid, newText)
+            _state.update { st ->
+                st.copy(messages = st.messages.map { if (it.id == mid) it.copy(text = newText) else it })
+            }
+            runCatching { c.runManager.rewindAndTruncateAfter(sid, mid) }
                 .onFailure { e ->
                     _state.update { st -> st.copy(error = "Could not rewind: ${e.message}") }
                     return@launch
                 }
-            startRun(newText)
+            startRun(newText, existingPromptId = mid)
         }
     }
 
@@ -1675,6 +1725,10 @@ class ChatViewModel(
             }
             is com.androidharness.app.llm.ModelCatalog.Result.Failed -> result.message
         }
+    }
+
+    suspend fun testModelLatency(providerId: String, modelId: String): com.androidharness.app.llm.ModelCatalog.LatencyResult {
+        return c.providers.testModelLatency(providerId, modelId)
     }
 
     fun dismissError() {

@@ -236,6 +236,12 @@ interface HarnessDao {
     )
     suspend fun deleteMessagesFrom(sessionId: String, messageId: String): Int
 
+    @Query("UPDATE messages SET text = :text WHERE id = :messageId")
+    suspend fun updateMessageText(messageId: String, text: String): Int
+
+    @Query("DELETE FROM messages WHERE id IN (:ids)")
+    suspend fun deleteMessagesByIds(ids: List<String>): Int
+
     // chat search
     @Query(
         "SELECT m.* FROM message_fts f JOIN messages m ON m.rowid = f.docid " +

@@ -1,8 +1,11 @@
 package com.androidharness.app.llm
 
+import com.androidharness.app.core.ChatMessage
+import com.androidharness.app.core.Role
 import com.androidharness.app.llm.jsonArrayOrAbsent
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.booleanOrNull
@@ -69,6 +72,71 @@ object ModelCatalog {
     sealed interface Result {
         data class Models(val models: List<ModelEntry>, val latencyMs: Long) : Result
         data class Failed(val message: String) : Result
+    }
+
+    sealed interface LatencyResult {
+        data class Success(val latencyMs: Long) : LatencyResult
+        data class Failed(val message: String) : LatencyResult
+    }
+
+    private class TokenReceivedException(val elapsed: Long) : Exception()
+    private class StreamFailedException(val msg: String) : Exception()
+
+    suspend fun testModelLatency(
+        config: ProviderConfig,
+        apiKey: String,
+        modelId: String,
+    ): LatencyResult = withContext(Dispatchers.IO) {
+        val clean = modelId.trim()
+        if (clean.isBlank()) return@withContext LatencyResult.Failed("Model ID cannot be empty")
+        val effectiveKey = if (config.id == HarnessProvider.ID) {
+            HarnessProvider.KEYLESS
+        } else apiKey.trim()
+        if (effectiveKey.isBlank()) {
+            return@withContext LatencyResult.Failed("API key required for testing")
+        }
+        val started = System.currentTimeMillis()
+        try {
+            val testConfig = config.copy(model = clean)
+            val provider = ProviderFactory.create(testConfig)
+            val flow = provider.streamChat(
+                config = testConfig,
+                apiKey = effectiveKey,
+                systemPrompt = "",
+                messages = listOf(ChatMessage(role = Role.USER, text = "hi")),
+                tools = emptyList(),
+                options = RequestOptions(
+                    maxOutputTokens = 8,
+                    thinking = com.androidharness.app.agent.ThinkingLevel.OFF,
+                ),
+            )
+            withTimeout(15_000L) {
+                flow.collect { event ->
+                    when (event) {
+                        is StreamEvent.Failure -> throw StreamFailedException(event.message)
+                        is StreamEvent.TextDelta,
+                        is StreamEvent.ThinkingDelta,
+                        is StreamEvent.Done,
+                        is StreamEvent.Usage -> {
+                            val elapsed = (System.currentTimeMillis() - started).coerceAtLeast(1L)
+                            throw TokenReceivedException(elapsed)
+                        }
+                        else -> {}
+                    }
+                }
+            }
+            LatencyResult.Success((System.currentTimeMillis() - started).coerceAtLeast(1L))
+        } catch (e: TokenReceivedException) {
+            LatencyResult.Success(e.elapsed)
+        } catch (e: StreamFailedException) {
+            LatencyResult.Failed(e.msg)
+        } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
+            LatencyResult.Failed("Test timed out (15s)")
+        } catch (e: ApiException) {
+            LatencyResult.Failed("HTTP ${e.code}: ${e.message}")
+        } catch (e: Exception) {
+            LatencyResult.Failed(e.message ?: "Connection error")
+        }
     }
 
     suspend fun listModels(config: ProviderConfig, apiKey: String): Result =

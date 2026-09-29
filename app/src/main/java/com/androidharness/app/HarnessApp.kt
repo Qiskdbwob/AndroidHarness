@@ -79,7 +79,8 @@ class AppContainer(val appContext: Context) {
     val linuxEnv =
         com.androidharness.app.data.env.LinuxEnvironmentManager(appContext) { keys.githubToken() }
     val shizuku = com.androidharness.app.data.env.ShizukuManager(appContext)
-    val shellRouter = com.androidharness.app.data.env.ShellTierRouter(appContext, shizuku, linuxEnv)
+    val termuxSsh = com.androidharness.app.data.env.TermuxSshManager(appContext, settings, keys)
+    val shellRouter = com.androidharness.app.data.env.ShellTierRouter(appContext, shizuku, linuxEnv, termuxSsh, settings)
     val codeGraph = com.androidharness.app.data.env.CodeGraphManager(linuxEnv, shellRouter)
 
     init {

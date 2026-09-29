@@ -545,8 +545,19 @@ class SessionRepository(
      * message: the conversation is truncated there and resent.
      */
     suspend fun truncateFrom(sessionId: String, messageId: String) {
+        messageCache.remove(messageId)
         db.dao().deleteMessagesFrom(sessionId, messageId)
         db.dao().setCompaction(sessionId, "", 0)
+    }
+
+    suspend fun updateMessageText(messageId: String, text: String) {
+        messageCache.remove(messageId)
+        db.dao().updateMessageText(messageId, clampForStorage(text))
+    }
+
+    suspend fun deleteMessagesByIds(ids: List<String>) {
+        ids.forEach { messageCache.remove(it) }
+        db.dao().deleteMessagesByIds(ids)
     }
 
     suspend fun deleteSession(session: SessionEntity) {

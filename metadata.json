@@ -1,0 +1,6 @@
+{
+  "name": "AndroidHarness",
+  "description": "AndroidHarness - an agent execution harness for Android.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -38,10 +38,14 @@ import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.Archive
 import androidx.compose.material.icons.outlined.AutoStories
 import androidx.compose.material.icons.outlined.BarChart
+import androidx.compose.material.icons.outlined.Cable
 import androidx.compose.material.icons.outlined.CheckCircle
 import androidx.compose.material.icons.outlined.Code
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Description
+import androidx.compose.material.icons.outlined.Dns
+import androidx.compose.material.icons.outlined.ExpandLess
+import androidx.compose.material.icons.outlined.ExpandMore
 import androidx.compose.material.icons.outlined.Extension
 import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.FolderOpen
@@ -53,6 +57,8 @@ import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material.icons.outlined.SystemUpdate
 import androidx.compose.material.icons.outlined.Inventory2
 import androidx.compose.material.icons.outlined.Terminal
+import androidx.compose.material.icons.outlined.Visibility
+import androidx.compose.material.icons.outlined.VisibilityOff
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
@@ -93,6 +99,8 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.androidharness.app.AppContainer
@@ -448,12 +456,21 @@ private fun TerminalSection(
                 icon = Icons.Outlined.Shield,
                 title = "System paths & any folder",
                 subtitle = "ADB-shell privileges via Shizuku",
-                divider = false,
+                divider = true,
                 trailing = { StatusText(systemText, ok = shizukuState == ShizukuState.GRANTED) },
+            )
+            val termuxSettings by container.settings.settings.collectAsStateWithLifecycle(initialValue = com.androidharness.app.data.AppSettings())
+            SettingRow(
+                icon = Icons.Outlined.Dns,
+                title = "Termux SSH bridge",
+                subtitle = if (termuxSettings.termuxSshEnabled) "Active on ${termuxSettings.termuxSshHost}:${termuxSettings.termuxSshPort}" else "Run git and shell inside Termux sshd",
+                divider = false,
+                trailing = { StatusText(if (termuxSettings.termuxSshEnabled) "Active" else "Off", ok = termuxSettings.termuxSshEnabled) },
             )
         }
     }
 
+    TermuxSshCard(container = container)
     StorageAccessCard(allFiles = allFiles, onGrant = { SystemGrants.openAllFilesAccess(context) })
     ShizukuCard(
         state = shizukuState,
@@ -1860,6 +1877,245 @@ private fun ShizukuCard(
                 ShizukuState.RUNNING_NO_PERMISSION -> Button(onClick = onGrant) { Text("Grant Shizuku access") }
                 ShizukuState.NOT_RUNNING -> OutlinedButton(onClick = onRefresh) { Text("Refresh status") }
                 ShizukuState.NOT_INSTALLED -> OutlinedButton(onClick = onRefresh) { Text("Check again") }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TermuxSshCard(
+    container: AppContainer,
+) {
+    val scope = rememberCoroutineScope()
+    val settings by container.settings.settings.collectAsStateWithLifecycle(initialValue = com.androidharness.app.data.AppSettings())
+    var testResult by remember { mutableStateOf<String?>(null) }
+    var isTesting by remember { mutableStateOf(false) }
+    var testSuccess by remember { mutableStateOf(false) }
+    var showInstructions by remember { mutableStateOf(false) }
+
+    var hostInput by remember(settings.termuxSshHost) { mutableStateOf(settings.termuxSshHost) }
+    var portInput by remember(settings.termuxSshPort) { mutableStateOf(settings.termuxSshPort.toString()) }
+    var userInput by remember(settings.termuxSshUser) { mutableStateOf(settings.termuxSshUser) }
+
+    var passwordInput by remember { mutableStateOf(container.keys.termuxSshPassword() ?: "") }
+    var showPassword by remember { mutableStateOf(false) }
+
+    var keyInput by remember { mutableStateOf(container.keys.termuxSshKey() ?: "") }
+    var showKeySection by remember { mutableStateOf(false) }
+
+    SettingsPanel(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    Icons.Outlined.Dns,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(20.dp),
+                )
+                Spacer(Modifier.width(10.dp))
+                Column(Modifier.weight(1f)) {
+                    Text("Termux SSH Bridge", style = MaterialTheme.typography.titleSmall)
+                    Text(
+                        "Route agent commands and git commit/push through Termux sshd",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(
+                    checked = settings.termuxSshEnabled,
+                    onCheckedChange = { enabled ->
+                        scope.launch { container.settings.setTermuxSshEnabled(enabled) }
+                    },
+                )
+            }
+
+            if (settings.termuxSshEnabled) {
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    OutlinedTextField(
+                        value = hostInput,
+                        onValueChange = {
+                            hostInput = it
+                            scope.launch { container.settings.setTermuxSshHost(it) }
+                        },
+                        label = { Text("Host") },
+                        modifier = Modifier.weight(2f),
+                        singleLine = true,
+                    )
+                    OutlinedTextField(
+                        value = portInput,
+                        onValueChange = {
+                            portInput = it
+                            it.toIntOrNull()?.let { p ->
+                                scope.launch { container.settings.setTermuxSshPort(p) }
+                            }
+                        },
+                        label = { Text("Port") },
+                        modifier = Modifier.weight(1f),
+                        singleLine = true,
+                    )
+                }
+
+                OutlinedTextField(
+                    value = userInput,
+                    onValueChange = {
+                        userInput = it
+                        scope.launch { container.settings.setTermuxSshUser(it) }
+                    },
+                    label = { Text("Username") },
+                    placeholder = { Text("termux") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                )
+
+                OutlinedTextField(
+                    value = passwordInput,
+                    onValueChange = {
+                        passwordInput = it
+                        if (it.isBlank()) {
+                            container.keys.removeTermuxSshPassword()
+                        } else {
+                            container.keys.putTermuxSshPassword(it)
+                        }
+                    },
+                    label = { Text("Password (set with 'passwd' in Termux)") },
+                    visualTransformation = if (showPassword) VisualTransformation.None else PasswordVisualTransformation(),
+                    trailingIcon = {
+                        IconButton(onClick = { showPassword = !showPassword }) {
+                            Icon(
+                                if (showPassword) Icons.Outlined.VisibilityOff else Icons.Outlined.Visibility,
+                                contentDescription = if (showPassword) "Hide password" else "Show password",
+                            )
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                )
+
+                TextButton(
+                    onClick = { showKeySection = !showKeySection },
+                    modifier = Modifier.align(Alignment.Start),
+                ) {
+                    Icon(
+                        if (showKeySection) Icons.Outlined.ExpandLess else Icons.Outlined.ExpandMore,
+                        contentDescription = null,
+                    )
+                    Spacer(Modifier.width(4.dp))
+                    Text(if (showKeySection) "Hide SSH Private Key" else "SSH Private Key (Optional)")
+                }
+
+                if (showKeySection) {
+                    OutlinedTextField(
+                        value = keyInput,
+                        onValueChange = {
+                            keyInput = it
+                            if (it.isBlank()) {
+                                container.keys.removeTermuxSshKey()
+                            } else {
+                                container.keys.putTermuxSshKey(it)
+                            }
+                        },
+                        label = { Text("OpenSSH / RSA Private Key") },
+                        placeholder = { Text("-----BEGIN OPENSSH PRIVATE KEY-----\n...") },
+                        modifier = Modifier.fillMaxWidth(),
+                        minLines = 3,
+                        maxLines = 6,
+                    )
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Button(
+                        enabled = !isTesting,
+                        onClick = {
+                            scope.launch {
+                                isTesting = true
+                                testResult = null
+                                val res = container.termuxSsh.testConnection()
+                                isTesting = false
+                                if (res.isSuccess) {
+                                    testSuccess = true
+                                    testResult = res.getOrNull()
+                                } else {
+                                    testSuccess = false
+                                    testResult = res.exceptionOrNull()?.message ?: "Unknown error"
+                                }
+                            }
+                        },
+                    ) {
+                        if (isTesting) {
+                            androidx.compose.material3.CircularProgressIndicator(
+                                modifier = Modifier.size(16.dp),
+                                strokeWidth = 2.dp,
+                                color = MaterialTheme.colorScheme.onPrimary,
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Text("Testing…")
+                        } else {
+                            Icon(Icons.Outlined.Cable, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(8.dp))
+                            Text("Test Connection")
+                        }
+                    }
+
+                    TextButton(onClick = { showInstructions = !showInstructions }) {
+                        Text(if (showInstructions) "Hide Termux setup" else "Termux setup guide")
+                    }
+                }
+
+                testResult?.let { msg ->
+                    Box(
+                        Modifier
+                            .fillMaxWidth()
+                            .background(
+                                if (testSuccess) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f)
+                                else MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.5f),
+                                MaterialTheme.shapes.small,
+                            )
+                            .padding(10.dp),
+                    ) {
+                        Column {
+                            Text(
+                                if (testSuccess) "✓ Connected to Termux SSH" else "✗ Connection Failed",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = if (testSuccess) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
+                            )
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                msg,
+                                style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                                color = if (testSuccess) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onErrorContainer,
+                            )
+                        }
+                    }
+                }
+
+                if (showInstructions) {
+                    Box(
+                        Modifier
+                            .fillMaxWidth()
+                            .background(
+                                MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                                MaterialTheme.shapes.small,
+                            )
+                            .padding(10.dp),
+                    ) {
+                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Text("Quick setup in Termux app:", style = MaterialTheme.typography.titleSmall)
+                            Text("1. Install SSH & Git:\npkg install openssh git", style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace))
+                            Text("2. Set a password:\npasswd", style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace))
+                            Text("3. Start SSH daemon:\nsshd", style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace))
+                            Text("4. (Optional) Device storage:\ntermux-setup-storage", style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace))
+                        }
+                    }
+                }
             }
         }
     }

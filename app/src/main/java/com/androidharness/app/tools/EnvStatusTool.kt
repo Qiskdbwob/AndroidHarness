@@ -51,6 +51,8 @@ class EnvStatusTool(
                 "app-uid Linux bash (full toolchain: node, python, git, …) in $cwd"
             ExecutionTier.TOYBOX ->
                 "toybox sh (Linux environment not installed)"
+            ExecutionTier.TERMUX_SSH ->
+                "Termux SSH Bridge (executing inside Termux environment via SSH)"
         }
         val storage =
             if (router.isAllFilesAccess()) "All files access granted ✓"

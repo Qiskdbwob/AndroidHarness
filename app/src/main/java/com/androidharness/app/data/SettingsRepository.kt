@@ -80,6 +80,11 @@ data class AppSettings(
     val lastActiveSessionId: String? = null,
     /** Generate and inject compact codebase symbol index (Repo map) into agent context. */
     val repoMapEnabled: Boolean = true,
+    /** Termux SSH Bridge: connect to local Termux sshd for shell and git execution. */
+    val termuxSshEnabled: Boolean = false,
+    val termuxSshHost: String = "127.0.0.1",
+    val termuxSshPort: Int = 8022,
+    val termuxSshUser: String = "termux",
 ) {
     companion object {
         const val DEFAULT_MAX_CONTEXT = 1_000_000
@@ -89,6 +94,9 @@ data class AppSettings(
         const val VOICE_ENGINE_GROQ = "groq"
         const val GROQ_MODEL_WHISPER_V3 = "whisper-large-v3"
         const val GROQ_MODEL_WHISPER_TURBO = "whisper-large-v3-turbo"
+        const val DEFAULT_TERMUX_SSH_HOST = "127.0.0.1"
+        const val DEFAULT_TERMUX_SSH_PORT = 8022
+        const val DEFAULT_TERMUX_SSH_USER = "termux"
     }
 }
 
@@ -126,6 +134,10 @@ class SettingsRepository(private val context: Context) {
         val RESUME_LAST_CHAT = booleanPreferencesKey("resume_last_chat")
         val LAST_ACTIVE_SESSION = stringPreferencesKey("last_active_session_id")
         val REPO_MAP_ENABLED = booleanPreferencesKey("repo_map_enabled")
+        val TERMUX_SSH_ENABLED = booleanPreferencesKey("termux_ssh_enabled")
+        val TERMUX_SSH_HOST = stringPreferencesKey("termux_ssh_host")
+        val TERMUX_SSH_PORT = intPreferencesKey("termux_ssh_port")
+        val TERMUX_SSH_USER = stringPreferencesKey("termux_ssh_user")
     }
 
     val settings: Flow<AppSettings> = context.settingsStore.data.map { prefs ->
@@ -169,6 +181,10 @@ class SettingsRepository(private val context: Context) {
             resumeLastChat = prefs[Keys.RESUME_LAST_CHAT] ?: true,
             lastActiveSessionId = prefs[Keys.LAST_ACTIVE_SESSION],
             repoMapEnabled = prefs[Keys.REPO_MAP_ENABLED] ?: true,
+            termuxSshEnabled = prefs[Keys.TERMUX_SSH_ENABLED] ?: false,
+            termuxSshHost = prefs[Keys.TERMUX_SSH_HOST] ?: AppSettings.DEFAULT_TERMUX_SSH_HOST,
+            termuxSshPort = prefs[Keys.TERMUX_SSH_PORT] ?: AppSettings.DEFAULT_TERMUX_SSH_PORT,
+            termuxSshUser = prefs[Keys.TERMUX_SSH_USER] ?: AppSettings.DEFAULT_TERMUX_SSH_USER,
         )
     }
 
@@ -339,5 +355,21 @@ class SettingsRepository(private val context: Context) {
             if (sessionId.isNullOrBlank()) prefs.remove(Keys.LAST_ACTIVE_SESSION)
             else prefs[Keys.LAST_ACTIVE_SESSION] = sessionId
         }
+    }
+
+    suspend fun setTermuxSshEnabled(enabled: Boolean) {
+        context.settingsStore.edit { it[Keys.TERMUX_SSH_ENABLED] = enabled }
+    }
+
+    suspend fun setTermuxSshHost(host: String) {
+        context.settingsStore.edit { it[Keys.TERMUX_SSH_HOST] = host.trim().ifBlank { AppSettings.DEFAULT_TERMUX_SSH_HOST } }
+    }
+
+    suspend fun setTermuxSshPort(port: Int) {
+        context.settingsStore.edit { it[Keys.TERMUX_SSH_PORT] = if (port in 1..65535) port else AppSettings.DEFAULT_TERMUX_SSH_PORT }
+    }
+
+    suspend fun setTermuxSshUser(user: String) {
+        context.settingsStore.edit { it[Keys.TERMUX_SSH_USER] = user.trim().ifBlank { AppSettings.DEFAULT_TERMUX_SSH_USER } }
     }
 }

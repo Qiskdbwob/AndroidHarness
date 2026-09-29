@@ -1,7 +1,7 @@
 [versions]
-agp = "9.3.1"
-kotlin = "2.4.10"
-ksp = "2.3.11"
+agp = "9.1.1"
+kotlin = "2.2.10"
+ksp = "2.3.5"
 composeBom = "2026.08.00"
 material3 = "1.5.0-alpha26"
 coreKtx = "1.17.0"
@@ -24,6 +24,7 @@ commonsCompress = "1.28.0"
 xz = "1.12"
 shizuku = "13.1.5"
 soraEditor = "0.23.6"
+jsch = "0.2.24"
 
 [libraries]
 core-ktx = { module = "androidx.core:core-ktx", version.ref = "coreKtx" }
@@ -58,6 +59,7 @@ xz = { module = "org.tukaani:xz", version.ref = "xz" }
 sora-editor = { module = "io.github.Rosemoe.sora-editor:editor", version.ref = "soraEditor" }
 shizuku-api = { module = "dev.rikka.shizuku:api", version.ref = "shizuku" }
 shizuku-provider = { module = "dev.rikka.shizuku:provider", version.ref = "shizuku" }
+jsch = { module = "com.github.mwiede:jsch", version.ref = "jsch" }
 junit = { module = "junit:junit", version = "4.13.2" }
 
 [plugins]

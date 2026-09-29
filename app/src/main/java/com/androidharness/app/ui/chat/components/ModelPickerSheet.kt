@@ -21,6 +21,7 @@ import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Search
+import androidx.compose.material.icons.outlined.Speed
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
@@ -42,6 +43,7 @@ import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -81,6 +83,7 @@ fun ModelPickerSheet(
     browseProviderId: String? = null,
     onAddCustomModel: (providerId: String, model: String, reasoning: Boolean?) -> Unit = { _, _, _ -> },
     onDeleteCustomModel: (providerId: String, model: String) -> Unit = { _, _ -> },
+    onTestLatency: (suspend (providerId: String, modelId: String) -> com.androidharness.app.llm.ModelCatalog.LatencyResult)? = null,
 ) {
     val scheme = MaterialTheme.colorScheme
     val scope = rememberCoroutineScope()
@@ -89,6 +92,8 @@ fun ModelPickerSheet(
     var isRefreshing by remember { mutableStateOf(false) }
     var refreshError by remember { mutableStateOf<String?>(null) }
     var showAddCustomDialog by remember { mutableStateOf(false) }
+    val latencyResults = remember { mutableStateMapOf<String, com.androidharness.app.llm.ModelCatalog.LatencyResult>() }
+    val latencyTesting = remember { mutableStateMapOf<String, Boolean>() }
 
     val listedId = browseProviderId ?: activeProviderId
     val listedProvider = providers.firstOrNull { it.id == listedId }
@@ -205,6 +210,43 @@ fun ModelPickerSheet(
                     leadingIcon = { Icon(Icons.Outlined.Add, contentDescription = null, modifier = Modifier.size(16.dp)) },
                     modifier = Modifier.padding(top = 8.dp),
                 )
+                if (onTestLatency != null && listedProvider != null && listedModel != null) {
+                    val targetModel = listedModel
+                    val activeResult = latencyResults[targetModel]
+                    val isTesting = latencyTesting[targetModel] == true
+                    Spacer(Modifier.width(8.dp))
+                    AssistChip(
+                        onClick = {
+                            if (!isTesting) {
+                                scope.launch {
+                                    latencyTesting[targetModel] = true
+                                    val res = onTestLatency(listedProvider.id, targetModel)
+                                    latencyResults[targetModel] = res
+                                    latencyTesting[targetModel] = false
+                                }
+                            }
+                        },
+                        label = {
+                            if (isTesting) {
+                                Text("Testing…", style = MaterialTheme.typography.labelSmall)
+                            } else if (activeResult is com.androidharness.app.llm.ModelCatalog.LatencyResult.Success) {
+                                Text("${activeResult.latencyMs} ms", style = MaterialTheme.typography.labelSmall, color = scheme.primary)
+                            } else if (activeResult is com.androidharness.app.llm.ModelCatalog.LatencyResult.Failed) {
+                                Text("Failed", style = MaterialTheme.typography.labelSmall, color = scheme.error)
+                            } else {
+                                Text("Test latency", style = MaterialTheme.typography.labelSmall)
+                            }
+                        },
+                        leadingIcon = {
+                            if (isTesting) {
+                                CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 1.5.dp)
+                            } else {
+                                Icon(Icons.Outlined.Speed, contentDescription = null, modifier = Modifier.size(16.dp))
+                            }
+                        },
+                        modifier = Modifier.padding(top = 8.dp),
+                    )
+                }
                 Spacer(Modifier.weight(1f))
                 listedProvider?.let { p ->
                     Text(
@@ -361,6 +403,18 @@ fun ModelPickerSheet(
                                 entry.contextTokens
                                     ?: ModelsDev.entry(devKey, entry.id)?.contextTokens,
                             ),
+                            latency = latencyResults[entry.id],
+                            isTestingLatency = latencyTesting[entry.id] == true,
+                            onTestLatency = if (onTestLatency != null) {
+                                {
+                                    scope.launch {
+                                        latencyTesting[entry.id] = true
+                                        val res = onTestLatency(provider.id, entry.id)
+                                        latencyResults[entry.id] = res
+                                        latencyTesting[entry.id] = false
+                                    }
+                                }
+                            } else null,
                             onClick = {
                                 onSelect(provider.id, entry.id)
                                 onDismiss()
@@ -398,6 +452,12 @@ fun ModelPickerSheet(
                 onSelect(listedProvider.id, modelId)
                 onDismiss()
             },
+            onTestLatency = onTestLatency?.let { testFn ->
+                { modelId -> testFn(listedProvider.id, modelId) }
+            },
+            onLatencyRecorded = { modelId, result ->
+                latencyResults[modelId] = result
+            },
         )
     }
 }
@@ -410,6 +470,9 @@ private fun ModelRow(
     selected: Boolean,
     ctx: String?,
     isCustom: Boolean = false,
+    latency: com.androidharness.app.llm.ModelCatalog.LatencyResult? = null,
+    isTestingLatency: Boolean = false,
+    onTestLatency: (() -> Unit)? = null,
     onClick: () -> Unit,
     onDelete: (() -> Unit)? = null,
 ) {
@@ -452,17 +515,52 @@ private fun ModelRow(
                         }
                     }
                 }
+                val latencyText = when (latency) {
+                    is com.androidharness.app.llm.ModelCatalog.LatencyResult.Success -> "⚡ ${latency.latencyMs} ms"
+                    is com.androidharness.app.llm.ModelCatalog.LatencyResult.Failed -> "⚠️ ${latency.message.take(25)}"
+                    null -> if (isTestingLatency) "testing latency…" else null
+                }
                 val sub = listOfNotNull(
                     if (thinking) "thinking" else null,
                     ctx,
+                    latencyText,
                 ).joinToString(" · ")
                 if (sub.isNotEmpty()) {
                     Text(
                         sub,
                         style = MaterialTheme.typography.labelSmall,
-                        color = if (thinking) scheme.primary else scheme.onSurfaceVariant,
+                        color = when {
+                            latency is com.androidharness.app.llm.ModelCatalog.LatencyResult.Success -> scheme.primary
+                            latency is com.androidharness.app.llm.ModelCatalog.LatencyResult.Failed -> scheme.error
+                            thinking -> scheme.primary
+                            else -> scheme.onSurfaceVariant
+                        },
                     )
                 }
+            }
+            if (isTestingLatency) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(20.dp).padding(2.dp),
+                    strokeWidth = 2.dp,
+                )
+                Spacer(Modifier.width(6.dp))
+            } else if (onTestLatency != null) {
+                IconButton(
+                    onClick = onTestLatency,
+                    modifier = Modifier.size(30.dp),
+                ) {
+                    Icon(
+                        Icons.Outlined.Speed,
+                        contentDescription = "Test latency",
+                        tint = if (latency is com.androidharness.app.llm.ModelCatalog.LatencyResult.Success) {
+                            scheme.primary
+                        } else {
+                            scheme.onSurfaceVariant
+                        },
+                        modifier = Modifier.size(16.dp),
+                    )
+                }
+                Spacer(Modifier.width(4.dp))
             }
             if (onDelete != null) {
                 IconButton(
@@ -495,9 +593,15 @@ private fun AddCustomModelDialog(
     providerName: String,
     onDismiss: () -> Unit,
     onAdd: (modelId: String, reasoning: Boolean?) -> Unit,
+    onTestLatency: (suspend (modelId: String) -> com.androidharness.app.llm.ModelCatalog.LatencyResult)? = null,
+    onLatencyRecorded: ((modelId: String, result: com.androidharness.app.llm.ModelCatalog.LatencyResult) -> Unit)? = null,
 ) {
+    val scheme = MaterialTheme.colorScheme
+    val scope = rememberCoroutineScope()
     var modelId by remember { mutableStateOf("") }
     var thinking by remember { mutableStateOf(false) }
+    var latencyStatus by remember { mutableStateOf<com.androidharness.app.llm.ModelCatalog.LatencyResult?>(null) }
+    var isTestingLatency by remember { mutableStateOf(false) }
     val clean = modelId.trim()
 
     AlertDialog(
@@ -512,7 +616,10 @@ private fun AddCustomModelDialog(
                 )
                 OutlinedTextField(
                     value = modelId,
-                    onValueChange = { modelId = it },
+                    onValueChange = {
+                        modelId = it
+                        latencyStatus = null
+                    },
                     label = { Text("Model ID") },
                     placeholder = { Text("e.g. meta-llama/llama-3.3-70b") },
                     singleLine = true,
@@ -539,11 +646,89 @@ private fun AddCustomModelDialog(
                         )
                     }
                 }
+
+                if (onTestLatency != null) {
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = scheme.surfaceVariant.copy(alpha = 0.5f),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text("Model latency test", style = MaterialTheme.typography.labelMedium)
+                                when (val status = latencyStatus) {
+                                    is com.androidharness.app.llm.ModelCatalog.LatencyResult.Success -> {
+                                        Text(
+                                            "⚡ Latency: ${status.latencyMs} ms",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = scheme.primary,
+                                        )
+                                    }
+                                    is com.androidharness.app.llm.ModelCatalog.LatencyResult.Failed -> {
+                                        Text(
+                                            "⚠️ ${status.message}",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = scheme.error,
+                                        )
+                                    }
+                                    null -> {
+                                        if (isTestingLatency) {
+                                            Text(
+                                                "Testing latency…",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = scheme.onSurfaceVariant,
+                                            )
+                                        } else {
+                                            Text(
+                                                "Test response time before adding",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = scheme.onSurfaceVariant,
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                            Spacer(Modifier.width(8.dp))
+                            OutlinedButton(
+                                enabled = clean.isNotBlank() && !isTestingLatency,
+                                onClick = {
+                                    scope.launch {
+                                        isTestingLatency = true
+                                        latencyStatus = null
+                                        val res = onTestLatency(clean)
+                                        latencyStatus = res
+                                        isTestingLatency = false
+                                        onLatencyRecorded?.invoke(clean, res)
+                                    }
+                                },
+                            ) {
+                                if (isTestingLatency) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(14.dp),
+                                        strokeWidth = 2.dp,
+                                    )
+                                } else {
+                                    Icon(
+                                        Icons.Outlined.Speed,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(16.dp),
+                                    )
+                                    Spacer(Modifier.width(4.dp))
+                                    Text("Test")
+                                }
+                            }
+                        }
+                    }
+                }
             }
         },
         confirmButton = {
             Button(
-                enabled = clean.isNotBlank(),
+                enabled = clean.isNotBlank() && !isTestingLatency,
                 onClick = {
                     onAdd(clean, if (thinking) true else null)
                     onDismiss()

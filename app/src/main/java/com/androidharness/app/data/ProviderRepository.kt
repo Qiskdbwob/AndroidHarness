@@ -122,6 +122,13 @@ class ProviderRepository(
         }
     }
 
+    suspend fun testModelLatency(providerId: String, modelId: String): com.androidharness.app.llm.ModelCatalog.LatencyResult {
+        val provider = providers.first().firstOrNull { it.id == providerId }
+            ?: return com.androidharness.app.llm.ModelCatalog.LatencyResult.Failed("Unknown provider")
+        val key = apiKey(providerId).orEmpty()
+        return com.androidharness.app.llm.ModelCatalog.testModelLatency(provider, key, modelId)
+    }
+
     suspend fun add(name: String, type: ProviderType, baseUrl: String, model: String, apiKey: String): ProviderConfig {
         val config = ProviderConfig(
             id = UUID.randomUUID().toString(),

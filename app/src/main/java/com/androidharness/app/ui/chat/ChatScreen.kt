@@ -368,6 +368,7 @@ fun ChatScreen(
             onRefreshCatalog = viewModel::refreshCatalog,
             onAddCustomModel = viewModel::addCustomModel,
             onDeleteCustomModel = viewModel::deleteCustomModel,
+            onTestLatency = viewModel::testModelLatency,
             // Provider management stays in-conversation: a sheet, not a screen.
             onManageProviders = {
                 activeProviderManagerTarget = target
@@ -454,7 +455,7 @@ fun ChatScreen(
                     TextButton(
                         onClick = {
                             actionsMessage = null
-                            viewModel.retryMessage(msg.text)
+                            viewModel.retryMessage(msg)
                         },
                         enabled = !state.busy,
                     ) { Text("Retry") }
@@ -481,12 +482,20 @@ fun ChatScreen(
                 )
             },
             confirmButton = {
-                Button(onClick = {
-                    if (text.isNotBlank()) {
-                        confirmingEdit = msg to text
-                        editingMessage = null
-                    }
-                }) { Text("Continue") }
+                Row {
+                    TextButton(onClick = {
+                        if (text.isNotBlank()) {
+                            viewModel.editMessageOnly(msg, text)
+                            editingMessage = null
+                        }
+                    }) { Text("Save only") }
+                    Button(onClick = {
+                        if (text.isNotBlank()) {
+                            confirmingEdit = msg to text
+                            editingMessage = null
+                        }
+                    }) { Text("Save & resend") }
+                }
             },
             dismissButton = { TextButton(onClick = { editingMessage = null }) { Text("Cancel") } },
         )
@@ -499,9 +508,7 @@ fun ChatScreen(
             title = { Text("Edit this message?") },
             text = {
                 Text(
-                    "Everything after this message will be deleted, and any file changes made " +
-                        "after it will be undone: files are restored to how they were at that " +
-                        "point. The edited message is then resent. This cannot be undone.",
+                    "This message will be updated in place. Everything in the conversation after this message will be deleted, and any files modified since will be restored. The agent will then run for the edited message without creating a duplicate row.",
                 )
             },
             confirmButton = {

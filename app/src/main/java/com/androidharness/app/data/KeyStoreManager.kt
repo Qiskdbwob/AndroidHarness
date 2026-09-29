@@ -124,6 +124,28 @@ class KeyStoreManager(context: Context) {
         prefs.edit().remove(KEY_GROQ_API).apply()
     }
 
+    /** Password used for Termux SSH connection. */
+    fun putTermuxSshPassword(password: String) {
+        prefs.edit().putString(KEY_TERMUX_SSH_PASSWORD, password).apply()
+    }
+
+    fun termuxSshPassword(): String? = prefs.getString(KEY_TERMUX_SSH_PASSWORD, null)?.ifBlank { null }
+
+    fun removeTermuxSshPassword() {
+        prefs.edit().remove(KEY_TERMUX_SSH_PASSWORD).apply()
+    }
+
+    /** Private key used for Termux SSH key-based authentication. */
+    fun putTermuxSshKey(key: String) {
+        prefs.edit().putString(KEY_TERMUX_SSH_KEY, key.trim()).apply()
+    }
+
+    fun termuxSshKey(): String? = prefs.getString(KEY_TERMUX_SSH_KEY, null)?.trim()?.ifBlank { null }
+
+    fun removeTermuxSshKey() {
+        prefs.edit().remove(KEY_TERMUX_SSH_KEY).apply()
+    }
+
     private object McpServerNameSanitizer {
         fun sanitize(raw: String): String =
             raw.trim().lowercase().replace(Regex("[^a-z0-9_]+"), "_")
@@ -137,5 +159,7 @@ class KeyStoreManager(context: Context) {
         const val KEY_SEARCH_API = "search_api_key"
         const val KEY_MCP_OAUTH = "mcp_oauth"
         const val KEY_GROQ_API = "groq_api_key"
+        const val KEY_TERMUX_SSH_PASSWORD = "termux_ssh_password"
+        const val KEY_TERMUX_SSH_KEY = "termux_ssh_key"
     }
 }

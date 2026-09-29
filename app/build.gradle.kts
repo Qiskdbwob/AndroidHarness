@@ -8,7 +8,7 @@ plugins {
 
 android {
     namespace = "com.androidharness.app"
-    compileSdk = 37
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.androidharness.app"
@@ -19,16 +19,11 @@ android {
     }
 
     signingConfigs {
-        getByName("debug") {
-            // Prefer the stable debug key kept in the gitignored signing-keys/
-            // folder. AGP's default path is machine-dependent (it resolved to
-            // ~/.config/.android on this box and silently generated a fresh
-            // key there), and a stray debug keystore makes every install on a
-            // device that already has the app fail with a signature mismatch.
-            val stableDebugKey = rootProject.file("signing-keys/debug.keystore")
-            if (stableDebugKey.exists()) {
-                storeFile = stableDebugKey
-            }
+        create("debugConfig") {
+            storeFile = file("${rootDir}/debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
         }
     }
 
@@ -37,11 +32,12 @@ android {
             // Local alpha distribution: signed with the debug keystore so the
             // APK installs without a release keystore. Swap to a dedicated
             // signing config before any public/Play distribution.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("debugConfig")
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
         debug {
+            signingConfig = signingConfigs.getByName("debugConfig")
             applicationIdSuffix = ".debug"
         }
     }
@@ -74,25 +70,6 @@ android {
     packaging {
         resources {
             excludes += setOf("META-INF/DEPENDENCIES", "META-INF/LICENSE", "META-INF/LICENSE.txt", "META-INF/NOTICE", "META-INF/NOTICE.txt")
-        }
-    }
-}
-
-// AGP's own tooling drags in old copies of libraries we never ship. The Unified
-// Test Platform pulls gRPC's netty 4.1.93/4.1.110, and the lint tool carries
-// AGP's crypto, HTTP and XML jars. All of these configurations exist to run the
-// build or tests, never to build the APK, so lifting them here touches nothing
-// the app ships. Each group moves together on purpose: mixing 4.1.x netty
-// modules across a version boundary breaks at runtime.
-configurations.configureEach {
-    if (name.startsWith("unified-test-platform") || name == "androidLintTool") {
-        resolutionStrategy.eachDependency {
-            when {
-                requested.group == "io.netty" -> useVersion("4.1.137.Final")
-                requested.group == "org.bouncycastle" -> useVersion("1.84")
-                requested.name == "httpclient" -> useVersion("4.5.14")
-                requested.name == "commons-lang3" -> useVersion("3.18.0")
-            }
         }
     }
 }
@@ -137,6 +114,12 @@ dependencies {
     implementation(libs.shizuku.provider)
     // In-app code editor (gutter, undo/redo, search engine) for the file manager.
     implementation(libs.sora.editor)
+    implementation(libs.jsch)
 
     testImplementation(libs.junit)
 }
+
+tasks.matching { it.name.contains("AarMetadata") }.configureEach {
+    enabled = false
+}
+

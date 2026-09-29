@@ -3,8 +3,10 @@ package com.androidharness.app.data.env
 import android.content.Context
 import android.os.Build
 import android.os.Environment
+import com.androidharness.app.data.SettingsRepository
 import com.androidharness.app.tools.ShellPolicy
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.concurrent.TimeUnit
@@ -30,6 +32,9 @@ enum class ExecutionTier {
 
     /** Bare toybox sh when the app-side toolchain is not installed. */
     TOYBOX,
+
+    /** Termux SSH bridge: commands execute inside local Termux environment over SSH. */
+    TERMUX_SSH,
 }
 
 data class ShellRunResult(
@@ -55,6 +60,8 @@ class ShellTierRouter(
     private val context: Context,
     private val shizuku: ShizukuManager,
     private val linuxEnv: LinuxEnvironmentManager,
+    private val termuxSsh: TermuxSshManager? = null,
+    private val settings: SettingsRepository? = null,
 ) {
 
     /** "All files access" (MANAGE_EXTERNAL_STORAGE). Pre-API-30 apps were not scoped. */
@@ -81,6 +88,9 @@ class ShellTierRouter(
     fun permissionNote(cwd: File, tier: ExecutionTier): String? {
         val region = PathClassifier.regionOf(cwd.absolutePath, linuxEnv.internalDataRoot.absolutePath)
         return when {
+            tier == ExecutionTier.TERMUX_SSH ->
+                "[note: executing via Termux SSH bridge]"
+
             tier == ExecutionTier.APP_LINUX &&
                 region == PathClassifier.Region.SHARED_STORAGE &&
                 !isAllFilesAccess() ->
@@ -103,10 +113,31 @@ class ShellTierRouter(
         // would freeze the UI for the command's full duration, so the work
         // never inherits the caller's dispatcher.
         withContext(Dispatchers.IO) {
+            val isTermuxEnabled = settings?.settings?.firstOrNull()?.termuxSshEnabled == true && termuxSsh != null
+            if (isTermuxEnabled) {
+                val sshResult = termuxSsh.run(command, cwd, timeoutMs, maxOutput)
+                // If SSH succeeded or returned an exit code from the remote process, return it
+                if (sshResult.exitCode != -1 || !sshResult.note.orEmpty().contains("unreachable")) {
+                    return@withContext sshResult
+                }
+                // If SSH connection was unreachable, fall back to default tiers with explanatory note
+                val fallbackTier = resolveTier(cwd)
+                val fallbackResult = when (fallbackTier) {
+                    ExecutionTier.PRIVILEGED -> runPrivileged(command, cwd, timeoutMs, maxOutput)
+                    ExecutionTier.APP_LINUX -> runApp(command, cwd, timeoutMs, maxOutput, ExecutionTier.APP_LINUX)
+                    ExecutionTier.TOYBOX -> runApp(command, cwd, timeoutMs, maxOutput, ExecutionTier.TOYBOX)
+                    else -> runApp(command, cwd, timeoutMs, maxOutput, ExecutionTier.TOYBOX)
+                }
+                return@withContext fallbackResult.copy(
+                    note = "[Termux SSH unreachable: fell back to ${fallbackTier.name}]\n${sshResult.rawStderr}",
+                )
+            }
+
             when (val tier = resolveTier(cwd)) {
                 ExecutionTier.PRIVILEGED -> runPrivileged(command, cwd, timeoutMs, maxOutput)
                 ExecutionTier.APP_LINUX -> runApp(command, cwd, timeoutMs, maxOutput, ExecutionTier.APP_LINUX)
                 ExecutionTier.TOYBOX -> runApp(command, cwd, timeoutMs, maxOutput, ExecutionTier.TOYBOX)
+                ExecutionTier.TERMUX_SSH -> runApp(command, cwd, timeoutMs, maxOutput, ExecutionTier.APP_LINUX)
             }
         }
 

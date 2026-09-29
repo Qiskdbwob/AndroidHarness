@@ -231,6 +231,9 @@ fun ProvidersScreen(
             onDeleteCustomModel = { providerId, model ->
                 scope.launch { container.providers.removeCustomModel(providerId, model) }
             },
+            onTestLatency = { providerId, modelId ->
+                container.providers.testModelLatency(providerId, modelId)
+            },
             onManageProviders = { /* already here */ },
         )
     }
