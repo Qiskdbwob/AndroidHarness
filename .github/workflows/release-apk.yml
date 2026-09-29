@@ -82,7 +82,11 @@ jobs:
           STAMP=$(date -u +%Y%m%d-%H%M)
           SHA=$(git rev-parse --short HEAD)
           NAME="AndroidHarness-${STAMP}-${SHA}-release-unsigned.apk"
-          mkdir dist && cp app/build/outputs/apk/release/app-release-unsigned.apk "dist/${NAME}"
+          APK=$(find app/build/outputs/apk/release -name "*.apk" -print -quit)
+          if [ -z "$APK" ]; then
+            echo "::error::No release APK was produced"; ls -R app/build/outputs; exit 1
+          fi
+          mkdir -p dist && cp "$APK" "dist/${NAME}"
           echo "name=${NAME}" >> "$GITHUB_OUTPUT"
           ls -l dist
 

@@ -57,7 +57,11 @@ jobs:
           STAMP=$(date -u +%Y%m%d-%H%M)
           SHA=$(git rev-parse --short HEAD)
           NAME="AndroidHarness-${STAMP}-${SHA}-debug.apk"
-          mkdir dist && cp app/build/outputs/apk/debug/app-debug.apk "dist/${NAME}"
+          APK=$(find app/build/outputs/apk/debug -name "*.apk" -print -quit)
+          if [ -z "$APK" ]; then
+            echo "::error::No debug APK was produced"; ls -R app/build/outputs; exit 1
+          fi
+          mkdir -p dist && cp "$APK" "dist/${NAME}"
           echo "name=${NAME}" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact (Actions tab, kept 30 days)
