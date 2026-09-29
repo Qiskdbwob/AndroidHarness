@@ -21,6 +21,7 @@ enum class ThemeMode { SYSTEM, LIGHT, DARK, AMOLED }
 @kotlinx.serialization.Serializable
 data class AppSettings(
     val permissionMode: PermissionMode = PermissionMode.CONFIRM_RISKY,
+    val subagentFullAccess: Boolean = false,
     val themeMode: ThemeMode = ThemeMode.SYSTEM,
     val dynamicColor: Boolean = true,
     val activeProviderId: String? = null,
@@ -85,6 +86,9 @@ data class AppSettings(
     val termuxSshHost: String = "127.0.0.1",
     val termuxSshPort: Int = 8022,
     val termuxSshUser: String = "termux",
+    val cavemanInstalled: Boolean = false,
+    val cavemanIntensity: com.androidharness.app.caveman.CavemanIntensity = com.androidharness.app.caveman.CavemanIntensity.OFF,
+    val cavemanWenyan: Boolean = false,
 ) {
     companion object {
         const val DEFAULT_MAX_CONTEXT = 1_000_000
@@ -104,6 +108,7 @@ class SettingsRepository(private val context: Context) {
 
     private object Keys {
         val PERMISSION_MODE = stringPreferencesKey("permission_mode")
+        val SUBAGENT_FULL_ACCESS = booleanPreferencesKey("subagent_full_access")
         val THEME_MODE = stringPreferencesKey("theme_mode")
         val DYNAMIC_COLOR = booleanPreferencesKey("dynamic_color")
         val ACTIVE_PROVIDER = stringPreferencesKey("active_provider_id")
@@ -138,6 +143,9 @@ class SettingsRepository(private val context: Context) {
         val TERMUX_SSH_HOST = stringPreferencesKey("termux_ssh_host")
         val TERMUX_SSH_PORT = intPreferencesKey("termux_ssh_port")
         val TERMUX_SSH_USER = stringPreferencesKey("termux_ssh_user")
+        val CAVEMAN_INSTALLED = booleanPreferencesKey("caveman_installed")
+        val CAVEMAN_INTENSITY = stringPreferencesKey("caveman_intensity")
+        val CAVEMAN_WENYAN = booleanPreferencesKey("caveman_wenyan")
     }
 
     val settings: Flow<AppSettings> = context.settingsStore.data.map { prefs ->
@@ -145,6 +153,7 @@ class SettingsRepository(private val context: Context) {
             permissionMode = prefs[Keys.PERMISSION_MODE]
                 ?.let { runCatching { PermissionMode.valueOf(it) }.getOrNull() }
                 ?: PermissionMode.CONFIRM_RISKY,
+            subagentFullAccess = prefs[Keys.SUBAGENT_FULL_ACCESS] ?: false,
             themeMode = prefs[Keys.THEME_MODE]
                 ?.let { runCatching { ThemeMode.valueOf(it) }.getOrNull() }
                 ?: ThemeMode.SYSTEM,
@@ -185,6 +194,11 @@ class SettingsRepository(private val context: Context) {
             termuxSshHost = prefs[Keys.TERMUX_SSH_HOST] ?: AppSettings.DEFAULT_TERMUX_SSH_HOST,
             termuxSshPort = prefs[Keys.TERMUX_SSH_PORT] ?: AppSettings.DEFAULT_TERMUX_SSH_PORT,
             termuxSshUser = prefs[Keys.TERMUX_SSH_USER] ?: AppSettings.DEFAULT_TERMUX_SSH_USER,
+            cavemanInstalled = prefs[Keys.CAVEMAN_INSTALLED] ?: false,
+            cavemanIntensity = prefs[Keys.CAVEMAN_INTENSITY]?.let {
+                runCatching { com.androidharness.app.caveman.CavemanIntensity.valueOf(it) }.getOrNull()
+            } ?: com.androidharness.app.caveman.CavemanIntensity.OFF,
+            cavemanWenyan = prefs[Keys.CAVEMAN_WENYAN] ?: false,
         )
     }
 
@@ -197,12 +211,16 @@ class SettingsRepository(private val context: Context) {
             p[Keys.MAX_OUTPUT] = s.maxOutputTokens
             p[Keys.MAX_ITERATIONS] = s.maxIterations
             p[Keys.KEEP_ALIVE] = s.keepAlive
+            p[Keys.SUBAGENT_FULL_ACCESS] = s.subagentFullAccess
             p[Keys.DISABLED_SKILLS] = s.disabledSkills
             p[Keys.WEB_SEARCH_PROVIDER] = s.webSearchProvider
             p[Keys.VOICE_ENGINE] = s.voiceEngine
             p[Keys.GROQ_WHISPER_MODEL] = s.groqWhisperModel
             p[Keys.RESUME_LAST_CHAT] = s.resumeLastChat
             p[Keys.REPO_MAP_ENABLED] = s.repoMapEnabled
+            p[Keys.CAVEMAN_INSTALLED] = s.cavemanInstalled
+            p[Keys.CAVEMAN_INTENSITY] = s.cavemanIntensity.name
+            p[Keys.CAVEMAN_WENYAN] = s.cavemanWenyan
             p[Keys.PLANNING_MODELS_ENABLED] = s.planningModelsEnabled
             listOf(Keys.ACTIVE_PROVIDER to s.activeProviderId, Keys.ACTIVE_MODEL to s.activeModel,
                 Keys.PLANNING_PROVIDER to s.planningProviderId, Keys.PLANNING_MODEL to s.planningModel,
@@ -218,6 +236,10 @@ class SettingsRepository(private val context: Context) {
 
     suspend fun setPermissionMode(mode: PermissionMode) {
         context.settingsStore.edit { it[Keys.PERMISSION_MODE] = mode.name }
+    }
+
+    suspend fun setSubagentFullAccess(enabled: Boolean) {
+        context.settingsStore.edit { it[Keys.SUBAGENT_FULL_ACCESS] = enabled }
     }
 
     suspend fun setThemeMode(mode: ThemeMode) {
@@ -329,6 +351,23 @@ class SettingsRepository(private val context: Context) {
 
     suspend fun setRepoMapEnabled(enabled: Boolean) {
         context.settingsStore.edit { it[Keys.REPO_MAP_ENABLED] = enabled }
+    }
+
+    suspend fun setCavemanInstalled(installed: Boolean) {
+        context.settingsStore.edit {
+            it[Keys.CAVEMAN_INSTALLED] = installed
+            it[Keys.CAVEMAN_INTENSITY] = com.androidharness.app.caveman.CavemanIntensity.OFF.name
+        }
+    }
+
+    suspend fun setCavemanIntensity(intensity: com.androidharness.app.caveman.CavemanIntensity) {
+        context.settingsStore.edit {
+            if (it[Keys.CAVEMAN_INSTALLED] == true) it[Keys.CAVEMAN_INTENSITY] = intensity.name
+        }
+    }
+
+    suspend fun setCavemanWenyan(enabled: Boolean) {
+        context.settingsStore.edit { it[Keys.CAVEMAN_WENYAN] = enabled }
     }
 
     suspend fun setSkillEnabled(name: String, enabled: Boolean) {

@@ -4,11 +4,10 @@ import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import com.androidharness.app.data.AppSettings
-import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.togetherWith
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.infiniteRepeatable
@@ -35,7 +34,6 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -47,6 +45,7 @@ import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
@@ -64,6 +63,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Snackbar
 import androidx.compose.material3.SnackbarDuration
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
@@ -85,6 +85,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.withFrameNanos
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.input.nestedscroll.nestedScroll
@@ -94,7 +95,6 @@ import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.TextFieldValue
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.androidharness.app.core.Role
@@ -113,8 +113,6 @@ import com.androidharness.app.ui.chat.components.MessageComposer
 import com.androidharness.app.ui.chat.components.ModelPickerSheet
 import com.androidharness.app.ui.chat.components.PlanApprovalCard
 import com.androidharness.app.ui.chat.components.QuestionCard
-import com.androidharness.app.ui.chat.components.QueuedMessageChip
-import com.androidharness.app.ui.chat.components.RewindButton
 import com.androidharness.app.skills.slashInvokedSkillName
 import com.androidharness.app.skills.slashSkillInstruction
 import com.androidharness.app.ui.chat.components.CompactionBanner
@@ -138,6 +136,7 @@ import com.androidharness.app.ui.common.formatRelativeTime
 import com.androidharness.app.ui.common.formatDuration
 import com.androidharness.app.ui.files.DiffStatText
 import com.androidharness.app.ui.settings.ProviderManagerSheet
+import com.androidharness.app.ui.theme.HarnessMono
 import com.androidharness.app.ui.theme.fastEffectsSpec
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -455,7 +454,7 @@ fun ChatScreen(
                     TextButton(
                         onClick = {
                             actionsMessage = null
-                            viewModel.retryMessage(msg)
+                            confirmingEdit = msg to msg.text
                         },
                         enabled = !state.busy,
                     ) { Text("Retry") }
@@ -505,17 +504,19 @@ fun ChatScreen(
     confirmingEdit?.let { (msg, newText) ->
         AlertDialog(
             onDismissRequest = { confirmingEdit = null },
-            title = { Text("Edit this message?") },
+            title = { Text(if (newText == msg.text) "Retry this message?" else "Edit this message?") },
             text = {
                 Text(
-                    "This message will be updated in place. Everything in the conversation after this message will be deleted, and any files modified since will be restored. The agent will then run for the edited message without creating a duplicate row.",
+                    "Everything after this message will be deleted, and any file changes made " +
+                        "after it will be undone: files are restored to how they were at that " +
+                        "point. The message is then resent once. This cannot be undone.",
                 )
             },
             confirmButton = {
                 Button(onClick = {
                     viewModel.editAndResend(msg, newText)
                     confirmingEdit = null
-                }) { Text("Edit & resend") }
+                }) { Text(if (newText == msg.text) "Retry" else "Edit & resend") }
             },
             dismissButton = { TextButton(onClick = { confirmingEdit = null }) { Text("Cancel") } },
         )
@@ -847,7 +848,6 @@ fun ChatScreen(
     Scaffold(
         containerColor = MaterialTheme.colorScheme.surface,
         topBar = {
-            val ap = state.activeProvider
             // The FULL global ladder for every model (Hermes-style): picking a
             // rung the model doesn't natively speak resolves down the chain
             val currentProvider = state.activeProvider
@@ -890,7 +890,7 @@ fun ChatScreen(
                 onOpenWebPreview = { showWebPreview = true },
             )
         },
-        snackbarHost = { SnackbarHost(snackbar) },
+        snackbarHost = {},
     ) { padding ->
         Box(
             modifier = Modifier
@@ -1066,13 +1066,12 @@ fun ChatScreen(
                                             }
                                             IconButton(
                                                 onClick = { actionsMessage = message },
-                                                modifier = Modifier.size(28.dp),
                                             ) {
                                                 Icon(
                                                     Icons.Outlined.MoreHoriz,
                                                     contentDescription = "More message actions",
                                                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                                    modifier = Modifier.size(16.dp),
+                                                    modifier = Modifier.size(17.dp),
                                                 )
                                             }
                                         }
@@ -1380,6 +1379,10 @@ fun ChatScreen(
                             .padding(bottom = 8.dp),
                     )
                 }
+                val fabBottomPadding by animateDpAsState(
+                    targetValue = if (snackbar.currentSnackbarData != null) 68.dp else 10.dp,
+                    label = "fab-bottom-pad",
+                )
                 ScrollToBottomFab(
                     visible = !pinnedToBottom,
                     unread = unreadWhileAway,
@@ -1408,7 +1411,22 @@ fun ChatScreen(
                     },
                     modifier = Modifier
                         .align(Alignment.BottomEnd)
-                        .padding(end = 16.dp, bottom = 10.dp),
+                        .padding(end = 16.dp, bottom = fabBottomPadding),
+                )
+                SnackbarHost(
+                    hostState = snackbar,
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(horizontal = 16.dp, vertical = 8.dp),
+                    snackbar = { data ->
+                        Snackbar(
+                            snackbarData = data,
+                            shape = RoundedCornerShape(14.dp),
+                            containerColor = MaterialTheme.colorScheme.inverseSurface,
+                            contentColor = MaterialTheme.colorScheme.inverseOnSurface,
+                            actionColor = MaterialTheme.colorScheme.inversePrimary,
+                        )
+                    },
                 )
                 }
 
@@ -1555,15 +1573,17 @@ fun ChatScreen(
 internal fun CopyIconButton(text: String) {
     var copied by remember { mutableStateOf(false) }
     val clipboard = LocalClipboardManager.current
+    // No size override: IconButton's own 48dp touch target is what makes these
+    // reachable with a thumb. The glyph stays small, the row just gets taller.
     IconButton(onClick = {
         clipboard.setText(AnnotatedString(text))
         copied = true
-    }, modifier = Modifier.size(28.dp)) {
+    }) {
         Icon(
             if (copied) Icons.Filled.Check else Icons.Filled.ContentCopy,
             contentDescription = "Copy",
             tint = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.size(15.dp),
+            modifier = Modifier.size(17.dp),
         )
     }
     LaunchedEffect(copied) {
@@ -1576,24 +1596,24 @@ internal fun CopyIconButton(text: String) {
 
 @Composable
 private fun ForkIconButton(onClick: () -> Unit) {
-    IconButton(onClick = onClick, modifier = Modifier.size(28.dp)) {
+    IconButton(onClick = onClick) {
         Icon(
             Icons.Outlined.ForkRight,
             contentDescription = "Fork from this message",
             tint = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.size(16.dp),
+            modifier = Modifier.size(17.dp),
         )
     }
 }
 
 @Composable
 private fun UndoIconButton(onClick: () -> Unit) {
-    IconButton(onClick = onClick, modifier = Modifier.size(28.dp)) {
+    IconButton(onClick = onClick) {
         Icon(
             Icons.Outlined.History,
             contentDescription = "Undo file changes from this turn",
             tint = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.size(16.dp),
+            modifier = Modifier.size(17.dp),
         )
     }
 }
@@ -1676,7 +1696,7 @@ private fun FileEditsCard(
                                 Text(
                                     path.substringAfterLast('/'),
                                     style = MaterialTheme.typography.labelMedium,
-                                    fontFamily = FontFamily.Monospace,
+                                    fontFamily = HarnessMono,
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis,
                                 )
@@ -1719,8 +1739,12 @@ private fun isAtBottom(info: LazyListLayoutInfo, canScrollForward: Boolean, tole
 private suspend fun LazyListState.scrollToEnd() {
     val last = layoutInfo.totalItemsCount - 1
     if (last < 0) return
-    scrollToItem(last)
-    scrollBy(FORWARD_FAR_PX)
+    // requestScrollToItem lands on the next measure pass instead of forcing a
+    // synchronous remeasure; the forced one crashed Compose when items were
+    // being removed in the same frame (LayoutNode.onChildRemoved NPE).
+    requestScrollToItem(last)
+    withFrameNanos { }
+    if (canScrollForward) scrollBy(FORWARD_FAR_PX)
 }
 
 /** Cheap exact snap to the true bottom; a no-op unless the end is composed. */
@@ -1763,15 +1787,17 @@ private fun ScrollToBottomFab(
             shape = CircleShape,
             color = MaterialTheme.colorScheme.surfaceContainerHigh,
             border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)),
-            modifier = Modifier
-                .size(40.dp)
-                // graphicsLayer scale: the pulse redraws without re-layout.
-                .graphicsLayer {
+            modifier = Modifier.size(48.dp),
+        ) {
+            Box(
+                contentAlignment = Alignment.Center,
+                // The pulse scales the drawing only, so the tap target stays 48dp
+                // even while the button is animating.
+                modifier = Modifier.graphicsLayer {
                     scaleX = pulse
                     scaleY = pulse
                 },
-        ) {
-            Box(contentAlignment = Alignment.Center) {
+            ) {
                 Icon(
                     Icons.Filled.KeyboardArrowDown,
                     contentDescription = "Scroll to latest",

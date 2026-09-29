@@ -133,6 +133,8 @@ class SessionRepository(
                 thinkingMs = message.thinkingMs,
                 outputTokens = message.outputTokens,
                 generationMs = message.generationMs,
+                firstTokenMs = message.firstTokenMs,
+                streamMs = message.streamMs,
                 imagesJson = json.encodeToString(imageList, message.images),
                 turnId = turnId,
                 createdAt = System.currentTimeMillis(),
@@ -271,6 +273,8 @@ class SessionRepository(
                         thinkingMs = userMsg.thinkingMs,
                         outputTokens = userMsg.outputTokens,
                         generationMs = userMsg.generationMs,
+                        firstTokenMs = userMsg.firstTokenMs,
+                        streamMs = userMsg.streamMs,
                         imagesJson = userMsg.imagesJson,
                         turnId = newTurnId,
                         createdAt = now - 1,
@@ -292,6 +296,8 @@ class SessionRepository(
                     thinkingMs = targetAssistant.thinkingMs,
                     outputTokens = targetAssistant.outputTokens,
                     generationMs = targetAssistant.generationMs,
+                    firstTokenMs = targetAssistant.firstTokenMs,
+                    streamMs = targetAssistant.streamMs,
                     imagesJson = targetAssistant.imagesJson,
                     turnId = newTurnId,
                     createdAt = now,
@@ -544,9 +550,9 @@ class SessionRepository(
      * summary (it may reference deleted history). Used when editing a past
      * message: the conversation is truncated there and resent.
      */
-    suspend fun truncateFrom(sessionId: String, messageId: String) {
+    suspend fun truncateFrom(sessionId: String, messageId: String) = db.withTransaction {
+        check(db.dao().deleteMessagesFrom(sessionId, messageId) > 0) { "Message no longer exists in this chat" }
         messageCache.remove(messageId)
-        db.dao().deleteMessagesFrom(sessionId, messageId)
         db.dao().setCompaction(sessionId, "", 0)
     }
 
@@ -585,6 +591,8 @@ class SessionRepository(
         thinkingMs = thinkingMs,
         outputTokens = outputTokens,
         generationMs = generationMs,
+        firstTokenMs = firstTokenMs,
+        streamMs = streamMs,
         images = runCatching {
             json.decodeFromString(imageList, imagesJson)
         }.getOrDefault(emptyList()),

@@ -47,9 +47,11 @@ class TerminalManager(
     val state: StateFlow<TerminalState> = _state
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private var process: Process? = null
+    @Volatile private var process: Process? = null
     private var readJob: Job? = null
+    private var sshJob: Job? = null
     private var cwd: File = linuxEnv.shellFallbackRoot
+    private var remoteWorkspace: com.androidharness.app.workspace.SshFs? = null
 
     private val marker = "__HCTERM_DONE__"
     private val maxLines = 1_500
@@ -73,8 +75,23 @@ class TerminalManager(
 
     /** Starts the terminal if it isn't running yet. */
     fun ensureStarted() {
+        if (remoteWorkspace != null) {
+            _state.update { it.copy(started = true, cwd = cwd.absolutePath) }
+            return
+        }
         if (process != null || _state.value.started) return
         startAppShell()
+    }
+
+    fun useWorkspace(fs: com.androidharness.app.workspace.WorkspaceFs) {
+        if (_state.value.busy) return
+        val remote = fs as? com.androidharness.app.workspace.SshFs
+        val root = remote?.root?.let { File(it) } ?: fs.shellRoot ?: linuxEnv.shellFallbackRoot
+        if (remoteWorkspace?.displayPath == remote?.displayPath && root == cwd) return
+        stopProcess()
+        remoteWorkspace = remote
+        cwd = root
+        _state.update { it.copy(started = false, cwd = root.path) }
     }
 
     fun setPrivileged(on: Boolean) {
@@ -109,41 +126,47 @@ class TerminalManager(
             return
         }
         runManager.acquireKeepalive()
-        cwd = linuxEnv.shellFallbackRoot
         resetLines()
         _state.update {
             it.copy(started = true, cwd = cwd.absolutePath, lines = emptyList())
         }
         appendLines(listOf("# terminal ready: ${if (linuxEnv.bashExecutable() != null) "bash" else "toybox sh"} (app user)"))
 
+        val startedProcess = process ?: return
         readJob = scope.launch {
-            val input = process!!.inputStream.bufferedReader()
-            val line = StringBuilder()
-            val buf = CharArray(4096)
-            while (true) {
-                val n = input.read(buf)
-                if (n < 0) break
-                for (i in 0 until n) {
-                    val ch = buf[i]
-                    if (ch == '\n') {
-                        handleLine(line.toString())
-                        line.setLength(0)
-                    } else if (ch != '\r') {
-                        line.append(ch)
+            try {
+                val input = startedProcess.inputStream.bufferedReader()
+                val line = StringBuilder()
+                val buf = CharArray(4096)
+                while (true) {
+                    val n = input.read(buf)
+                    if (n < 0) break
+                    if (process !== startedProcess) break
+                    for (i in 0 until n) {
+                        val ch = buf[i]
+                        if (ch == '\n') {
+                            handleLine(line.toString())
+                            line.setLength(0)
+                        } else if (ch != '\r') {
+                            line.append(ch)
+                        }
+                    }
+                }
+            } catch (_: java.io.IOException) {
+                // Switching workspace closes the previous shell's reader.
+            } finally {
+                synchronized(this@TerminalManager) {
+                    if (process === startedProcess) {
+                        process = null
+                        runManager.releaseKeepalive()
+                        _state.update {
+                            it.copy(started = false, busy = false,
+                                lastExitCode = if (it.busy && it.lastExitCode == null) -1 else it.lastExitCode)
+                        }
+                        appendLines(listOf("# shell exited"))
                     }
                 }
             }
-            // process ended
-            process = null
-            runManager.releaseKeepalive()
-            _state.update {
-                it.copy(
-                    started = false,
-                    busy = false,
-                    lastExitCode = if (it.busy && it.lastExitCode == null) -1 else it.lastExitCode,
-                )
-            }
-            appendLines(listOf("# shell exited"))
         }
     }
 
@@ -197,21 +220,45 @@ class TerminalManager(
     }
 
     /** Sends one command line. */
-    fun send(command: String) {
+    fun send(command: String, workspace: com.androidharness.app.workspace.WorkspaceFs? = null) {
         val cmd = command.trimEnd()
         if (cmd.isEmpty()) return
-        ensureStarted()
         if (_state.value.busy) {
             appendLines(listOf("# still running: wait for it to finish"))
             return
         }
+        workspace?.let { useWorkspace(it) }
+        ensureStarted()
         _state.update { it.copy(busy = true, lastCommand = cmd, lastExitCode = null) }
         appendLines(listOf("\$ $cmd"))
 
-        if (_state.value.privileged && shizuku.isGranted()) {
+        if (remoteWorkspace != null) {
+            sendSsh(cmd)
+        } else if (_state.value.privileged && shizuku.isGranted()) {
             sendPrivileged(cmd)
         } else {
             sendAppTier(cmd)
+        }
+    }
+
+    private fun sendSsh(cmd: String) {
+        val workspace = remoteWorkspace ?: return
+        sshJob = scope.launch {
+            runManager.acquireKeepalive()
+            try {
+                // A fresh exec channel per command, with cwd tracked like the
+                // Shizuku tier. Shell variables do not persist between commands.
+                val quote = "'" + cmd.replace("'", "'\\''") + "'"
+                val script = "eval $quote; ec=\$?; printf '\\n$marker:%s:%s\\n' \"\$ec\" \"\$PWD\"; exit \"\$ec\""
+                val result = workspace.run(script, cwd.path, 120_000, 60_000)
+                result.rawOutput.lines().forEach(::handleLine)
+                if (result.rawStderr.isNotBlank()) appendLines(result.rawStderr.lines())
+                if (result.timedOut) appendLines(listOf("# SSH command timed out; check Termux before retrying a modifying command"))
+                _state.update { it.copy(lastExitCode = result.exitCode) }
+            } finally {
+                _state.update { it.copy(busy = false) }
+                runManager.releaseKeepalive()
+            }
         }
     }
 
@@ -298,13 +345,15 @@ class TerminalManager(
     }
 
     private fun stopProcess() {
+        sshJob?.cancel()
+        sshJob = null
         readJob?.cancel()
         readJob = null
-        process?.let { p ->
+        val previous = synchronized(this) { process.also { process = null } }
+        previous?.let { p ->
+            runManager.releaseKeepalive()
             runCatching { p.destroyForcibly() }
             runCatching { p.waitFor(2, java.util.concurrent.TimeUnit.SECONDS) }
         }
-        process = null
-        runManager.releaseKeepalive()
     }
 }

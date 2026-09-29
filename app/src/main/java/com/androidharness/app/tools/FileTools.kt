@@ -147,6 +147,9 @@ class ReadFileTool : Tool {
                 if (raw.isEmpty()) return@withContext ToolResult(true, "(empty file)")
                 val all = splitLines(raw)
                 if (all.isEmpty()) return@withContext ToolResult(true, "(empty file)")
+                if (offset > all.size) {
+                    return@withContext ToolResult(true, "[offset $offset is beyond end of file: ${all.size} lines]")
+                }
                 val slice = all.drop(offset - 1).take(limit)
                 val sb = StringBuilder()
                 var truncated = false
@@ -209,15 +212,22 @@ private class StreamScan {
 }
 
 /**
- * Streams [node] counting bytes and newline-terminated lines up to [byteCap].
+ * Streams [node] counting bytes and line-terminated lines up to [byteCap].
  * With [sniffBinary], binary content is detected inline from the first chunk
  * (for zero-stat entries where node.isBinary()'s own length guard skips it).
+ *
+ * A line ends at LF, CRLF, or a bare CR, matching [splitLines] and therefore
+ * read_file: counting only LF made file_info report one line for "a\rb\rc"
+ * while read_file numbered three, so the two tools disagreed about the same
+ * file (QA, 2026-09-21).
  */
 private fun scanFileStream(node: FsNode, byteCap: Long, sniffBinary: Boolean): StreamScan {
     val scan = StreamScan()
     val buf = ByteArray(64 * 1024)
+    var pendingCr = false
     try {
-        node.openInputStream()?.buffered(64 * 1024)?.use { input ->
+        (node.openInputStream() ?: throw ToolFailure("Cannot read file: input stream unavailable"))
+            .buffered(64 * 1024).use { input ->
             var total = 0L
             while (total < byteCap) {
                 val want = minOf(buf.size.toLong(), byteCap - total).toInt()
@@ -232,8 +242,19 @@ private fun scanFileStream(node: FsNode, byteCap: Long, sniffBinary: Boolean): S
                 total += read
                 for (i in 0 until read) {
                     val b = buf[i].toInt()
-                    if (b == 0x0A) { // '\n'
-                        scan.lineCount++
+                    when {
+                        b == 0x0D -> { // '\r': CRLF counts on the LF, a bare CR counts here
+                            if (pendingCr) scan.lineCount++
+                            pendingCr = true
+                        }
+                        b == 0x0A -> { // '\n'
+                            scan.lineCount++
+                            pendingCr = false
+                        }
+                        pendingCr -> { // bare CR holding a terminator
+                            scan.lineCount++
+                            pendingCr = false
+                        }
                     }
                     scan.lastByte = b
                 }
@@ -244,8 +265,9 @@ private fun scanFileStream(node: FsNode, byteCap: Long, sniffBinary: Boolean): S
             scan.hasBytes = total > 0
             scan.measuredBytes = total
         }
-    } catch (_: Exception) {
-        // Unreadable stream behaves like an empty one, matching prior behavior.
+        if (pendingCr) scan.lineCount++
+    } catch (e: Exception) {
+        throw ToolFailure("Cannot inspect file contents: ${e.message}")
     }
     return scan
 }

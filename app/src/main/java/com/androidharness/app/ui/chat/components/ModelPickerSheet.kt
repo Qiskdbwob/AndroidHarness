@@ -50,7 +50,6 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.androidharness.app.agent.ThinkingLevel
@@ -59,6 +58,7 @@ import com.androidharness.app.llm.ModelEntry
 import com.androidharness.app.llm.ModelsDev
 import com.androidharness.app.llm.reasoningCapable
 import com.androidharness.app.ui.common.ProviderMark
+import com.androidharness.app.ui.theme.HarnessMono
 import kotlinx.coroutines.launch
 
 /**
@@ -379,7 +379,7 @@ fun ModelPickerSheet(
                                         Text(
                                             query.trim(),
                                             style = MaterialTheme.typography.bodyMedium,
-                                            fontFamily = FontFamily.Monospace,
+                                            fontFamily = HarnessMono,
                                             maxLines = 1,
                                             overflow = TextOverflow.Ellipsis,
                                         )
@@ -415,6 +415,7 @@ fun ModelPickerSheet(
                                     }
                                 }
                             } else null,
+                            note = entry.note,
                             onClick = {
                                 onSelect(provider.id, entry.id)
                                 onDismiss()
@@ -473,6 +474,7 @@ private fun ModelRow(
     latency: com.androidharness.app.llm.ModelCatalog.LatencyResult? = null,
     isTestingLatency: Boolean = false,
     onTestLatency: (() -> Unit)? = null,
+    note: String? = null,
     onClick: () -> Unit,
     onDelete: (() -> Unit)? = null,
 ) {
@@ -495,7 +497,7 @@ private fun ModelRow(
                     Text(
                         id,
                         style = MaterialTheme.typography.bodyMedium,
-                        fontFamily = FontFamily.Monospace,
+                        fontFamily = HarnessMono,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f, fill = false),
@@ -524,6 +526,7 @@ private fun ModelRow(
                     if (thinking) "thinking" else null,
                     ctx,
                     latencyText,
+                    note,
                 ).joinToString(" · ")
                 if (sub.isNotEmpty()) {
                     Text(
@@ -565,7 +568,7 @@ private fun ModelRow(
             if (onDelete != null) {
                 IconButton(
                     onClick = onDelete,
-                    modifier = Modifier.size(30.dp),
+                    modifier = Modifier.size(40.dp),
                 ) {
                     Icon(
                         Icons.Outlined.Close,

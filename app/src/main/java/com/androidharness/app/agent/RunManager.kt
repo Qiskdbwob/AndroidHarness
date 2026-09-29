@@ -127,7 +127,7 @@ class RunManager(
 
     /**
      * Publishes buffered stream deltas into [LiveRunState]; a no-op when nothing
-     * is pending. Batching deltas here keeps the UI at ~15 updates/sec no matter
+     * is pending. Batching deltas here keeps the UI at ~30 updates/sec no matter
      * how fast the model streams.
      */
     private fun flushDeltas(sessionId: String) {
@@ -205,6 +205,7 @@ class RunManager(
         resume: Boolean = false,
         queuedPromptId: String? = null,
         existingPromptId: String? = null,
+        replacementMessageId: String? = null,
     ): String = kotlinx.coroutines.withContext(Dispatchers.IO) { workspaceGuard.withLock {
         val sid = sessionId ?: sessions.createSession(
             text.take(48),
@@ -213,6 +214,18 @@ class RunManager(
         synchronized(lock) { jobs[sid] }?.let { previous ->
             previous.cancel()
             previous.join()
+        }
+        if (replacementMessageId != null) {
+            check(!resume) { "Cannot replace a message while resuming" }
+            val projectId = sessions.session(sid)?.projectId
+            check(projectId == null || projectId == workspace.currentProjectOnce().id) {
+                "Open this chat's original workspace before editing or retrying a message"
+            }
+            val path = workspace.currentOnce().displayPath
+            check(runningSessionIds.value.none { it != sid && controls.flow(it).value.workspacePath == path }) {
+                "Pause other tasks in this workspace before editing or retrying a message"
+            }
+            rewindAndTruncate(sid, replacementMessageId)
         }
         val prior = controls.flow(sid).value
         val runWorkspace = workspaceOverride ?: workspace.currentOnce()
@@ -766,7 +779,8 @@ class RunManager(
         stopAndJoin(sessionId)
         val msgs = sessions.messages(sessionId)
         val index = msgs.indexOfFirst { it.id == messageId }
-        if (index < 0) return
+        check(index >= 0) { "This message no longer exists. Refresh the chat before retrying." }
+        check(msgs[index].role == Role.USER) { "Only user messages can be resent" }
         // distinct turns from the edited message onward, newest first
         val toDelete = msgs.drop(index)
         val turnIds = toDelete.mapNotNull { it.turnId }.distinct().reversed()
@@ -937,8 +951,8 @@ class RunManager(
     }
 
     companion object {
-        /** UI frame-cadence flush interval for streamed deltas (~15 fps). */
-        private const val STREAM_FLUSH_MS = 66L
+        /** UI refreshes at ~30 fps; network chunks are consumed independently. */
+        private const val STREAM_FLUSH_MS = 33L
 
         /**
          * The blocking prompts of [state] as answerable notification payloads.

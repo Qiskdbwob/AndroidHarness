@@ -55,9 +55,9 @@ class ProviderRepository(
             }
             .toMap().toMutableMap()
 
-        if (catalogMap[HarnessProvider.ID].isNullOrEmpty()) {
-            catalogMap[HarnessProvider.ID] = HarnessProvider.fallbackModels
-        }
+        // The harness catalog is the static anonymous pool. Overwrite whatever
+        // older fetches saved so retired zen models never resurface in the picker.
+        catalogMap[HarnessProvider.ID] = HarnessProvider.pooledModels
 
         prefs.asMap().asSequence()
             .filter { it.key.name.startsWith(CUSTOM_MODELS_PREFIX) }
@@ -162,6 +162,19 @@ class ProviderRepository(
     }
 
     fun apiKey(providerId: String): String? = if (providerId == HarnessProvider.ID) HarnessProvider.KEYLESS else keys.getKey(providerId)
+
+    /**
+     * Zen ended anonymous access to its free models (keyless calls get a 403
+     * FreeTierError), so the built-in provider rides on the key saved for any
+     * OpenCode-branded provider. Falls back to the keyless sentinel.
+     */
+    suspend fun harnessApiKey(): String = harnessApiKey(current())
+
+    fun harnessApiKey(candidates: List<ProviderConfig>): String =
+        keys.getKey(HarnessProvider.ID)?.takeIf { it.isNotBlank() }
+            ?: candidates.firstOrNull { it.id != HarnessProvider.ID && HarnessProvider.isOpenCode(it) }
+                ?.let { keys.getKey(it.id) }?.takeIf { it.isNotBlank() }
+            ?: HarnessProvider.KEYLESS
 
     /**
      * Learned wire protocol per Harness model. The first chat request for a

@@ -48,6 +48,8 @@ data class MessageEntity(
     val thinkingMs: Long = 0,
     val outputTokens: Int = 0,
     val generationMs: Long = 0,
+    val firstTokenMs: Long = 0,
+    val streamMs: Long = 0,
     val imagesJson: String = "[]",
     val turnId: String? = null,
     val createdAt: Long,
@@ -231,8 +233,10 @@ interface HarnessDao {
 
     /** Deletes [messageId] and every message after it in the session. */
     @Query(
-        "DELETE FROM messages WHERE sessionId = :sessionId AND rowid >= " +
-            "(SELECT rowid FROM messages WHERE id = :messageId)",
+        "DELETE FROM messages WHERE sessionId = :sessionId AND (createdAt > " +
+            "(SELECT createdAt FROM messages WHERE id = :messageId AND sessionId = :sessionId) " +
+            "OR (createdAt = (SELECT createdAt FROM messages WHERE id = :messageId AND sessionId = :sessionId) " +
+            "AND rowid >= (SELECT rowid FROM messages WHERE id = :messageId AND sessionId = :sessionId)))",
     )
     suspend fun deleteMessagesFrom(sessionId: String, messageId: String): Int
 
@@ -398,13 +402,20 @@ interface HarnessDao {
         SessionFileChangeEntity::class,
         MessageFtsEntity::class,
     ],
-    version = 13,
+    version = 14,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
     abstract fun dao(): HarnessDao
 
     companion object {
+        val MIGRATION_13_14 = object : androidx.room.migration.Migration(13, 14) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE messages ADD COLUMN firstTokenMs INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE messages ADD COLUMN streamMs INTEGER NOT NULL DEFAULT 0")
+            }
+        }
+
         /**
          * Android CursorWindow hard-caps rows at 2MB; rows exceeding the cap
          * throw SQLiteBlobTooBigException and crash the app on startup/query.

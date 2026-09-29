@@ -26,6 +26,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -154,6 +155,7 @@ fun AppNav(container: AppContainer) {
         .collectAsStateWithLifecycle(initialValue = null)
     val providers by container.providers.providers.collectAsStateWithLifecycle(initialValue = emptyList())
     val currentWorkspace by container.workspace.currentProject.collectAsStateWithLifecycle(initialValue = null)
+    val activeFs by container.workspace.current.collectAsStateWithLifecycle(initialValue = null)
     val allWorkspaces by container.workspace.projects.collectAsStateWithLifecycle(initialValue = emptyList())
     val keyboard = LocalSoftwareKeyboardController.current
 
@@ -394,7 +396,7 @@ fun AppNav(container: AppContainer) {
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(horizontal = 16.dp, vertical = 8.dp)
-                            .height(46.dp),
+                            .heightIn(min = 46.dp),
                     ) {
                         Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(19.dp))
                         Spacer(Modifier.width(8.dp))
@@ -657,7 +659,10 @@ fun AppNav(container: AppContainer) {
             }
         },
     ) {
+        Column(Modifier.fillMaxSize()) {
+        com.androidharness.app.ui.common.SshWorkspaceBar(container, activeFs as? com.androidharness.app.workspace.SshFs)
         NavHost(
+            modifier = Modifier.weight(1f),
             navController = nav,
             startDestination = startDestination,
             // Quiet transitions: a short fade with a small rise. No shared-element
@@ -851,6 +856,8 @@ fun AppNav(container: AppContainer) {
                 )
             }
         }
+    }
+
     }
 
     // Workspace switching from the drawer + chat overflow shares one sheet.

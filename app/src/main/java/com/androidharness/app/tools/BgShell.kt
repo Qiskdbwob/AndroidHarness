@@ -11,6 +11,7 @@ import kotlinx.serialization.json.jsonPrimitive
 class ShellBackgroundTool(
     private val store: BgProcessStore,
     private val linuxEnv: LinuxEnvironmentManager,
+    private val router: com.androidharness.app.data.env.ShellTierRouter? = null,
 ) : Tool {
     override val name = "shell_background"
     override val description =
@@ -29,6 +30,12 @@ class ShellBackgroundTool(
         withContext(Dispatchers.IO) {
             val rawCommand = args["command"]?.jsonPrimitive?.content
                 ?: throw ToolFailure("Missing required argument: command")
+            val remote = ctx.workspace as? com.androidharness.app.workspace.SshFs
+            if (remote != null) {
+                val deny = if (ctx.sandboxOff) null else ShellPolicy.denyReason(rawCommand, java.io.File(remote.root), java.io.File(remote.root))
+                if (deny != null) return@withContext ToolResult(false, deny)
+                return@withContext com.androidharness.app.workspace.SshJobs.start(remote, rawCommand)
+            }
             val cwd = ctx.workspace.shellRoot
                 ?: throw ToolFailure(
                     "This workspace has no real filesystem path, so background processes cannot " +
@@ -81,6 +88,9 @@ class BgListTool(
 
     override suspend fun execute(args: JsonObject, ctx: ToolContext): ToolResult =
         withContext(Dispatchers.IO) {
+            (ctx.workspace as? com.androidharness.app.workspace.SshFs)?.let {
+                return@withContext com.androidharness.app.workspace.SshJobs.list(it)
+            }
             val entries = store.list()
             if (entries.isEmpty()) return@withContext ToolResult(true, "No background processes running.")
             val sb = StringBuilder()
@@ -114,6 +124,9 @@ class BgKillTool(
         withContext(Dispatchers.IO) {
             val id = args["id"]?.jsonPrimitive?.intOrNull
                 ?: throw ToolFailure("Missing required argument: id")
+            (ctx.workspace as? com.androidharness.app.workspace.SshFs)?.let {
+                return@withContext com.androidharness.app.workspace.SshJobs.stop(it, id)
+            }
             if (store.get(id) == null) ToolResult(false, "No background process with id $id.")
             else if (store.kill(id)) ToolResult(true, "Killed background process $id.")
             else ToolResult(false, "Failed to kill process $id.")

@@ -22,7 +22,7 @@ import androidx.compose.ui.unit.dp
 internal fun SettingsHome(
     query: String,
     onQueryChange: (String) -> Unit,
-    onOpen: (SettingsPage) -> Unit,
+    onOpen: (SettingsPage, String?) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val colors = MaterialTheme.colorScheme
@@ -71,7 +71,7 @@ internal fun SettingsHome(
                 SettingsPanel(Modifier.fillMaxWidth()) {
                     entries.forEachIndexed { index, entry ->
                         Surface(
-                            onClick = { onOpen(entry.page) },
+                            onClick = { onOpen(entry.page, entry.anchor) },
                             color = colors.surfaceContainerLow,
                             modifier = Modifier.fillMaxWidth(),
                         ) {
@@ -149,6 +149,7 @@ private fun settingsIcon(page: SettingsPage): ImageVector = when (page) {
     SettingsPage.AGENT -> Icons.Outlined.Tune
     SettingsPage.CHAT -> Icons.Outlined.ChatBubbleOutline
     SettingsPage.CODE_INTELLIGENCE -> Icons.Outlined.AccountTree
+    SettingsPage.CAVEMAN -> Icons.Outlined.ShortText
     SettingsPage.VOICE -> Icons.Outlined.Mic
     SettingsPage.SKILLS -> Icons.Outlined.AutoStories
     SettingsPage.APPEARANCE -> Icons.Outlined.Palette

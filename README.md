@@ -1,10 +1,12 @@
 # AndroidHarness
 
+<a href="https://play.google.com/store/apps/details?id=com.androidharness.app"><img src="https://play.google.com/intl/en_us/badges/static/images/badges/en_badge_web_generic.png" alt="Get it on Google Play" height="72"></a>
+
 A coding agent that lives on your phone.
 
 AndroidHarness is a native Android app, written in Kotlin with Jetpack Compose, that works on code projects directly from the device. It reads and edits files, runs shell commands, uses git, and chats with you about the work as it goes. No PC required.
 
-Status: early alpha.
+Status: 1.2.
 
 ## Features
 
@@ -12,7 +14,7 @@ Status: early alpha.
 - Full markdown chat with streaming responses, thinking blocks, and cards showing every tool call the agent makes.
 - Responsive markdown tables with compact card previews and an expandable full-sheet viewer with horizontal scroll.
 - In-chat file diff sheet to inspect file changes directly from tool call cards without leaving the conversation.
-- Turn performance metrics: tracks response duration (ms) and token generation throughput (tokens/sec) alongside token counts in turn stats.
+- Turn performance metrics: response duration, token generation throughput measured over the streaming window itself, and first-token latency, alongside token counts in turn stats.
 - Turn activity rollups and streamlined tool cards: consecutive tool calls roll up into a compact activity summary with reactive expansion states and status indicators.
 - Voice input with live waveforms and Groq Whisper cloud transcription (`whisper-large-v3` / `turbo`) or native Android speech. Tap the mic to lock recording open, or hold with slide-up lock and slide-left cancel.
 - Fork conversations from any assistant turn into a fresh session with cloned context.
@@ -22,7 +24,9 @@ Status: early alpha.
 - Keep multiple queued instructions with edit, reorder, remove, and Send now controls. The queue persists across app restarts and is consumed at agent boundaries.
 - Long-press your own message for Retry alongside Copy and Edit, resending it as a fresh turn.
 - Ask the agent questions mid-run and answer from the notification shade or the chat.
+- Optional Caveman reply modes: terse, compressed responses with an intensity dial and optional skill enforcement, configured in their own settings screen.
 - Chat backup and restore: export every chat with its full message history to a JSON file and import it back on any device. The file holds chats and messages only, never API keys or settings.
+- Encrypted settings backup: export provider setup, catalogs, and preferences as an encrypted file and restore them on any device, with API keys included optionally.
 
 **Scheduled automations**
 - Define recurring or interval-based prompt tasks that run in the background via Android WorkManager.
@@ -31,14 +35,14 @@ Status: early alpha.
 - Run history logs, execution status indicators, and background completion notifications.
 
 **Agent tools**
-- File tools: read, write, edit, search, grep, list, move, delete, plus fuzzy multi-edit and apply_patch with atomic rollback on failure. The agent reads images by filename and extracts text from attached PDFs.
+- File tools: read, write, edit, search, grep, list, move, delete, plus fuzzy multi-edit and apply_patch, which checks every hunk header and line count before it touches a file and rolls back atomically on failure. Moves refuse to overwrite an existing destination unless you pass `overwrite=true`. The agent reads images by filename and extracts text from attached PDFs.
 - Shell tools: run commands with timeouts, launch background processes, list and kill them, install Linux packages, and query Android logs with package, tag, level, and pattern filters.
 - Git tools: status, diff, commit, log, show, branch, checkout, push, and pull. The harness auto-configures git identity so commits never fail on "author unknown".
-- Web tools: web search through keyless engines or the Brave and Tavily APIs with a key, page fetch, raw HTTP requests with JSON bodies, and GitHub API requests that authenticate automatically.
+- Web tools: web search through keyless engines or the Brave and Tavily APIs with a key, page fetch, raw HTTP requests with JSON bodies restricted to public addresses (localhost, private and other non-public destinations are refused, DNS answers are validated before connecting, and redirects are not followed), and GitHub API requests that authenticate automatically.
 - In-app web preview: universal preview hub for localhost ports, workspace HTML files, and web links with Eruda DevTools, console logs, and one-tap bug fixing. The agent also drives the page itself through browser tools (navigate, snapshot, click, type, scroll, eval, screenshot) with a floating live-action bubble.
 - MCP tools: connect Model Context Protocol servers over stdio or HTTP, add them by pasting a Claude config or a claude mcp add command, and sign in with OAuth when the server needs it.
 - Optional CodeGraph integration: install CodeGraph from Settings, enable its local index per workspace, and let the agent explore symbols, callers/callees, change impact, affected tests, and incremental sync without separate agent configuration.
-- Task tool: spawn subagents that work in parallel on independent chunks, each optionally on a different model.
+- Task tool: spawn subagents that work in parallel on independent chunks, each optionally on a different model. Subagents research read-only by default; with Subagent action tools enabled they also edit files and run commands in Act mode, always under the current permission mode.
 - Skill tools: list, view, and manage the markdown skills library from inside a run.
 - Todo and memory tools: a live todo list, a core memory file that loads at the start of every conversation, and topic files with search for everything else.
 
@@ -53,6 +57,13 @@ Status: early alpha.
 - Login with GitHub in Settings by pasting a personal access token, or tap Get access token to create one on GitHub. AndroidHarness verifies the token before saving it in encrypted app storage. Git push/pull, the bundled gh CLI, and GitHub API requests reuse the saved token.
 - doctor --github checks the token, git transport, and the free plan's hidden protection limits in one command.
 
+**Remote development over SSH**
+- Connect to remote Linux machines, servers, or local Termux environments over SSH with password or private key authentication (including Ed25519 support via Bouncy Castle).
+- SFTP-backed workspace file system (`SshFs`): browse directories, read, write, edit, and view diffs on remote files directly from the app.
+- Remote agent execution: terminal commands, background shell processes, git tools, and package managers run over the remote SSH connection.
+- Persistent SSH status bar with live connection state and quick reconnect controls.
+- Saved SSH profiles in workspace settings for seamless switching between local and remote workspaces.
+
 **Shell tiers, not a sandbox hack**
 - Commands route by path: Shizuku runs privileged commands as the shell uid, the app uid runs a Termux-prefix Linux toolchain with real bash, git, python and node, and bare toybox sh is the fallback when nothing else is installed.
 - A shell policy and a secret redactor keep the agent from escaping the workspace, touching system paths without permission, or leaking API keys.
@@ -63,10 +74,11 @@ Status: early alpha.
 - Context & limits lets you edit the saved summary, pin instructions, and remove older model context while retaining the visible chat.
 - Optional task-wide token, estimated USD cost, and active-time limits include subagents and compaction. Tasks pause at request/action boundaries with progress saved; in-flight work can exceed a limit. Raise a reached limit before resuming.
 - Approve or deny sensitive actions from the notification shade, with four permission modes up to a full access mode that lifts every sandbox for workspaces you trust.
+- Remembered permission management: review every remembered tool permission in a settings section and revoke them individually.
 - Redesigned navigation drawer with a quick-access tool strip (Files, Terminal, Automations, Build & Test) and a dedicated active provider card.
 
 **Model flexibility**
-- Built-in keyless Harness provider on the OpenCode Zen relay for immediate out-of-the-box model access without API keys.
+- Built-in keyless Harness provider: anonymous free models from Kilo and Pollinations served out of the box, with each model's rate limit shown in the picker and the kilo-auto/free router as the default. No API key needed to start.
 - Anthropic, Google Gemini, and any OpenAI compatible endpoint with a custom base URL.
 - Custom model IDs: enter any custom model name directly in the model picker sheet across all supported providers.
 - Live model catalog fetch with latency check, per-model price tracking, and a running cost readout, plus a total estimated cost hero on the Stats screen.
@@ -92,7 +104,7 @@ The app ships with a library of markdown skills: git, planning, test driven deve
 
 1. Install the app.
 2. Grant storage access. On Android 11 and up the app needs "All files access" so the shell and file tools can use real filesystem paths.
-3. Add an API key in Settings.
+3. Add an API key in Settings, or start immediately with the built-in keyless Harness provider.
 4. Optional but recommended: install Shizuku or Termux so the agent can run shell commands with proper permissions.
 
 ## Build
@@ -136,6 +148,8 @@ AndroidHarness borrows ideas and design taste from open source projects across t
 - [browser-use](https://github.com/browser-use/browser-use)
 - [Termux](https://github.com/termux)
 - [Shizuku](https://github.com/RikkaApps/Shizuku)
+- [CodeGraph](https://github.com/colbymchenry/codegraph)
+- [Caveman](https://github.com/JuliusBrussee/caveman)
 - [llama.cpp](https://github.com/ggerganov/llama.cpp)
 - [sora-editor](https://github.com/Rosemoe/sora-editor)
 - [Eruda](https://github.com/liriliri/eruda)

@@ -3,6 +3,8 @@ package com.androidharness.app
 import android.app.Application
 import android.content.Context
 import android.webkit.WebView
+import androidx.compose.foundation.ComposeFoundationFlags
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.room.Room
 import com.androidharness.app.agent.AgentEngine
 import com.androidharness.app.agent.TodoStore
@@ -20,6 +22,7 @@ import com.androidharness.app.workspace.WorkspaceManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 import java.util.concurrent.atomic.AtomicBoolean
@@ -29,8 +32,11 @@ class HarnessApp : Application() {
     lateinit var container: AppContainer
         private set
 
+    @OptIn(ExperimentalFoundationApi::class)
     override fun onCreate() {
         super.onCreate()
+        // Paused LazyColumn prefetch crashes in LayoutNode.onChildRemoved when chat items change.
+        ComposeFoundationFlags.isPausableCompositionInPrefetchEnabled = false
         WebView.enableSlowWholeDocumentDraw()
         container = AppContainer(this)
     }
@@ -58,7 +64,7 @@ class AppContainer(val appContext: Context) {
         .addMigrations(
             AppDatabase.MIGRATION_4_5, AppDatabase.MIGRATION_5_6,
             AppDatabase.MIGRATION_6_7, AppDatabase.MIGRATION_7_8,
-            AppDatabase.MIGRATION_8_9, AppDatabase.MIGRATION_9_10, AppDatabase.MIGRATION_10_11, AppDatabase.MIGRATION_11_12, AppDatabase.MIGRATION_12_13,
+            AppDatabase.MIGRATION_8_9, AppDatabase.MIGRATION_9_10, AppDatabase.MIGRATION_10_11, AppDatabase.MIGRATION_11_12, AppDatabase.MIGRATION_12_13, AppDatabase.MIGRATION_13_14,
         )
         .addCallback(AppDatabase.OVERSIZED_ROW_SANITIZER)
         // Only kicks in when no migration path exists (pre-v4 databases);
@@ -69,7 +75,8 @@ class AppContainer(val appContext: Context) {
     val chatBackup = ChatBackupManager(db, appContext)
     val snippets = com.androidharness.app.data.SnippetRepository(db.dao())
 
-    val workspace = WorkspaceManager(appContext, db.dao())
+    val sshConnections = com.androidharness.app.workspace.SshConnections(keys)
+    val workspace = WorkspaceManager(appContext, db.dao(), sshConnections)
     val checkpoints = CheckpointStore(db.dao())
     val images = ImageStore(appContext)
 
@@ -113,11 +120,15 @@ class AppContainer(val appContext: Context) {
             }
         }
 
+    private val cavemanSettings = AtomicReference(com.androidharness.app.data.AppSettings())
     val skills = com.androidharness.app.skills.SkillStore(
         bundled = com.androidharness.app.skills.SkillAssets.load(appContext.assets),
         userDir = java.io.File(appContext.filesDir, "skills").apply { mkdirs() },
         projectDir = { projectSkillsDir },
         disabled = { disabledSkills.get() },
+        optionalBundled = {
+            if (cavemanSettings.get().cavemanInstalled) com.androidharness.app.caveman.CavemanPolicy.skills else emptyMap()
+        },
     )
     val browser = com.androidharness.app.browser.BrowserController(appContext, images)
     val registry = ToolRegistry.default(
@@ -137,6 +148,7 @@ class AppContainer(val appContext: Context) {
         skills = skills,
         todoStore = todoStore,
         repoMap = repoMap,
+        cavemanSettings = { settings.settings.first().also { cavemanSettings.set(it); disabledSkills.set(it.disabledSkills) } },
     )
     val runManager = com.androidharness.app.agent.RunManager(
         context = appContext,
@@ -171,16 +183,14 @@ class AppContainer(val appContext: Context) {
             providers.harnessWires.collect { com.androidharness.app.llm.HarnessProvider.pins = it }
         }
         kotlinx.coroutines.CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
-            val builtIn = com.androidharness.app.llm.HarnessProvider
-            val catalog = com.androidharness.app.llm.ModelCatalog.listModels(builtIn.config, builtIn.KEYLESS)
-            if (catalog is com.androidharness.app.llm.ModelCatalog.Result.Models) {
-                providers.saveCatalog(builtIn.ID, catalog.models)
-            }
+            // The harness catalog is the static anonymous pool now, nothing to
+            // fetch; only models.dev needs a background refresh.
             com.androidharness.app.llm.ModelsDev.refresh(appContext)
         }
         kotlinx.coroutines.CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
             settings.settings.collect {
                 disabledSkills.set(it.disabledSkills)
+                cavemanSettings.set(it)
                 // The search key store moved to per-provider slots; attribute
                 // the pre-split key to whichever provider was active first.
                 if (searchKeyMigrated.compareAndSet(false, true)) {

@@ -57,13 +57,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.androidharness.app.AppContainer
 import com.androidharness.app.ui.common.AppHeader
+import com.androidharness.app.ui.theme.HarnessMono
 import com.androidharness.app.ui.theme.LocalStatusColors
 import com.androidharness.app.workspace.WorkspaceFs
 import kotlinx.coroutines.delay
@@ -151,15 +151,17 @@ fun BuildTestScreen(
     var elapsedMs by remember { mutableLongStateOf(0L) }
 
     val workspaceId = project?.id
-    val shellRoot = workspace?.shellRoot
-    val defaults = remember(workspace?.displayPath) { defaultCommands(workspace) }
+    val remote = workspace as? com.androidharness.app.workspace.SshFs
+    val shellRoot = workspace?.shellRoot ?: remote?.root?.let { java.io.File(it) }
+    var defaults by remember { mutableStateOf<List<SavedCommand>>(emptyList()) }
 
     LaunchedEffect(workspaceId) {
         val id = workspaceId ?: return@LaunchedEffect
+        defaults = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { defaultCommands(workspace) }
         commands = store.load(id, defaults)
         activeCommand = null
     }
-    LaunchedEffect(Unit) { terminal.ensureStarted() }
+    LaunchedEffect(workspace?.displayPath) { workspace?.let { terminal.useWorkspace(it) }; terminal.ensureStarted() }
     LaunchedEffect(terminalState.lines.size) {
         if (terminalState.lines.isNotEmpty()) {
             outputState.scrollToItem(terminalState.lines.lastIndex)
@@ -192,11 +194,12 @@ fun BuildTestScreen(
 
     fun run(command: SavedCommand) {
         val root = shellRoot ?: return
+        workspace?.let { terminal.useWorkspace(it) }
         terminal.clear()
         activeCommand = command
         startedAt = SystemClock.elapsedRealtime()
         elapsedMs = 0L
-        terminal.send("cd ${shellQuote(root.absolutePath)} && ${command.command}")
+        terminal.send("cd ${shellQuote(root.absolutePath)} && ${command.command}", workspace)
     }
 
     Scaffold(
@@ -436,7 +439,7 @@ private fun RunHeroCard(
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                         style = MaterialTheme.typography.bodySmall,
-                        fontFamily = FontFamily.Monospace,
+                        fontFamily = HarnessMono,
                         color = scheme.onSurfaceVariant,
                     )
                 }
@@ -524,7 +527,7 @@ private fun CommandCard(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                     style = MaterialTheme.typography.labelSmall,
-                    fontFamily = FontFamily.Monospace,
+                    fontFamily = HarnessMono,
                     color = scheme.onSurfaceVariant,
                 )
             }
@@ -576,7 +579,7 @@ private fun ErrorRow(error: BuildError, onClick: () -> Unit) {
             Text(
                 "${error.path}:${error.line}",
                 style = MaterialTheme.typography.labelMedium,
-                fontFamily = FontFamily.Monospace,
+                fontFamily = HarnessMono,
                 color = scheme.error,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
@@ -641,7 +644,7 @@ private fun LiveOutputCard(
                         Text(
                             stripAnsi(line),
                             style = MaterialTheme.typography.bodySmall,
-                            fontFamily = FontFamily.Monospace,
+                            fontFamily = HarnessMono,
                             color = when {
                                 line.startsWith("$ ") || line.startsWith("# ") -> scheme.primary
                                 line.contains("error", ignoreCase = true) || line.contains("failed", ignoreCase = true) -> scheme.error
@@ -685,7 +688,7 @@ private fun CommandDialog(
                     placeholder = { Text("./gradlew test") },
                     minLines = 2,
                     maxLines = 4,
-                    textStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.Monospace),
+                    textStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = HarnessMono),
                     modifier = Modifier.fillMaxWidth(),
                 )
             }
@@ -727,7 +730,7 @@ private fun saved(name: String, command: String) =
 
 private fun parseErrors(lines: List<String>, workspace: WorkspaceFs?): List<BuildError> {
     if (workspace == null) return emptyList()
-    val root = workspace.shellRoot?.canonicalPath
+    val root = (workspace as? com.androidharness.app.workspace.SshFs)?.root ?: workspace.shellRoot?.canonicalPath
     val fileUri = Regex("file://(.+?):(\\d+)(?::\\d+)?")
     val colon = Regex("((?:[A-Za-z]:)?[^\\s:()]+\\.(?:kt|kts|java|xml|gradle|js|jsx|ts|tsx|py|c|cc|cpp|h|hpp)):(\\d+)(?::\\d+)?")
     val paren = Regex("([^\\s()]+\\.(?:kt|kts|java|xml|gradle|js|jsx|ts|tsx|py|c|cc|cpp|h|hpp))\\((\\d+)(?:,\\d+)?\\)")

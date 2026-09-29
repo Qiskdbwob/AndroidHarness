@@ -191,6 +191,7 @@ class AgentEngine(
     private val skills: com.androidharness.app.skills.SkillStore,
     private val todoStore: TodoStore? = null,
     private val repoMap: com.androidharness.app.repomap.RepoMapCache? = null,
+    private val cavemanSettings: suspend () -> com.androidharness.app.data.AppSettings = { com.androidharness.app.data.AppSettings() },
 ) {
     private val json = Json { ignoreUnknownKeys = true }
 
@@ -237,6 +238,7 @@ class AgentEngine(
         }
         // Rebuilt when Full access toggles, because the path rules the model
         // is told about change with it.
+        var replySettings = cavemanSettings()
         var systemPrompt = systemPrompt(workspace, mode, fullAccess = false, repoMapEnabled = repoMapEnabled) + if (pinnedInstructions.isBlank()) "" else "\n\nPinned user instructions:\n$pinnedInstructions"
         var promptSandboxOff = false
         val runRegistry = registry.withExtra(extraTools)
@@ -294,7 +296,9 @@ class AgentEngine(
             // tools this round executes.
             val effectiveMode = permissionMode()
             val sandboxOff = effectiveMode == PermissionMode.FULL_ACCESS
-            if (sandboxOff != promptSandboxOff) {
+            val nextReplySettings = cavemanSettings()
+            if (sandboxOff != promptSandboxOff || replySettings != nextReplySettings) {
+                replySettings = nextReplySettings
                 promptSandboxOff = sandboxOff
                 systemPrompt = systemPrompt(workspace, mode, fullAccess = sandboxOff, repoMapEnabled = repoMapEnabled) + if (pinnedInstructions.isBlank()) "" else "\n\nPinned user instructions:\n$pinnedInstructions"
             }
@@ -307,8 +311,14 @@ class AgentEngine(
                     workspace
                 }
 
+            val requestSystemPrompt = com.androidharness.app.caveman.CavemanPolicy.apply(
+                systemPrompt,
+                installed = replySettings.cavemanInstalled,
+                intensity = replySettings.cavemanIntensity,
+                wenyan = replySettings.cavemanWenyan,
+            )
             // Auto-compact before the request grows past the context budget.
-            val estimate = estimateContext(working, systemPrompt)
+            val estimate = estimateContext(working, requestSystemPrompt)
             emit(AgentEvent.EstimatedContext(estimate))
             if (estimate.total > (maxContextTokens * 0.8).toInt() && working.size > 6) {
                 val compacted = compact(provider, config, apiKey, working, maxContextTokens, sessionId) { emit(it) }
@@ -317,7 +327,7 @@ class AgentEngine(
                     working.addAll(compacted)
                     // The window just shrank: refresh the context panel now
                     // instead of waiting for the next request's usage row.
-                    emit(AgentEvent.EstimatedContext(estimateContext(working, systemPrompt)))
+                    emit(AgentEvent.EstimatedContext(estimateContext(working, requestSystemPrompt)))
                 }
             }
 
@@ -326,14 +336,26 @@ class AgentEngine(
             var calls = mutableListOf<ToolCallData>()
             var outputTokens = 0
             var requestStartedNs = System.nanoTime()
+            var firstTokenNs = 0L
+            var lastTokenNs = 0L
 
             val streamEventHandler: suspend (StreamEvent) -> Unit = { event ->
                 when (event) {
                     is StreamEvent.TextDelta -> {
+                        if (event.text.isNotEmpty()) {
+                            val now = System.nanoTime()
+                            if (firstTokenNs == 0L) firstTokenNs = now
+                            lastTokenNs = now
+                        }
                         text.append(event.text)
                         emit(AgentEvent.Text(event.text))
                     }
                     is StreamEvent.ThinkingDelta -> {
+                        if (event.text.isNotEmpty()) {
+                            val now = System.nanoTime()
+                            if (firstTokenNs == 0L) firstTokenNs = now
+                            lastTokenNs = now
+                        }
                         thinking.append(event.text)
                         emit(AgentEvent.Thinking(event.text))
                     }
@@ -342,10 +364,20 @@ class AgentEngine(
                     is StreamEvent.Batch -> event.events.forEach { nested ->
                         when (nested) {
                             is StreamEvent.TextDelta -> {
+                                if (nested.text.isNotEmpty()) {
+                                    val now = System.nanoTime()
+                                    if (firstTokenNs == 0L) firstTokenNs = now
+                                    lastTokenNs = now
+                                }
                                 text.append(nested.text)
                                 emit(AgentEvent.Text(nested.text))
                             }
                             is StreamEvent.ThinkingDelta -> {
+                                if (nested.text.isNotEmpty()) {
+                                    val now = System.nanoTime()
+                                    if (firstTokenNs == 0L) firstTokenNs = now
+                                    lastTokenNs = now
+                                }
                                 thinking.append(nested.text)
                                 emit(AgentEvent.Thinking(nested.text))
                             }
@@ -375,11 +407,13 @@ class AgentEngine(
             // re-emitting deltas the UI already showed would duplicate output.
             var failure = StreamRetrier.run(
                 streamFor = {
-                    provider.streamChat(config, apiKey, systemPrompt, working, tools, requestOptions)
+                    provider.streamChat(config, apiKey, requestSystemPrompt, working, tools, requestOptions)
                 },
                 onAttemptStart = {
                     requestStartedNs = System.nanoTime()
                     outputTokens = 0
+                    firstTokenNs = 0L
+                    lastTokenNs = 0L
                     text = StringBuilder()
                     thinking = StringBuilder()
                     calls = mutableListOf()
@@ -399,11 +433,13 @@ class AgentEngine(
                 working.addAll(stripped)
                 failure = StreamRetrier.run(
                     streamFor = {
-                        provider.streamChat(config, apiKey, systemPrompt, working, tools, requestOptions)
+                        provider.streamChat(config, apiKey, requestSystemPrompt, working, tools, requestOptions)
                     },
                     onAttemptStart = {
                         requestStartedNs = System.nanoTime()
                         outputTokens = 0
+                        firstTokenNs = 0L
+                        lastTokenNs = 0L
                         text = StringBuilder()
                         thinking = StringBuilder()
                         calls = mutableListOf()
@@ -435,6 +471,8 @@ class AgentEngine(
                     thinking = thinking.toString(),
                     outputTokens = outputTokens,
                     generationMs = ((System.nanoTime() - requestStartedNs) / 1_000_000).coerceAtLeast(1),
+                    firstTokenMs = if (firstTokenNs > 0L) ((firstTokenNs - requestStartedNs) / 1_000_000).coerceAtLeast(1) else 0,
+                    streamMs = if (lastTokenNs > firstTokenNs) ((lastTokenNs - firstTokenNs) / 1_000_000).coerceAtLeast(1) else 0,
                 )
                 working += assistant
                 emit(AgentEvent.AssistantCommitted(assistant))
@@ -457,7 +495,7 @@ class AgentEngine(
                 }
             }
 
-            // Subagents are read-only, independent and slow, run every task
+            // Subagents are independent and slow, run every task
             // call in the batch concurrently so research branches don't queue.
             // Ordinary read-only calls are also allowed to overlap, but only
             // inside contiguous safe-read groups. Writes and interactive/stateful
@@ -656,6 +694,15 @@ class AgentEngine(
         return result
     }
 
+    /**
+     * Every tool result crosses this before it can reach the model, the chat DB
+     * or the screen. The environment-repair path below re-runs a tool outside
+     * the normal flow, so it has to go through here too rather than handing the
+     * raw output back.
+     */
+    private fun ToolResult.redacted(): ToolResult =
+        copy(output = com.androidharness.app.tools.SecretRedactor.redact(output))
+
     private suspend fun performWithPermission(
         call: ToolCallData,
         mode: PermissionMode,
@@ -725,13 +772,14 @@ class AgentEngine(
             }
             return runSubagent(
                 prompt, title, call.id, taskConfig, apiKey, workspace, requestOptions, emitEvent,
-                sandboxOff = mode == PermissionMode.FULL_ACCESS,
+                registry, mode, sessionAllowedTools, sessionId, turnId,
+                actionTools = agentMode == AgentMode.ACT && cavemanSettings().subagentFullAccess,
             )
         }
 
         // Commands that need real toolchains (git/python/node/…) prompt the user
         // to install the bundled Linux environment straight from the chat.
-        if ((call.name == "shell" || call.name == "shell_background") && !linuxEnv.isReady) {
+        if ((call.name == "shell" || call.name == "shell_background") && !linuxEnv.isReady && workspace !is com.androidharness.app.workspace.SshFs) {
             val args = runCatching {
                 json.parseToJsonElement(call.argumentsJson).jsonObject
             }.getOrNull()
@@ -849,7 +897,7 @@ class AgentEngine(
             isPkgInstall -> {
                 // Mandatory confirmation: even in FULL_ACCESS or FULL_AUTO mode,
                 // package installation ALWAYS requires explicit user confirmation (Decline or Allow).
-                val preview = computePkgInstallPreview(call)
+                val preview = if (workspace is com.androidharness.app.workspace.SshFs) "Install requested packages on the SSH host for ${workspace.root}." else computePkgInstallPreview(call)
                 val request = ApprovalRequest(call, tool.description, preview, grantKey)
                 emitEvent(AgentEvent.ApprovalNeeded(request))
                 request.response.await()
@@ -897,11 +945,11 @@ class AgentEngine(
         val startedAt = System.currentTimeMillis()
         val executed = try {
             val raw = tool.execute(args, ToolContext(workspace, mode == PermissionMode.FULL_ACCESS, sessionId))
-            raw.copy(output = com.androidharness.app.tools.SecretRedactor.redact(raw.output))
+            raw.redacted()
         } catch (ce: CancellationException) {
             throw ce
         } catch (e: Exception) {
-            ToolResult(false, e.message ?: "${call.name} failed")
+            ToolResult(false, e.message ?: "${call.name} failed").redacted()
         }
 
         // Broken-environment repair: a headline tool died with "not found"
@@ -910,7 +958,7 @@ class AgentEngine(
         // in chat instead of letting the model retry blindly. The presence
         // check keeps project-level failures ("vite: not found") out: those
         // are not fixable by reinstalling the toolchain.
-        if (call.name == "shell" && !executed.ok &&
+        if (call.name == "shell" && !executed.ok && workspace !is com.androidharness.app.workspace.SshFs &&
             linuxEnv.isReady && linuxEnv.state.value !is com.androidharness.app.data.env.EnvState.Failed
         ) {
             val missingTool = detectMissingHeadlineTool(executed.output)
@@ -931,10 +979,11 @@ class AgentEngine(
                     } catch (ce: CancellationException) {
                         throw ce
                     } catch (e: Exception) {
-                        ToolResult(false, e.message ?: "${call.name} failed again after repair")
+                        ToolResult(false, e.message ?: "${call.name} failed again after repair").redacted()
                     }
-                    return retry.copy(
-                        output = "[Linux environment repaired: $missingTool is now installed]\n" + retry.output,
+                    val scrubbed = retry.redacted()
+                    return scrubbed.copy(
+                        output = "[Linux environment repaired: $missingTool is now installed]\n" + scrubbed.output,
                     )
                 }
                 return executed.copy(
@@ -1099,16 +1148,18 @@ class AgentEngine(
     // Subagents
     // ------------------------------------------------------------------
 
-    /** Tools a subagent may see: read-only, no ask_user (deadlock), no task (no nesting). */
-    private fun subagentTools(ctx: ToolContext): List<com.androidharness.app.llm.ToolSchema> =
-        registry.schemas(readOnlyOnly = true, context = ctx).filter {
+    private fun subagentTools(
+        registry: com.androidharness.app.tools.ToolRegistry,
+        ctx: ToolContext,
+        actionTools: Boolean,
+    ): List<com.androidharness.app.llm.ToolSchema> =
+        registry.schemas(readOnlyOnly = !actionTools, context = ctx).filter {
             it.name != "ask_user" && it.name != "task"
         }
 
     /**
-     * Runs a nested read-only agent to answer [prompt] and returns its final
-     * message as the tool result. The subagent explores with read-only tools
-     * in its own context; only the final answer comes back to the parent, so
+     * Runs a nested agent to answer [prompt] and returns its final
+     * message as the tool result. Only the final answer comes back to the parent, so
      * broad exploration never bloats the main conversation. Usage is
      * re-emitted so it rolls into the session totals (same as compaction).
      * Each action the subagent takes is emitted as [AgentEvent.SubagentStep]
@@ -1124,25 +1175,43 @@ class AgentEngine(
         workspace: WorkspaceFs,
         requestOptions: RequestOptions,
         emitEvent: suspend (AgentEvent) -> Unit,
-        sandboxOff: Boolean = false,
+        registry: com.androidharness.app.tools.ToolRegistry,
+        permissionMode: PermissionMode,
+        sessionAllowedTools: MutableSet<String>,
+        sessionId: String,
+        turnId: String,
+        actionTools: Boolean,
     ): ToolResult {
         suspend fun step(line: String) = emitEvent(AgentEvent.SubagentStep(parentCallId, line))
         val label = if (title.isNullOrBlank()) "Task" else "Task [$title]"
         step("$label: ${prompt.take(80)}")
         val provider = providerFactory(config)
-        val system =
-            "You are a read-only research subagent inside a coding harness. " +
-                "Explore the workspace with the tools you have (read_file, list_dir, " +
-                "search_files, grep, file_info, web_fetch/search, and CodeGraph when available) to answer the task. " +
-                "You must not modify anything, and you cannot ask questions; if something " +
+        // Subagent answers are folded back into the parent's context, so the
+        // reply style applies here too. Code, paths and quoted errors stay exact.
+        val caveman = cavemanSettings()
+        val system = com.androidharness.app.caveman.CavemanPolicy.apply(
+            (if (actionTools) {
+                "You are a coding subagent inside a coding harness. You may edit files and run tools " +
+                    "to complete the delegated task, under the parent run's permission mode. "
+            } else {
+                "You are a read-only research subagent inside a coding harness. " +
+                    "Explore the workspace with the tools you have (read_file, list_dir, " +
+                    "search_files, grep, file_info, web_fetch/search, and CodeGraph when available) to answer the task. " +
+                    "You must not modify anything. "
+            }) +
+                "You cannot ask questions or spawn subagents; if something " +
                 "is ambiguous, state your assumption and continue. " +
                 "When reporting file properties like newlines or byte counts, inspect with file_info rather than inferring from line counts. " +
                 "Finish with a complete, self-contained answer: your final message is the " +
                 "ONLY thing returned to the caller, so include file paths, line references " +
-                "and concrete details, and no meta-commentary."
+                "and concrete details, and no meta-commentary.",
+            installed = caveman.cavemanInstalled,
+            intensity = caveman.cavemanIntensity,
+            wenyan = caveman.cavemanWenyan,
+        )
         val history = mutableListOf(ChatMessage(role = Role.USER, text = prompt))
-        val ctx = ToolContext(workspace, sandboxOff)
-        val subTools = subagentTools(ctx)
+        val ctx = ToolContext(workspace, permissionMode == PermissionMode.FULL_ACCESS, sessionId)
+        val subTools = subagentTools(registry, ctx, actionTools)
         // No separate budget quota here: capping output made reasoning models
         // burn the cap on thinking before ever answering (reasoning streamed,
         // no answer). Subagents get the main loop's full output budget.
@@ -1256,24 +1325,30 @@ class AgentEngine(
                 }
             }
 
-            // Execute requested tools directly. The schema list only contains
-            // read-only, non-interactive tools, so no permission gating is
-            // needed. but verify defensively and refuse anything else.
+            // Verify the allowed tool set even when a provider invents a call.
             for (call in calls) {
                 step(describeToolCall(call))
                 val tool = registry.get(call.name)
                 val subStartedAt = System.currentTimeMillis()
-                val result = if (tool == null || !tool.isReadOnly || call.name == "ask_user" || call.name == "task") {
+                val result = if (tool == null || (!actionTools && !tool.isReadOnly) ||
+                    call.name == "ask_user" || call.name == "task" || !tool.isAvailable(ctx)
+                ) {
                     ToolResult(false, "${call.name} is not available to subagents.")
                 } else {
-                    val executed = try {
-                        val args = json.parseToJsonElement(call.argumentsJson).jsonObject
-                        val raw = tool.execute(args, ctx)
-                        raw.copy(output = com.androidharness.app.tools.SecretRedactor.redact(raw.output))
-                    } catch (ce: CancellationException) {
-                        throw ce
-                    } catch (e: Exception) {
-                        ToolResult(false, e.message ?: "${call.name} failed")
+                    val executed = if (actionTools) {
+                        performWithPermission(
+                            call, permissionMode, sessionAllowedTools, workspace, sessionId, turnId,
+                            AgentMode.ACT, requestOptions, config, apiKey, registry, null, emitEvent,
+                        )
+                    } else {
+                        try {
+                            val args = json.parseToJsonElement(call.argumentsJson).jsonObject
+                            tool.execute(args, ctx).redacted()
+                        } catch (ce: CancellationException) {
+                            throw ce
+                        } catch (e: Exception) {
+                            ToolResult(false, e.message ?: "${call.name} failed").redacted()
+                        }
                     }
                     val elapsedMs = System.currentTimeMillis() - subStartedAt
                     if (executed.output.length < 100_000) {
@@ -1423,13 +1498,24 @@ class AgentEngine(
      * outside the request loop, so nothing else recomputes it): same math as
      * the run loop, over the model-facing history slice.
      */
-    fun estimateFor(
+    suspend fun estimateFor(
         history: List<ChatMessage>,
         workspace: WorkspaceFs,
         mode: AgentMode,
         fullAccess: Boolean,
         repoMapEnabled: Boolean = true,
-    ): ContextEstimate = estimateContext(history, systemPrompt(workspace, mode, fullAccess, repoMapEnabled))
+    ): ContextEstimate {
+        val caveman = cavemanSettings()
+        return estimateContext(
+            history,
+            com.androidharness.app.caveman.CavemanPolicy.apply(
+                systemPrompt(workspace, mode, fullAccess, repoMapEnabled),
+                installed = caveman.cavemanInstalled,
+                intensity = caveman.cavemanIntensity,
+                wenyan = caveman.cavemanWenyan,
+            ),
+        )
+    }
 
     /**
      * Models pass options in wildly different shapes: string arrays, arrays of
@@ -1570,7 +1656,9 @@ Rules:
 
 """.trim()
         )
-        if (workspace.shellRoot != null) {
+        if (workspace is com.androidharness.app.workspace.SshFs) {
+            sb.append("- This is an SSH workspace at ${workspace.root}. All file tools, checkpoints, shell commands, Git, builds and background jobs operate on that host. Use its installed tools and Git credentials. Never use local Android paths or assume the built-in toolchain is available remotely. Inspect uncertain command results before retrying any modifying operation.\n")
+        } else if (workspace.shellRoot != null) {
             if (linuxEnv.isReady) {
                 sb.append("- The shell tool runs a full Linux environment (bash, git, python, node and more) with the workspace as its working directory. Call commands by their plain names (python3, git, node, ls, …): the harness launches them correctly on every execution tier. Use shell_background for long-running servers. If a required CLI package is missing (e.g. ripgrep, jq, clang, rust, tmux, tree, openjdk-17), search for it with pkg_search and install it with pkg_install (do NOT run 'apt' or 'pkg' directly in shell). Package installation will always prompt the user with a confirmation warning before downloading.\n")
             } else {
@@ -1580,19 +1668,21 @@ Rules:
             sb.append("- This workspace has no real filesystem path (cloud/SAF). File tools still work. Do NOT call shell, shell_background, or git tools, they will fail. Tell the user to switch to a device folder or the app workspace if they need a shell.\n")
         }
 
-        // Shizuku guidance: tell the agent the current state so it can guide the user.
-        when {
-            shizuku.isGranted() -> sb.append("- Shizuku is connected with ADB-shell privileges: the shell tool automatically runs as the shell user whenever the working directory needs it (system paths, shared storage), with the same toolchain. Just use shell normally.\n")
-            shizuku.state.value == com.androidharness.app.data.env.ShizukuState.RUNNING_NO_PERMISSION -> sb.append("- Shizuku is running but AndroidHarness hasn't been granted access yet. If a task needs ADB-level shell access (edit system files, access any folder, etc.), tell the user to go to Settings → Terminal and tap \"Grant Shizuku access\".\n")
-            shizuku.state.value == com.androidharness.app.data.env.ShizukuState.NOT_RUNNING -> sb.append("- Shizuku is installed but not running. If a task needs ADB-level shell access, tell the user to open the Shizuku app, start the service, then in AndroidHarness go to Settings → Terminal and tap \"Refresh status\" followed by \"Grant Shizuku access\".\n")
-            else -> {} // NOT_INSTALLED: no mention; don't distract the agent.
+        if (workspace !is com.androidharness.app.workspace.SshFs) {
+            // Shizuku guidance: tell the agent the current state so it can guide the user.
+            when {
+                shizuku.isGranted() -> sb.append("- Shizuku is connected with ADB-shell privileges: the shell tool automatically runs as the shell user whenever the working directory needs it (system paths, shared storage), with the same toolchain. Just use shell normally.\n")
+                shizuku.state.value == com.androidharness.app.data.env.ShizukuState.RUNNING_NO_PERMISSION -> sb.append("- Shizuku is running but AndroidHarness hasn't been granted access yet. If a task needs ADB-level shell access (edit system files, access any folder, etc.), tell the user to go to Settings → Terminal and tap \"Grant Shizuku access\".\n")
+                shizuku.state.value == com.androidharness.app.data.env.ShizukuState.NOT_RUNNING -> sb.append("- Shizuku is installed but not running. If a task needs ADB-level shell access, tell the user to open the Shizuku app, start the service, then in AndroidHarness go to Settings → Terminal and tap \"Refresh status\" followed by \"Grant Shizuku access\".\n")
+                else -> {} // NOT_INSTALLED: no mention; don't distract the agent.
+            }
+            sb.append(
+                "- Shell environment rules (IMPORTANT): always call commands by plain name (ls, grep, head, python3, git, node…). NEVER work around the environment yourself: do not invoke /system/bin/linker64, /apex/.../linker64, or /system/bin/toybox directly, and do not craft alternate PATHs. The harness already makes every toolchain binary runnable in every tier. " +
+                    "If a basic command fails with \"Permission denied\" or exit code 126/127, the environment is misconfigured on this device: run the env_status tool once, tell the user what it reports, and stop retrying command variants.\n",
+            )
+            sb.append("- /data/local/tmp is readable only by the shell user: never try to inspect it from the app tier, and never conclude Shizuku/toolchain state from files there; use env_status.\n")
         }
-        sb.append(
-            "- Shell environment rules (IMPORTANT): always call commands by plain name (ls, grep, head, python3, git, node…). NEVER work around the environment yourself: do not invoke /system/bin/linker64, /apex/.../linker64, or /system/bin/toybox directly, and do not craft alternate PATHs. The harness already makes every toolchain binary runnable in every tier. " +
-                "If a basic command fails with \"Permission denied\" or exit code 126/127, the environment is misconfigured on this device: run the env_status tool once, tell the user what it reports, and stop retrying command variants.\n",
-        )
-        sb.append("- /data/local/tmp is readable only by the shell user: never try to inspect it from the app tier, and never conclude Shizuku/toolchain state from files there; use env_status.\n")
-        if (fullAccess) {
+        if (fullAccess && workspace !is com.androidharness.app.workspace.SshFs) {
             sb.append(
                 "- FULL ACCESS MODE is active: the workspace sandbox is lifted. File tools may read and write ANY path on the device (absolute paths work), the shell has no command denylist, and cwd may be any directory. The user chose this deliberately; no permission prompts will appear. Work outside the workspace only when the task requires it, and stay careful with system directories (/system, /data/system, /vendor): a mistake there can break the device.\n",
             )

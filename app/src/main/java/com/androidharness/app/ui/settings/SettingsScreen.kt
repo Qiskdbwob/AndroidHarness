@@ -17,7 +17,6 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
@@ -126,6 +125,7 @@ import com.androidharness.app.ui.common.SecureDialogEffect
 import com.androidharness.app.ui.common.SecureScreenEffect
 import com.androidharness.app.ui.common.SystemGrants
 import com.androidharness.app.ui.common.ThinLinearProgress
+import com.androidharness.app.ui.theme.HarnessMono
 import com.androidharness.app.ui.theme.LocalStatusColors
 import com.androidharness.app.tools.mcp.McpConfigParser
 import com.androidharness.app.tools.mcp.McpServerConfig
@@ -178,6 +178,15 @@ fun SettingsScreen(
 
     var pageName by rememberSaveable { mutableStateOf<String?>(null) }
     val page = pageName?.let { name -> SettingsPage.entries.firstOrNull { it.name == name } }
+    // Label of the control a search result or deep link asked for, cleared once
+    // the user has had a moment to see where they landed.
+    var highlight by rememberSaveable { mutableStateOf<String?>(null) }
+    LaunchedEffect(highlight) {
+        if (highlight != null) {
+            kotlinx.coroutines.delay(2600)
+            highlight = null
+        }
+    }
     var query by rememberSaveable { mutableStateOf("") }
     val homeScroll = rememberScrollState()
     fun goBack() {
@@ -191,10 +200,12 @@ fun SettingsScreen(
     LaunchedEffect(Unit) {
         container.pendingSettingsScroll.filterNotNull().collect { target ->
             settingsDeepLink(target)?.let { pageName = it.name }
+            highlight = settingsDeepLinkAnchor(target)
             container.pendingSettingsScroll.value = null
         }
     }
-    fun openPage(destination: SettingsPage) {
+    fun openPage(destination: SettingsPage, anchor: String? = null) {
+        highlight = anchor
         when (destination) {
             SettingsPage.SKILLS -> onOpenSkills()
             SettingsPage.USAGE -> onOpenStats()
@@ -227,24 +238,29 @@ fun SettingsScreen(
             )
         } else {
             key(page) {
-                Column(
-                    modifier = Modifier.fillMaxSize().padding(padding)
-                        .verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 16.dp),
-                    verticalArrangement = Arrangement.spacedBy(14.dp),
-                ) {
-                    SettingsPageIntro(page)
+                SettingsHighlightScope(highlight) {
+                    Column(
+                        modifier = Modifier.fillMaxSize().padding(padding)
+                            .verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 16.dp),
+                        verticalArrangement = Arrangement.spacedBy(14.dp),
+                    ) {
+                        SettingsPageIntro(page)
                     when (page) {
                         SettingsPage.MODELS -> {
                             SettingsPanel(Modifier.fillMaxWidth()) {
-                                SettingRow(
-                                    icon = Icons.Outlined.Key,
-                                    title = "Manage providers",
-                                    subtitle = "Add connections, sign in and choose models",
-                                    onClick = onOpenProviders,
-                                    trailing = { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null) },
-                                )
+                                SettingsAnchor("Manage providers") {
+                                    SettingRow(
+                                        icon = Icons.Outlined.Key,
+                                        title = "Manage providers",
+                                        subtitle = "Add connections, sign in and choose models",
+                                        onClick = onOpenProviders,
+                                        trailing = { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null) },
+                                    )
+                                }
                             }
-                            PlanningModelSection(container, settings, scope, onOpenProviders)
+                            SettingsAnchor("Dual planning models") {
+                                PlanningModelSection(container, settings, scope, onOpenProviders)
+                            }
                             CurrentSetupCard(settings, providers)
                         }
                         SettingsPage.AGENT -> AgentSection(container, settings, scope)
@@ -253,6 +269,7 @@ fun SettingsScreen(
                             SlashCommandsSection(container)
                         }
                         SettingsPage.CODE_INTELLIGENCE -> CodeIntelligenceSection(container, workspace, currentProject)
+                        SettingsPage.CAVEMAN -> CavemanSection(container, settings)
                         SettingsPage.VOICE -> VoiceSpeechSection(container, settings, scope)
                         SettingsPage.APPEARANCE -> AppearanceSection(container, settings, scope)
                         SettingsPage.PRIVACY -> PrivacySection(container, settings, scope)
@@ -277,7 +294,8 @@ fun SettingsScreen(
                         SettingsPage.ABOUT -> AboutSection(container)
                         SettingsPage.SKILLS, SettingsPage.USAGE, SettingsPage.SETUP -> Unit
                     }
-                    Spacer(Modifier.height(16.dp))
+                        Spacer(Modifier.height(16.dp))
+                    }
                 }
             }
         }
@@ -432,33 +450,39 @@ private fun TerminalSection(
 
     SettingsPanel(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(vertical = 4.dp)) {
-            SettingRow(
-                icon = Icons.Outlined.Terminal,
-                title = "App workspace shell",
-                subtitle = "Full Linux toolchain in the private workspace",
-                divider = true,
-                trailing = { StatusText(if (appShellOk) "Ready" else "toybox", ok = appShellOk) },
-            )
-            SettingRow(
-                icon = Icons.Outlined.SdStorage,
-                title = "Shared storage",
-                subtitle = "Read/write any folder on the device",
-                onClick = { SystemGrants.openAllFilesAccess(context) },
-                divider = true,
-                trailing = {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        StatusText(storageText, ok = allFiles)
-                        if (!allFiles) Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = "Open storage settings", tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
-                },
-            )
-            SettingRow(
-                icon = Icons.Outlined.Shield,
-                title = "System paths & any folder",
-                subtitle = "ADB-shell privileges via Shizuku",
-                divider = true,
-                trailing = { StatusText(systemText, ok = shizukuState == ShizukuState.GRANTED) },
-            )
+            SettingsAnchor("App workspace shell") {
+                SettingRow(
+                    icon = Icons.Outlined.Terminal,
+                    title = "App workspace shell",
+                    subtitle = "Full Linux toolchain in the private workspace",
+                    divider = true,
+                    trailing = { StatusText(if (appShellOk) "Ready" else "toybox", ok = appShellOk) },
+                )
+            }
+            SettingsAnchor("Shared storage") {
+                SettingRow(
+                    icon = Icons.Outlined.SdStorage,
+                    title = "Shared storage",
+                    subtitle = "Read/write any folder on the device",
+                    onClick = { SystemGrants.openAllFilesAccess(context) },
+                    divider = true,
+                    trailing = {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            StatusText(storageText, ok = allFiles)
+                            if (!allFiles) Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = "Open storage settings", tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    },
+                )
+            }
+            SettingsAnchor("System paths & any folder") {
+                SettingRow(
+                    icon = Icons.Outlined.Shield,
+                    title = "System paths & any folder",
+                    subtitle = "ADB-shell privileges via Shizuku",
+                    divider = true,
+                    trailing = { StatusText(systemText, ok = shizukuState == ShizukuState.GRANTED) },
+                )
+            }
             val termuxSettings by container.settings.settings.collectAsStateWithLifecycle(initialValue = com.androidharness.app.data.AppSettings())
             SettingRow(
                 icon = Icons.Outlined.Dns,
@@ -645,7 +669,7 @@ private fun CodeIntelligenceSection(
                 ) {
                     Text(
                         message.trim().lines().takeLast(9).joinToString("\n"),
-                        style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                        style = MaterialTheme.typography.bodySmall.copy(fontFamily = HarnessMono),
                         color = if (workspaceRun.failed) {
                             MaterialTheme.colorScheme.error
                         } else {
@@ -1240,7 +1264,9 @@ private fun VoiceSpeechSection(
                 )
                 Spacer(Modifier.width(10.dp))
                 Column(Modifier.weight(1f)) {
-                    Text("Speech-to-text engine", style = MaterialTheme.typography.titleSmall)
+                    SettingsAnchor("Speech-to-text engine") {
+                        Text("Speech-to-text engine", style = MaterialTheme.typography.titleSmall)
+                    }
                     Text(
                         when {
                             !isGroq -> "Inbuilt Android recognizer"
@@ -1288,11 +1314,13 @@ private fun VoiceSpeechSection(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             } else {
-                Text(
-                    "Whisper Model",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+                SettingsAnchor("Whisper Model") {
+                    Text(
+                        "Whisper Model",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
 
                 SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
                     listOf(
@@ -2338,13 +2366,15 @@ private fun AgentSection(
     var showAgentsDialog by remember { mutableStateOf(false) }
     SettingsPanel(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(horizontal = 14.dp, vertical = 4.dp)) {
-            DropdownSetting(
-                label = "Default permission mode",
-                current = settings.permissionMode.label,
-                entries = PermissionMode.entries.map { it.name to it.label },
-                onSelect = { scope.launch { container.settings.setPermissionMode(PermissionMode.valueOf(it)) } },
-                divider = true,
-            )
+            SettingsAnchor("Default permission mode") {
+                DropdownSetting(
+                    label = "Default permission mode",
+                    current = settings.permissionMode.label,
+                    entries = PermissionMode.entries.map { it.name to it.label },
+                    onSelect = { scope.launch { container.settings.setPermissionMode(PermissionMode.valueOf(it)) } },
+                    divider = true,
+                )
+            }
             if (settings.permissionMode == PermissionMode.FULL_ACCESS) {
                 Text(
                     "Full access runs every file and shell action without confirmation; " +
@@ -2356,36 +2386,59 @@ private fun AgentSection(
                     modifier = Modifier.padding(bottom = 8.dp),
                 )
             }
-            DropdownSetting(
-                label = "Max context window",
-                current = formatTokenCount(settings.maxContextTokens.toLong()),
-                entries = CONTEXT_PRESETS.map { it.toString() to formatTokenCount(it.toLong()) },
-                onSelect = { scope.launch { container.settings.setMaxContextTokens(it.toInt()) } },
-                divider = true,
-            )
+            SettingsAnchor("Subagent action tools") {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Subagent action tools", style = MaterialTheme.typography.titleSmall)
+                        Text(
+                            "Allow subagents to edit files and run commands in Act mode. " +
+                                "They follow the current permission mode; Plan mode stays read-only.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Switch(
+                        checked = settings.subagentFullAccess,
+                        onCheckedChange = { scope.launch { container.settings.setSubagentFullAccess(it) } },
+                    )
+                }
+            }
+            SettingsAnchor("Max context window") {
+                DropdownSetting(
+                    label = "Max context window",
+                    current = formatTokenCount(settings.maxContextTokens.toLong()),
+                    entries = CONTEXT_PRESETS.map { it.toString() to formatTokenCount(it.toLong()) },
+                    onSelect = { scope.launch { container.settings.setMaxContextTokens(it.toInt()) } },
+                    divider = true,
+                )
+            }
 
-            DropdownSetting(
-                label = "Tool-call iteration limit",
-                current = if (settings.maxIterations <= 0) "Unlimited" else settings.maxIterations.toString(),
-                entries = listOf(
-                    "0" to "Unlimited",
-                    "25" to "25",
-                    "100" to "100",
-                    "250" to "250",
-                ),
-                onSelect = { scope.launch { container.settings.setMaxIterations(it.toInt()) } },
-                divider = true,
-            )
+            SettingsAnchor("Tool-call iteration limit") {
+                DropdownSetting(
+                    label = "Tool-call iteration limit",
+                    current = if (settings.maxIterations <= 0) "Unlimited" else settings.maxIterations.toString(),
+                    entries = listOf(
+                        "0" to "Unlimited",
+                        "25" to "25",
+                        "100" to "100",
+                        "250" to "250",
+                    ),
+                    onSelect = { scope.launch { container.settings.setMaxIterations(it.toInt()) } },
+                    divider = true,
+                )
+            }
 
             // Detected state is loaded when the dialog opens; this row just
             // navigates there, so a light subtitle covers both cases.
-            SettingRow(
-                icon = Icons.Outlined.Description,
-                title = "Project instructions (AGENTS.md)",
-                subtitle = "Injected into every run for this workspace",
-                onClick = { showAgentsDialog = true },
-                divider = true,
-            )
+            SettingsAnchor("Project instructions (AGENTS.md)") {
+                SettingRow(
+                    icon = Icons.Outlined.Description,
+                    title = "Project instructions (AGENTS.md)",
+                    subtitle = "Injected into every run for this workspace",
+                    onClick = { showAgentsDialog = true },
+                    divider = true,
+                )
+            }
 
         }
     }
@@ -2459,7 +2512,7 @@ private fun AgentsInstructionsDialog(container: AppContainer, onDismiss: () -> U
                         .heightIn(min = 280.dp, max = 420.dp),
                     label = { Text("AGENTS.md content") },
                     textStyle = MaterialTheme.typography.bodySmall.copy(
-                        fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                        fontFamily = HarnessMono,
                     ),
                 )
                 if (error != null) {
@@ -2497,33 +2550,37 @@ private fun AppearanceSection(container: AppContainer, settings: AppSettings, sc
     SettingsHeader("Appearance")
     SettingsPanel(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("Theme", style = MaterialTheme.typography.titleSmall)
-            ThemeMode.entries.chunked(2).forEach { modes ->
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    modes.forEach { mode ->
-                        ThemeChoice(
-                            mode = mode,
-                            selected = settings.themeMode == mode,
-                            modifier = Modifier.weight(1f),
-                            onClick = { scope.launch { container.settings.setThemeMode(mode) } },
-                        )
+            SettingsAnchor("Theme") {
+                Text("Theme", style = MaterialTheme.typography.titleSmall)
+                ThemeMode.entries.chunked(2).forEach { modes ->
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        modes.forEach { mode ->
+                            ThemeChoice(
+                                mode = mode,
+                                selected = settings.themeMode == mode,
+                                modifier = Modifier.weight(1f),
+                                onClick = { scope.launch { container.settings.setThemeMode(mode) } },
+                            )
+                        }
                     }
                 }
             }
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
-            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                Column(Modifier.weight(1f)) {
-                    Text("Dynamic color", style = MaterialTheme.typography.bodyLarge)
-                    Text(
-                        "Match your wallpaper (Android 12+)",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+            SettingsAnchor("Dynamic color") {
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Dynamic color", style = MaterialTheme.typography.bodyLarge)
+                        Text(
+                            "Match your wallpaper (Android 12+)",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Switch(
+                        checked = settings.dynamicColor,
+                        onCheckedChange = { scope.launch { container.settings.setDynamicColor(it) } },
                     )
                 }
-                Switch(
-                    checked = settings.dynamicColor,
-                    onCheckedChange = { scope.launch { container.settings.setDynamicColor(it) } },
-                )
             }
         }
     }
@@ -2534,42 +2591,46 @@ private fun ChatBehaviorSection(container: AppContainer, settings: AppSettings, 
     SettingsHeader("Chat behavior")
     SettingsPanel(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                Column(Modifier.weight(1f)) {
-                    Text("Resume last chat on launch", style = MaterialTheme.typography.bodyLarge)
-                    Text(
-                        if (settings.resumeLastChat) {
-                            "On: opens your most recent chat when launching the app."
-                        } else {
-                            "Off: starts a new empty chat each time the app opens."
-                        },
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+            SettingsAnchor("Resume last chat on launch") {
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Resume last chat on launch", style = MaterialTheme.typography.bodyLarge)
+                        Text(
+                            if (settings.resumeLastChat) {
+                                "On: opens your most recent chat when launching the app."
+                            } else {
+                                "Off: starts a new empty chat each time the app opens."
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Switch(
+                        checked = settings.resumeLastChat,
+                        onCheckedChange = { scope.launch { container.settings.setResumeLastChat(it) } },
                     )
                 }
-                Switch(
-                    checked = settings.resumeLastChat,
-                    onCheckedChange = { scope.launch { container.settings.setResumeLastChat(it) } },
-                )
             }
             HorizontalDivider()
-            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                Column(Modifier.weight(1f)) {
-                    Text("Workspace code index (Repo map)", style = MaterialTheme.typography.bodyLarge)
-                    Text(
-                        if (settings.repoMapEnabled) {
-                            "On: injects a compact project symbol map (classes, functions, types) into context so the agent understands codebase structure without extra searches."
-                        } else {
-                            "Off: agent explores files only using tool commands."
-                        },
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+            SettingsAnchor("Workspace code index (Repo map)") {
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Workspace code index (Repo map)", style = MaterialTheme.typography.bodyLarge)
+                        Text(
+                            if (settings.repoMapEnabled) {
+                                "On: injects a compact project symbol map (classes, functions, types) into context so the agent understands codebase structure without extra searches."
+                            } else {
+                                "Off: agent explores files only using tool commands."
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Switch(
+                        checked = settings.repoMapEnabled,
+                        onCheckedChange = { scope.launch { container.settings.setRepoMapEnabled(it) } },
                     )
                 }
-                Switch(
-                    checked = settings.repoMapEnabled,
-                    onCheckedChange = { scope.launch { container.settings.setRepoMapEnabled(it) } },
-                )
             }
         }
     }
@@ -2803,7 +2864,9 @@ private fun ModelRoleRow(label: String, model: String?, onClick: () -> Unit) {
 @Composable
 private fun SlashCommandsSection(container: AppContainer) {
     val scope = rememberCoroutineScope()
-    SettingsHeader("Slash commands")
+    SettingsAnchor("Slash commands") {
+        SettingsHeader("Slash commands")
+    }
     SettingsPanel(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             var snippetName by remember { mutableStateOf("") }
@@ -2837,7 +2900,7 @@ private fun SlashCommandsSection(container: AppContainer) {
                     Text(
                         "/${snippet.name}",
                         style = MaterialTheme.typography.bodyMedium,
-                        fontFamily = FontFamily.Monospace,
+                        fontFamily = HarnessMono,
                         modifier = Modifier.weight(1f),
                     )
                     IconButton(onClick = { scope.launch { container.snippets.delete(snippet) } }) {
@@ -3121,6 +3184,8 @@ private data class Credit(val name: String, val role: String, val url: String)
 private val BUILT_WITH = listOf(
     Credit("Termux", "Linux packages and shell tooling", "https://github.com/termux"),
     Credit("Shizuku", "Elevated shell access without root", "https://github.com/RikkaApps/Shizuku"),
+    Credit("CodeGraph", "Semantic code index behind the graph tools", "https://github.com/colbymchenry/codegraph"),
+    Credit("Caveman", "Terse reply modes, adapted from Julius Brussee's skills", "https://github.com/JuliusBrussee/caveman"),
     Credit("sora-editor", "The in-app code editor", "https://github.com/Rosemoe/sora-editor"),
     Credit("Eruda", "Devtools inside the web preview", "https://github.com/liriliri/eruda"),
 )

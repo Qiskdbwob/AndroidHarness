@@ -24,6 +24,7 @@ object PathClassifier {
 
 /** Which engine actually runs the shell command. */
 enum class ExecutionTier {
+    TERMUX_SSH,
     /** Inside Shizuku's server process: shell/root uid, can reach system paths and any folder. */
     PRIVILEGED,
 
@@ -134,12 +135,19 @@ class ShellTierRouter(
             }
 
             when (val tier = resolveTier(cwd)) {
+                ExecutionTier.TERMUX_SSH -> error("SSH requires a captured workspace")
                 ExecutionTier.PRIVILEGED -> runPrivileged(command, cwd, timeoutMs, maxOutput)
                 ExecutionTier.APP_LINUX -> runApp(command, cwd, timeoutMs, maxOutput, ExecutionTier.APP_LINUX)
                 ExecutionTier.TOYBOX -> runApp(command, cwd, timeoutMs, maxOutput, ExecutionTier.TOYBOX)
                 ExecutionTier.TERMUX_SSH -> runApp(command, cwd, timeoutMs, maxOutput, ExecutionTier.APP_LINUX)
             }
         }
+
+    suspend fun runWorkspace(command: String, workspace: com.androidharness.app.workspace.WorkspaceFs,
+                             timeoutMs: Int, maxOutput: Int): ShellRunResult {
+        if (workspace is com.androidharness.app.workspace.SshFs) return workspace.run(command, timeoutMs = timeoutMs, maxOutput = maxOutput)
+        return run(command, requireNotNull(workspace.shellRoot) { "This workspace has no shell" }, timeoutMs, maxOutput)
+    }
 
     // --- privileged tier ---------------------------------------------------
 

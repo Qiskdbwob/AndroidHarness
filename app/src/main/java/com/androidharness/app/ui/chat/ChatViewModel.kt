@@ -251,24 +251,30 @@ class ChatViewModel(
     private var steering = false
     /** Text of a run paused on the workspace-MCP approval dialog. */
     private var pendingRunText: String? = null
+    private var pendingReplacement: ChatMessage? = null
+    private var startingRun = false
 
     /** User approved the workspace .harness/mcp.json: remember it and run. */
     fun approveWorkspaceMcp() {
         val text = pendingRunText
+        val replacement = pendingReplacement
+        pendingReplacement = null
         pendingRunText = null
         _state.update { it.copy(pendingWorkspaceMcp = null) }
         viewModelScope.launch {
             runCatching { c.mcp.approveWorkspace(c.workspace.currentOnce()) }
-            if (text != null) startRun(text, workspaceMcpGate = false)
+            if (text != null) startRun(text, workspaceMcpGate = false, replacement = replacement)
         }
     }
 
     /** User declined: run without the workspace servers (they stay blocked). */
     fun denyWorkspaceMcp() {
         val text = pendingRunText
+        val replacement = pendingReplacement
+        pendingReplacement = null
         pendingRunText = null
         _state.update { it.copy(pendingWorkspaceMcp = null) }
-        if (text != null) startRun(text, workspaceMcpGate = false)
+        if (text != null) startRun(text, workspaceMcpGate = false, replacement = replacement)
     }
 
     /**
@@ -699,42 +705,6 @@ class ChatViewModel(
     }
 
     /**
-     * Reruns a past user message. Rewinds any files touched after this message,
-     * deletes subsequent messages, and resends from this exact message without
-     * creating a duplicate user row.
-     */
-    fun retryMessage(message: ChatMessage) {
-        val sid = sessionId ?: return
-        val mid = message.id ?: return
-        if (c.runManager.isRunning(sid)) {
-            _state.update { it.copy(error = "Wait for the current run to finish before retrying.") }
-            return
-        }
-        viewModelScope.launch {
-            runCatching { c.runManager.rewindAndTruncateAfter(sid, mid) }
-                .onFailure { e ->
-                    _state.update { st -> st.copy(error = "Could not rewind: ${e.message}") }
-                    return@launch
-                }
-            startRun(message.text, existingPromptId = mid)
-        }
-    }
-
-    fun retryMessage(text: String) {
-        val sid = sessionId ?: return
-        if (c.runManager.isRunning(sid)) {
-            _state.update { it.copy(error = "Wait for the current run to finish before retrying.") }
-            return
-        }
-        val lastUserMsg = _state.value.messages.lastOrNull { it.role == Role.USER && it.text == text }
-        if (lastUserMsg != null) {
-            retryMessage(lastUserMsg)
-        } else {
-            send(text)
-        }
-    }
-
-    /**
      * Stops the in-flight run, then sends the queued text as a new turn.
      * Default send-while-busy only injects at the next iteration.
      */
@@ -777,7 +747,7 @@ class ChatViewModel(
             c.runManager.controls.update(sid) { it.copy(provider = provider) }
         }
         val key = if (provider.id == com.androidharness.app.llm.HarnessProvider.ID) {
-            com.androidharness.app.llm.HarnessProvider.KEYLESS
+            c.providers.harnessApiKey()
         } else c.providers.apiKey(provider.id)
         check(!key.isNullOrBlank()) { "Add the saved provider's API key before resuming" }
         _state.update { it.copy(error = null) }
@@ -831,6 +801,27 @@ class ChatViewModel(
 
     fun openSkillsSheet() {
         _state.update { it.copy(showSkillsSheet = true, skills = c.skills.list()) }
+    }
+
+    /**
+     * In-place message edit without re-running: updates the stored text of a
+     * past user message and its bubble, leaving the rest of the chat and the
+     * workspace untouched.
+     */
+    fun editMessageOnly(message: ChatMessage, newText: String) {
+        val mid = message.id ?: return
+        if (newText.isBlank()) return
+        viewModelScope.launch {
+            c.sessions.updateMessageText(mid, newText)
+            _state.update { st ->
+                st.copy(messages = st.messages.map { if (it.id == mid) it.copy(text = newText) else it })
+            }
+        }
+    }
+
+    /** Latency probe backing the model picker's per-model test button. */
+    suspend fun testModelLatency(providerId: String, modelId: String): com.androidharness.app.llm.ModelCatalog.LatencyResult {
+        return c.providers.testModelLatency(providerId, modelId)
     }
 
     // ------------------------------------------------------------------
@@ -1015,12 +1006,9 @@ class ChatViewModel(
     // Run lifecycle (delegated to the app-scoped RunManager)
     // ------------------------------------------------------------------
 
-    private fun startRun(
-        text: String,
-        workspaceMcpGate: Boolean = true,
-        queuedPromptId: String? = null,
-        existingPromptId: String? = null,
-    ) {
+    private fun startRun(text: String, workspaceMcpGate: Boolean = true, queuedPromptId: String? = null, replacement: ChatMessage? = null) {
+        if (startingRun) return
+        val targetSession = sessionId
         val s0 = _state.value
         // Separate planning/execution models: plan-mode runs use the planning
         // slot, everything else the execution one. A slot without a provider
@@ -1046,75 +1034,96 @@ class ChatViewModel(
                     ?: provider.model
             else -> s0.activeModel?.takeIf { it.isNotBlank() } ?: provider.model
         }
-        val apiKey = c.providers.apiKey(provider.id)
+        val apiKey = if (provider.id == com.androidharness.app.llm.HarnessProvider.ID) c.providers.harnessApiKey(s0.providers)
+        else c.providers.apiKey(provider.id)
         if (apiKey.isNullOrBlank()) {
             _state.update { it.copy(error = "Provider \"${provider.name}\" has no API key. Edit it on the Providers screen.") }
             return
         }
 
-        val imageRefs = pendingAttachments.toList()
-        pendingAttachments.clear()
-        val fileItems = pendingFileAttachments.toList()
-        pendingFileAttachments.clear()
-        _state.update { it.copy(attachments = emptyList(), fileAttachments = emptyList(), error = null) }
+        val imageRefs = replacement?.images ?: pendingAttachments.toList()
+        val fileItems = if (replacement == null) pendingFileAttachments.toList() else emptyList()
+        if (replacement == null) {
+            pendingAttachments.clear()
+            pendingFileAttachments.clear()
+        }
+        _state.update { if (replacement == null) it.copy(attachments = emptyList(), fileAttachments = emptyList(), error = null)
+            else it.copy(error = null) }
         // File attachments ride after the user's text as model-readable blocks.
         val payload = FileAttachments.buildMessageSuffix(fileItems)
             .takeIf { it.isNotEmpty() }
             ?.let { suffix -> if (text.isBlank()) suffix else "$text\n\n$suffix" }
             ?: text
 
+        startingRun = true
         viewModelScope.launch {
-            // Harness free-tier models live behind different wires per model; probe
-            // once on first use and pin the winner so later requests route directly.
-            if (provider.id == com.androidharness.app.llm.HarnessProvider.ID &&
-                c.providers.wire(roleModel) == null
-            ) {
-                val learned = com.androidharness.app.llm.HarnessProvider.probeWire(roleModel)
-                if (learned != null) {
-                    c.providers.pinWire(roleModel, learned.name)
-                    com.androidharness.app.llm.HarnessProvider.pins =
-                        com.androidharness.app.llm.HarnessProvider.pins + (roleModel to learned.name)
+            try {
+                // Harness free-tier models live behind different wires per model; probe
+                // once on first use and pin the winner so later requests route directly.
+                // Pooled community models always speak chat/completions, skip the probe.
+                if (provider.id == com.androidharness.app.llm.HarnessProvider.ID &&
+                    c.providers.wire(roleModel) == null &&
+                    !com.androidharness.app.llm.HarnessProvider.isPooled(roleModel)
+                ) {
+                    val learned = com.androidharness.app.llm.HarnessProvider.probeWire(
+                        roleModel, c.providers.harnessApiKey(),
+                    )
+                    if (learned != null) {
+                        c.providers.pinWire(roleModel, learned.name)
+                        com.androidharness.app.llm.HarnessProvider.pins =
+                            com.androidharness.app.llm.HarnessProvider.pins + (roleModel to learned.name)
+                    }
                 }
-            }
-            // Security gate (battery D1): a workspace .harness/mcp.json never
-            // spawns commands until this exact file content was approved. The
-            // dialog offers approve (and continue) or run without those servers.
-            if (workspaceMcpGate) {
-                val unapproved = runCatching {
-                    c.mcp.unapprovedWorkspaceServers(c.workspace.currentOnce())
-                }.getOrDefault(emptyList())
-                if (unapproved.isNotEmpty()) {
-                    pendingRunText = payload
-                    _state.update { it.copy(pendingWorkspaceMcp = unapproved.map { s -> s.name }) }
-                    return@launch
+                // Security gate (battery D1): a workspace .harness/mcp.json never
+                // spawns commands until this exact file content was approved. The
+                // dialog offers approve (and continue) or run without those servers.
+                if (workspaceMcpGate) {
+                    val unapproved = runCatching {
+                        c.mcp.unapprovedWorkspaceServers(c.workspace.currentOnce())
+                    }.getOrDefault(emptyList())
+                    if (unapproved.isNotEmpty()) {
+                        pendingRunText = payload
+                        pendingReplacement = replacement
+                        _state.update { it.copy(pendingWorkspaceMcp = unapproved.map { s -> s.name }) }
+                        return@launch
+                    }
                 }
-            }
-            // A model picked from the provider's catalog overrides its default.
-            val effectiveConfig = roleModel
-                ?.takeIf { it.isNotBlank() }
-                ?.let { provider.copy(model = it) } ?: provider
-            val sid = c.runManager.startRun(
-                sessionId = sessionId,
-                text = payload,
-                imageRefs = imageRefs,
-                config = effectiveConfig,
-                apiKey = apiKey,
-                permissionMode = s0.permissionMode,
-                mode = s0.mode,
-                maxOutputTokens = s0.maxOutputTokens,
-                maxContextTokens = s0.maxContextTokens,
-                thinking = s0.thinkingLevel,
-                maxIterations = s0.maxIterations,
-                queuedPromptId = queuedPromptId,
-                existingPromptId = existingPromptId,
-            )
-            if (sessionId == null) {
-                sessionId = sid
-                sessionIdFlow.value = sid
-                _state.update { it.copy(sessionId = sid, sessionTitle = payload.take(48)) }
-                viewModelScope.launch {
-                    c.settings.setLastActiveSessionId(sid)
+                // A model picked from the provider's catalog overrides its default.
+                val effectiveConfig = roleModel
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { provider.copy(model = it) } ?: provider
+                if (replacement != null) {
+                    check(targetSession != null && targetSession == sessionId) { "The active chat changed" }
                 }
+                val sid = c.runManager.startRun(
+                    sessionId = targetSession,
+                    text = payload,
+                    imageRefs = imageRefs,
+                    config = effectiveConfig,
+                    apiKey = apiKey,
+                    permissionMode = s0.permissionMode,
+                    mode = s0.mode,
+                    maxOutputTokens = s0.maxOutputTokens,
+                    maxContextTokens = s0.maxContextTokens,
+                    thinking = s0.thinkingLevel,
+                    maxIterations = s0.maxIterations,
+                    queuedPromptId = queuedPromptId,
+                    replacementMessageId = replacement?.id,
+                )
+                if (sessionId == null) {
+                    sessionId = sid
+                    sessionIdFlow.value = sid
+                    _state.update { it.copy(sessionId = sid, sessionTitle = payload.take(48)) }
+                    viewModelScope.launch {
+                        c.settings.setLastActiveSessionId(sid)
+                    }
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _state.update { it.copy(error = e.message ?: "Could not start the message") }
+            } finally {
+                startingRun = false
             }
         }
     }
@@ -1418,41 +1427,9 @@ class ChatViewModel(
      * message, truncates the conversation there, then resends the edited text
      * as a fresh run. The UI warns before calling this.
      */
-    /**
-     * In-place message edit without re-running.
-     */
-    fun editMessageOnly(message: ChatMessage, newText: String) {
-        val mid = message.id ?: return
-        if (newText.isBlank()) return
-        viewModelScope.launch {
-            c.sessions.updateMessageText(mid, newText)
-            _state.update { st ->
-                st.copy(messages = st.messages.map { if (it.id == mid) it.copy(text = newText) else it })
-            }
-        }
-    }
-
-    /**
-     * Editing a past user message: updates the message text in place, rewinds
-     * any files touched after that point and deletes any subsequent messages,
-     * then re-runs from the edited message without creating a duplicate row.
-     */
     fun editAndResend(message: ChatMessage, newText: String) {
-        val sid = sessionId ?: return
-        val mid = message.id ?: return
-        if (newText.isBlank()) return
-        viewModelScope.launch {
-            c.sessions.updateMessageText(mid, newText)
-            _state.update { st ->
-                st.copy(messages = st.messages.map { if (it.id == mid) it.copy(text = newText) else it })
-            }
-            runCatching { c.runManager.rewindAndTruncateAfter(sid, mid) }
-                .onFailure { e ->
-                    _state.update { st -> st.copy(error = "Could not rewind: ${e.message}") }
-                    return@launch
-                }
-            startRun(newText, existingPromptId = mid)
-        }
+        if (sessionId == null || message.id == null || message.role != Role.USER || newText.isBlank()) return
+        startRun(newText, replacement = message)
     }
 
     // ------------------------------------------------------------------
@@ -1465,7 +1442,8 @@ class ChatViewModel(
     private suspend fun forceCompact() {
         val sid = sessionId ?: return
         val provider = _state.value.activeProvider ?: return
-        val apiKey = c.providers.apiKey(provider.id) ?: return
+        val apiKey = if (provider.id == com.androidharness.app.llm.HarnessProvider.ID) c.providers.harnessApiKey()
+        else c.providers.apiKey(provider.id) ?: return
         // Trigger compaction by temporarily pretending the context is full:
         // Simplest correct approach, ask the engine for a summary of all history.
         // Subagent inner turns are excluded (same rule as new runs).
@@ -1725,10 +1703,6 @@ class ChatViewModel(
             }
             is com.androidharness.app.llm.ModelCatalog.Result.Failed -> result.message
         }
-    }
-
-    suspend fun testModelLatency(providerId: String, modelId: String): com.androidharness.app.llm.ModelCatalog.LatencyResult {
-        return c.providers.testModelLatency(providerId, modelId)
     }
 
     fun dismissError() {

@@ -18,7 +18,8 @@ class ShellTool(
 ) : Tool {
     override val name = "shell"
     override val description =
-        "Run a shell command on the device. Runs with the best available native environment: " +
+        "Run a shell command on the device. Uses SSH for an SSH workspace; " +
+        "otherwise runs with the best available native environment: " +
         "a full Linux userspace (bash, git, python, node…) as the app when installed, " +
         "Shizuku ADB-shell privileges (plus the same toolchain) when Shizuku is connected and " +
         "the target folder needs it, otherwise toybox sh. If the active workspace is a picked " +
@@ -42,13 +43,15 @@ class ShellTool(
         withContext(Dispatchers.IO) {
             val rawCommand = args["command"]?.jsonPrimitive?.content
                 ?: throw ToolFailure("Missing required argument: command")
-            val root = ctx.workspace.shellRoot
+            val remote = ctx.workspace as? com.androidharness.app.workspace.SshFs
+            val root = remote?.root?.let { File(it) } ?: ctx.workspace.shellRoot
                 ?: throw ToolFailure(
                     "This workspace has no real filesystem path, so the shell cannot run here. " +
                         "Switch to a device folder or the app workspace (Settings → Workspace).",
                 )
             val cwd =
-                if (ctx.sandboxOff) resolveCwdUnchecked(args, root)
+                if (remote != null) File(remote.commandPath(args["cwd"]?.jsonPrimitive?.content ?: "."))
+                else if (ctx.sandboxOff) resolveCwdUnchecked(args, root)
                 else resolveCwd(args, root)
 
             // Full access skips the denylist re-check; the engine already
@@ -62,7 +65,7 @@ class ShellTool(
                 .coerceIn(1, 600)
 
             // Auto-append --no-bin-links for npm install on shared storage (symlinks unsupported).
-            val (command, notes) = run {
+            val (command, notes) = if (remote != null) rawCommand to null else run {
                 val (afterNpm, npmNote) = NpmOnSharedStorage.prepare(rawCommand, cwd)
                 // Bug 4 fix: retarget workspace tar extractions to the
                 // exec-capable scratch dir so symlinks/exec bits survive.
@@ -70,12 +73,13 @@ class ShellTool(
                 afterTar to listOfNotNull(npmNote, tarNote).joinToString("\n").ifBlank { null }
             }
 
-            val res = router.run(command, cwd, timeoutSec * 1000, MAX_OUTPUT_CHARS * 2)
+            val res = if (remote != null) remote.run(command, cwd.path, timeoutSec * 1000, MAX_OUTPUT_CHARS * 2)
+                else router.run(command, cwd, timeoutSec * 1000, MAX_OUTPUT_CHARS * 2)
 
             val isSymlink = rawCommand.contains("ln ") && (rawCommand.contains("-s") || rawCommand.contains("--symbolic"))
             val hasSymlinkError = isSymlink && (res.exitCode != 0 || res.rawOutput.contains("Permission denied", true) || res.rawStderr.contains("Permission denied", true) || res.rawOutput.contains("Operation not permitted", true) || res.rawStderr.contains("Operation not permitted", true))
 
-            if (isSymlink) {
+            if (isSymlink && remote == null) {
                 // Check if ln left a stale empty regular file at destination
                 val tokens = ShellPolicy.extractTokens(rawCommand)
                 val lastToken = tokens.lastOrNull()?.trim()
@@ -99,12 +103,14 @@ class ShellTool(
             if (res.tier == ExecutionTier.PRIVILEGED) {
                 sb.append("[note: ran with Shizuku ADB-shell privileges]\n")
             }
-            if (res.timedOut) sb.append("[killed after ${timeoutSec}s timeout; output below is what was written before the kill]\n")
+            if (res.timedOut) sb.append(if (res.tier == ExecutionTier.TERMUX_SSH)
+                "[SSH channel closed after ${timeoutSec}s timeout; inspect Termux before retrying modifying commands]\n"
+                else "[killed after ${timeoutSec}s timeout; output below is what was written before the kill]\n")
             sb.append("exit code: ").append(if (res.timedOut) "killed (timeout)" else if (hasSymlinkError && res.exitCode == 0) 1 else res.exitCode).append('\n')
             val out = res.rawOutput.trimEnd()
             val err = res.rawStderr.trimEnd()
-            if (out.isNotEmpty()) sb.append("--- stdout ---\n").append(out.truncated()).append('\n')
-            if (err.isNotEmpty()) sb.append("--- stderr ---\n").append(err.truncated()).append('\n')
+            if (out.isNotEmpty()) sb.append("stdout (JSON string): ").append(kotlinx.serialization.json.JsonPrimitive(out.truncated())).append('\n')
+            if (err.isNotEmpty()) sb.append("stderr (JSON string): ").append(kotlinx.serialization.json.JsonPrimitive(err.truncated())).append('\n')
             if (out.isEmpty() && err.isEmpty()) sb.append("(no output)")
             ToolResult(ok = !res.timedOut && res.exitCode == 0 && !hasSymlinkError, output = sb.toString().trimEnd())
         }
